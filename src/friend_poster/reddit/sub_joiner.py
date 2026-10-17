@@ -18,10 +18,13 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import scrolledtext, ttk
 
+from friend_poster.core.paths import LEGACY_MISC_DIR
 from friend_poster.services.comment_precache import PHASE2  # noqa: E402 (single source of truth)
 from friend_poster.core.config import LOG_DIR  # noqa: E402
 from friend_poster.device.ssh_device import Phone, PhoneError, diagnose_usb, usb_status_line  # noqa: E402
 from friend_poster.device.ui_tree import TapStack  # noqa: E402
+
+MISC_DIR = str(LEGACY_MISC_DIR)
 
 os.environ["SKIP_SHOT"] = "1"
 

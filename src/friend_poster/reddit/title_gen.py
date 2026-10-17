@@ -26,7 +26,9 @@ import time
 import urllib.request
 
 from friend_poster.core.config import SECRETS_PATH, SCRAPER_PICS_DIR, SUBREDDITS_DIR
+from friend_poster.core.paths import PROJECT_ROOT
 
+ROOT_DIR = str(PROJECT_ROOT)
 PICS_DIR = SCRAPER_PICS_DIR
 SUBS_DIR = SUBREDDITS_DIR
 

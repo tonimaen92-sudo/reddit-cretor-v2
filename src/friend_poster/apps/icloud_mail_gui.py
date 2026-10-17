@@ -10,9 +10,11 @@ import tkinter as tk
 import webbrowser
 from tkinter import messagebox, ttk
 
+from friend_poster.core.paths import LEGACY_MISC_DIR
 from friend_poster.device.icloud_mail import connect, fetch_folder, list_folders, resolve_junk
 from friend_poster.device.ssh_device import load_secrets, update_secrets
 
+MISC_DIR = str(LEGACY_MISC_DIR)
 ICLOUD_MAIL_URL = "https://www.icloud.com/mail/"
 
 

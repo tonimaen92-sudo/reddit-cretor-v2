@@ -24,6 +24,7 @@ import tkinter as tk
 from datetime import datetime, timezone
 from tkinter import filedialog, scrolledtext, ttk
 
+from friend_poster.core.paths import LEGACY_MISC_DIR
 from friend_poster.core.config import LOG_DIR  # noqa: E402
 from friend_poster.core.config import ROOT_DIR, SUBREDDITS_DIR  # noqa: E402
 from friend_poster.core.config import USED_DIR  # noqa: E402
@@ -78,6 +79,7 @@ from friend_poster.device.ui_tree import find_update_settings  # noqa: E402
 from friend_poster.apps import poster_persistence as _persistence
 
 os.environ["SKIP_SHOT"] = "1"
+MISC_DIR = str(LEGACY_MISC_DIR)
 
 POSTER_QUEUE_PATH = os.path.join(LOG_DIR, "poster_queue.json")
 POSTER_LOG_PATH = os.path.join(LOG_DIR, "poster.log")
