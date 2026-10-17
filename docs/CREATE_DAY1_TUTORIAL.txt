@@ -1,0 +1,417 @@
+﻿# Reddit Create + Day 1 â€” micro tutorial (r1 and r2, 13 Sep 2026)
+
+CURRENT INSTALLATION WARNING (8 Oct 2026)
+- CURRENT MODE: create the Reddit account, prove its Home feed, record it created with cleanup
+  pending, immediately remove Reddit from Recents, clear its exact bundle process, prove Home, and
+  mark cleanup complete. No post-create browsing and no separate Day 1 session.
+- Historical slot names, completed-account claims, and 750x1334 coordinates
+  below are not current installation state.
+- Read logs/slots.json for slot truth. Use live dumps and device-size scaling
+  for the iPhone X; never treat example coordinates as current coordinates.
+- This file is reference documentation and does not prove a slot is ready.
+
+Read docs/LIVE_CREATE_PROMPT.txt, then follow this file. The bundled PDFs
+do not contain a current section 16; do not wait for or invent that section.
+Phone stays on Reddit from Crane pick until its Home feed is proven. Creator then checkpoints the
+created account and immediately calls the internal close_reddit() routine. Cleanup dismisses only the proven Reddit
+card, clears and verifies the exact Reddit process, and returns to a verified SpringBoard.
+
+Workspace: C:\Users\overclocked\Desktop\My file pos\friend poster
+Screen: 750x1334. XXTouch Elite OpenAPI :46952. SSH mobile 127.0.0.1:2222 -> device 22.
+Type one key at a time (stack.type_text). Never clipboard. Never SIWA. Never Skip on Verify.
+Never print passwords. Write them to logs/accounts.txt only.
+
+
+## FATAL: do not close Reddit at the code step
+
+When the dump says "Verify your email" the phone MUST stay there.
+
+Do NOT:
+- python misc/close_reddit.py
+- press_home / double_home / recents flick
+- killall Reddit
+- uiopen Mail or tap the Mail icon (that Homes out of Verify)
+- python misc/reddit_enter_code.py with no dump check that opens Mail (old bug; now IMAP-only)
+- re-run reddit_to_verify.py hoping it will "fix" Verify (old code closed Reddit if OCR truncated the HME)
+- tap Continue while reddit_to_verify.py is still typing the email
+- tap Continue on "Please enter a valid email address"
+- treat local[:8] or a 329px ...@i pill as typed (r13). Need @icloud.com or .co clip width>=450 and no error
+- kill reddit_to_verify.py at 120s. Wait 240s. Script now sends the full address in one key.send_text
+
+Do:
+- Leave Verify on screen
+- IMAP on the PC: imap.mail.me.com:993
+- python misc/reddit_enter_code.py --code=NNNNNN
+  (or without --code= it now polls IMAP and types; still requires Verify already on screen)
+
+If you already closed it: dump. If SpringBoard, you lost the Verify session. Re-open Crane rN from the Reddit icon (not uiopen), walk signup again, get a NEW code. Do not type the old code.
+
+
+## Before you start
+
+Slot row in logs/slots.json must have ghost=true and email=@icloud.com.
+r1 and r2 Create+Day1 are DONE. Next is r3 unless the user names another slot.
+r1 email let_welders_6z@icloud.com username Far-Strength9711
+r2 email omelette_jowls.8g@icloud.com username Sufficient_Act_7147
+Do not recreate Ghost. Do not mint a new HME unless the user deleted the old one.
+
+Unlock phone. USB. Desktop iTunes/AMDS. XXTouch Elite open, Remote Service on.
+One Lua at a time.
+
+
+## STEP 0 â€” confirm slot email (no taps)
+
+Read logs/slots.json for rN. You will type THAT address, nothing else.
+Example r2: omelette_jowls.8g@icloud.com
+
+
+## STEP 1 â€” open Reddit the Crane way (not uiopen)
+
+Command:
+  .\.venv\Scripts\python.exe misc\reddit_to_verify.py rN
+
+What that script does (dump-first every screen):
+
+1a. press_home. Read a transient 800_springboard dump (not saved or previewed).
+    Reddit OCR is the NAME UNDER the icon, often on page 2 (after Weather/Find My).
+    Long-press ICON, not text: x = label.center_x, y = label.y - 48, hold 650ms.
+    Do not normal-tap before Crane selection; that opens the previously selected container.
+
+1b. If no Reddit on this page: interp_flick 640,700 -> 110,700 (next SpringBoard page). Dump 802_page_N. Up to 4 pages.
+    NEVER uiopen com.reddit.Reddit. uiopen skips Crane Select Container and opens the wrong container.
+
+1c. Read the transient 810_haptic menu. Prefer an exact Crane / Containers /
+    Select Container / Switch Container parent entry. A single visible slot on the parent may be
+    the previously active container and may open the list even when it differs from requested rN.
+    Any slot shown beside an exact iOS haptic system action is a doorway, even when it already
+    equals requested rN; it is not the final container row.
+    Accept that doorway only when an exact iOS haptic system action proves the menu. Allow one
+    parent tap, re-dump, prove the container list by its title or multiple letter-prefixed slot IDs.
+    Check the visible rows, then use bounded full-range upward-finger flicks toward the bottom so the
+    newest requested container is found without walking through every earlier slot. Re-dump after
+    every flick and tap the exact requested rN row once. If an older/resume slot is not in the bottom
+    rows, use the bounded full-list fallback. Bare Calendar, Clock, badge, and keyboard numbers do
+    not prove a Crane list. Ignore a matching current-container/header duplicate in the
+    top navigation band; the final selectable row is in the list body.
+    Never tap Remove App, Edit Home Screen, Share App, Delete, or an unmatched row.
+
+1d. Read transient post-selection probes. If Crane returns to SpringBoard, find Reddit again
+    from that fresh dump and normal-tap its icon exactly once to launch the selected container.
+    Never reuse the pre-menu coordinate. Blank frames wait; a second SpringBoard result stops.
+    Save 820_after_launch only after Reddit UI is confirmed.
+
+1e. Possible next screens (locked taps, dump each time):
+    - "Not now" on Reddit notifications / "Log in or sign up": tap Not now. NOT OK. NOT Allow. NOT SIWA.
+      (OK is ONLY later on the home-feed "Please turn on notifications" sheet.)
+    - Initial page "Get Started" + "I already have an account": tap the exact Get Started button.
+      Never tap "I already have an account". A later provider sheet reuses Get Started as a heading.
+    - Provider sheet: tap exact "Continue with email" once. Never Apple, Google, the marketing checkbox,
+      Cancel, or the Get Started heading. Stop if the provider sheet remains after that one tap.
+    - Legacy "Use email or username": tap that. Not Continue with Apple. Not Google. Not phone.
+    - "Log in to Reddit" with footer "Create a new account": tap Create a new account. Not Log in.
+    - "Hi new friend," / "Enter your email to get started": STEP 2.
+
+
+## STEP 2 â€” type Hide My Email, Continue
+
+reddit_to_verify.py does this. Do not one-liner Continue.
+
+Source: logs/slots.json only. Must end with @icloud.com.
+Tap email pill at x=375, y=Email.center_y (r2: 375,682).
+One key.send_text of the FULL address (not paste, not 27 Lua keys). Clear 40 backspaces first if junk.
+Dump. email_ready() must pass before Continue:
+- False if "Please enter a valid email address"
+- False if pill is local@i or width under 450 (r13 fail 329px)
+- True if full email, or local+icloud.com (OCR dropped @), or local+icloud.co with width>=450 and no error (clip of last m)
+- local[:8] is NOT enough
+One retype max. Still invalid: ERROR, no Continue.
+
+Tap Continue whose label is exactly Continue, not Continue with Apple. r2: ~ (375,839).
+Wait and dump. If the valid email screen remains, poll up to eight fresh dumps for Verify whether
+Continue is still visible or temporarily absent. Do not retype or tap Continue again. OCR is captured
+before the diagnostic screenshot, so a same-stem PNG may already show Verify while its JSON still
+shows the email form. A restart on Verify resumes without reopening Crane or resubmitting.
+
+Success screen: "Verify your email", "Enter the 6 digit code we sent to", the HME, "Verification code", Skip (DO NOT TAP), Continue.
+Line wrap on Verify (slices- then ambush.2h@icloud.com) is real .com. Stay. IMAP next.
+r2 dump 879_verify. STOP THE SCRIPT HERE. reddit_to_verify.py exits 0 on this screen.
+
+If "Sorry, please try again later": STOP immediately. The current decision dump is already evidence;
+do not create 878_sorry, tap, retype, reopen Crane, change the slot/network, or retry automatically.
+Creator must log that the slot and phone screen were preserved for a later manual retry. Do not close.
+
+
+## STEP 3 â€” IMAP code. Phone does not move.
+
+PC only. Reddit stays on Verify.
+
+Host: imap.mail.me.com port 993
+User/pass: secrets.json icloud_user + icloud_app_password (never print)
+NOT imap.mail.icloud.com (Vietnam drops it)
+NOT the Mail app, NOT Mail search, NOT insides_crosse leftover local-part
+
+Subject looks like:  013987 is your Reddit verification code
+Sender: Reddit (not the HME local-part)
+
+Command:
+  .\.venv\Scripts\python.exe misc\reddit_enter_code.py
+  or
+  .\.venv\Scripts\python.exe misc\reddit_enter_code.py --code=013987
+
+enter_code.py MUST dump 880_now first. If Verify is missing it now ERRORS instead of Homing.
+It types digits on the Verify field. Skip stays on screen; do not tap it.
+Keyboard: dump 881_keyboard. Keys above y=850. Missing keys (0,1,9 often) use type_text that one char, not paste.
+Dump after each digit. When 6 digits show, tap Continue (may sit above the keyboard ~y=820).
+
+Success: "Create your username". Dump 884_after_code_continue.
+
+
+## STEP 4 â€” keep the Username FIELD
+
+  .\.venv\Scripts\python.exe misc\reddit_username.py rN
+
+Dump 890_username.
+The real name is the value UNDER the word Username (OCR triple, e.g. Sufficient_Act_7147 Sufficient_Act_7147 ...).
+Take the first token of that node. y is just below the Username label.
+IGNORE "Need inspiration?" names (OkSomewhere6062, Accurate-Army-6392, ...). Those are not the field.
+If the Username field is empty or Reddit reports failed suggestions, tap the proven "See more options"
+control from the fresh dump up to twice. Re-dump after every tap. Never select an inspiration row or tap
+disabled Continue. Stop if the field remains empty after the bounded refreshes.
+Tap Continue. Writes logs/accounts.txt (username+email, password later).
+Success: "Set a password".
+
+
+## STEP 5 â€” password
+
+  .\.venv\Scripts\python.exe misc\reddit_password.py rN
+
+Makes a Keychain-style 16-char grouped password: AB12-Cd3e-Fg45-hI67
+Tap Password field x=375, y=field.center. type_text one key. Never paste. Never print.
+Dump. Continue may jump up to ~y=820 while keyboard is open. Tap it.
+Next dump can still say Set a password for a second (loading). Dump again. About you is next.
+If iOS overlays the iCloud Keychain passkey sheet, require its full passkey signature and tap only
+the exact top-right X once. Never tap Set Up Face ID & Passcode or Save on Another Device. A restart
+on that proven popup or on About you resumes after the completed password stage without reopening Crane.
+Saves password to logs/accounts.txt. Do not echo it in chat.
+
+
+## STEP 6 â€” About you
+
+  .\.venv\Scripts\python.exe misc\reddit_about.py
+
+Dump 910_about: How do you identify? Woman / Man / Non-binary / I prefer not to say. Skip exists â€” do not tap Skip.
+Before starting, set `reddit_birth_date` in the gitignored secrets.json to the account owner's real
+date in YYYY-MM-DD form. The date must be valid, adult, and have a year from 2002 through 2006;
+the script stops before moving any wheel when it is missing or invalid, and never logs the date.
+Some Reddit builds first show Birthday wheels. Require exact About you + Birthday and prove the three
+centered wheel values. Set the exact configured year, then month, then day. Prefer an exact visible
+row; otherwise use only bounded directional gestures and re-dump after each movement. Classify wheel
+columns by each OCR box center (not its width-sensitive left edge), and require the selected row to be
+inside the strict vertical center band. If centered OCR is incomplete, re-dump up to three times
+without another gesture. Never infer from an adjacent row or accept Reddit's displayed default date.
+Tap exact Continue once only after all three centered values exactly equal the configured date.
+After Birthday Continue, Reddit may show the proven Confirm your birthday? sheet. Require exact
+Yes, Confirm plus Go Back and require the sheet's displayed date to match the configured date before
+tapping exact Yes, Confirm once. Then wait for How do you identify?. Never tap
+Go Back or repeat either birthday action. On gender, use the saved screenshot to distinguish the
+unselected white Woman row + gray Continue from the selected blue-gray row + orange Continue. Tap
+exact Woman only when unselected, then tap exact enabled Continue once and wait up to eight fresh
+dumps for exact Interests. A restart with Woman already selected must not select it again. Never tap
+Skip or guess coordinates. A restart on the confirmation sheet, gender screen, or Interests resumes
+in place without reopening Crane.
+
+
+## STEP 7 â€” Interests
+
+  .\.venv\Scripts\python.exe misc\reddit_interests.py rN --stay-open
+
+Dump 920_interests. The current build uses exact Choose your interests with a fixed visible category
+grid. Select exactly 4 random allow-listed category labels from fresh dumps without scrolling, never Skip, then
+tap exact Continue once. Older Interests layouts retain the bounded small-scroll path. Wait through
+the transition without a second Continue tap and save 924_after_interests. If exact Customize your
+feed appears, select exactly 4 random bounded visible topic pills, never Show More Topics or Skip, tap exact
+Continue once, and save the next screen in 927_after_customize. Do not Home or close.
+
+
+## STEP 8 â€” home feed notifications = OK
+
+Dump until you see Home / Popular near you / Join (do not tap Join).
+Sheet: "Please turn on notifications" + Not now + OK.
+THIS is the OK tap. r2 live OK node ~[512,803]. Dump live; do not reuse that point blindly.
+Tap OK. Not Not now. Not Join. Not Get Started on ads.
+
+If iOS then shows its exact notification permission alert, tap exact Allow once. If Reddit next
+shows "Your ads personalization choices", use the privacy-preserving exact Reject once. Never tap
+either control from an unproven screen. Re-dump after every tap and require the real Home feed
+before starting immediate verified cleanup.
+
+Creator converts that exact Home-feed frame into an immutable cleanup proof, records
+created=yes/day1=no with cleanup pending, and immediately begins the bounded Reddit-card cleanup in
+STEP 10. No feed gesture occurs between the proof and cleanup.
+
+Signup-time "Not now" was a different sheet. Do not mix them up.
+
+
+## STEP 9 â€” checkpoint the proven feed
+
+  Day 1 is disabled. Do not run misc\day1.py.
+
+Creator requires an exact trusted Home-feed proof before recording the account. It writes cleanup
+state `pending`, then passes that proof directly into the internal close_reddit() routine without scrolling. Cleanup
+remains strict: without direct Home-feed proof or the matching immutable proof, it must not open
+Recents or clear Reddit. The hard guard never leaves or closes Verify, Username, Password, About,
+Interests, Building, or any other protected signup screen.
+
+
+## STEP 10 â€” automatic verified cleanup (ONLY now)
+
+There is no separate command in the normal creation flow. Creator calls close_reddit() internally.
+If a created slot remains at cleanup `pending` or `app_stopped`, select that slot in Creator and use
+Finish cleanup. The standalone close command must not be used for a pending creation checkpoint.
+
+The close routine first requires either direct proof of the completed Reddit Home feed or the exact
+trusted proof passed from STEP 9. Without that proof it stops before opening Recents. On the
+iPhone X it opens Recents directly from that feed with two immediate synthetic Home presses and no
+timing gap; an ordinary
+delayed double-Home or bottom-edge drag is not this proven path. Recents OCR is transient and is
+neither saved nor previewed, so app-card thumbnails are not retained.
+
+If an adjacent app card is centered, the routine permits at most one bounded horizontal swipe to
+center Reddit, then re-dumps. Before dismissal it requires the exact title `Reddit` in the bounded
+centered Recents title region (x=180..360, y=120..220, width<=260, height<=80). It performs exactly
+one vertical upward dismissal flick on that proven card and re-dumps transiently. Success requires
+the Reddit card to be absent, the frame to have changed, and either a different centered app title
+or proven SpringBoard when Reddit was the only Recents card. It never flicks an unknown card and
+never retries a failed dismissal.
+
+After card removal it clears and verifies only the exact `com.reddit.Reddit` bundle process:
+`app.quit`, `app.is_running`, and at most one exact-bundle `app.close` fallback when the graceful
+quit left the process running. It never uses `*` or closes another app. Finally it presses Home once
+and uses a fresh transient OCR dump to prove SpringBoard. In the Creator flow,
+mark_reddit_created writes cleanup `pending` before close_reddit runs. Verified card removal plus
+exact-process stop writes `app_stopped`; final SpringBoard proof writes `complete`. A failed cleanup
+never repeats signup. Do not run a separate Day 1 session.
+
+logs/accounts.txt line: slot TAB username TAB email TAB password
+logs/rN.txt created=yes day1=no
+
+Offline regression gate (no phone/network):
+  .\.venv\Scripts\python.exe misc\create_regress.py
+
+
+## Debug table
+
+Symptom: Crane haptic menu never appears
+Cause: Reddit was normally tapped, the OCR text label was pressed instead of the icon, or Crane SpringBoard Integration is disabled
+Fix: reddit_open.py long-presses the freshly detected icon for 650ms, then accepts only the exact requested slot or the exact Crane submenu labels. It does not use uiopen, the app switcher, or guessed coordinates
+
+Symptom: Crane selection closes to SpringBoard
+Cause: this Crane configuration selects the active/default container without launching Reddit
+Fix: after proving SpringBoard, reddit_open.py finds the Reddit icon again and normal-taps that fresh coordinate exactly once. A normal tap is never used before container selection
+
+Symptom: Tapping the rN shown on the first haptic menu opens another Crane menu
+Cause: the first rN is a current-container/submenu entry, not the final container row, even when it equals the requested rN
+Fix: allow one parent navigation tap, prove the second-level container list, then tap the exact rN once. Never recurse or tap an unproven second level
+
+Symptom: Second-level Crane tap near the top returns to the first haptic menu
+Cause: OCR found the current-container/header duplicate instead of the selectable list-body row
+Fix: ignore matching slot labels in the top navigation band and tap only the exact row in the proven list body
+
+Symptom: First haptic menu shows a different slot than requested
+Cause: Crane is showing the previously active container as the doorway to its second-level list
+Fix: only with an exact iOS haptic system-action marker, tap that one normalized slot once, prove the resulting Crane list, then select the exact requested row. If the menu closes instead, stop because the requested container was not proven
+
+Symptom: Picker still listing r1 r2 r3 after tap
+Cause: missed the name (UUID / Cancel)
+Fix: dump, tap name center x~375
+
+Symptom: Blank Reddit after pick
+Cause: loading
+Fix: wait + dump. Do not Home
+
+Symptom: Pill shows ...@i or .co and Please enter a valid email
+Cause: type killed mid-address, then Continue / old local[:8] gate
+Fix: email_ready() now refuses. Let reddit_to_verify.py finish. No Continue one-liner. Retype full slots.json once if invalid
+
+Symptom: Full valid email remains after Continue, with Continue either visible or absent
+Cause: Reddit is still transitioning, or OCR completed just before a later screenshot captured Verify
+Fix: wait up to eight fresh dumps for Verify; never retype or submit again during this pending state
+
+Symptom: Verify line-wrap slices- / ...@icloud.com
+Cause: OCR wrap of a complete address
+Fix: stay on Verify. IMAP. Not a type failure
+
+Symptom: Verify, then SpringBoard / Mail / recents
+Cause: close_reddit, Home, Mail.app, or to_verify mismatch-close (old)
+Fix: do not leave Verify. IMAP on PC. enter_code.py --code=. Re-signup if session gone
+
+Symptom: enter_code opened Mail
+Cause: old default path
+Fix: current enter_code.py never opens Mail. IMAP only. Verify must already be on screen
+
+Symptom: Skip
+Cause: it is always on Verify
+Fix: never tap it
+
+Symptom: IMAP timeout
+Cause: wrong host, or mail not forwarded yet
+Fix: imap.mail.me.com:993, wait 150s, subject "NNNNNN is your Reddit verification code". Phone still on Verify
+
+Symptom: Username saved as Accurate-Army-...
+Cause: picked inspiration list
+Fix: field under Username. r2 real name was Sufficient_Act_7147
+
+Symptom: Suggested username not in dump / Failed to load suggested usernames
+Cause: Reddit left the Username field empty
+Fix: exact See more options from a fresh dump, maximum two refreshes; never inspiration rows or disabled Continue
+
+Symptom: Crane cannot find a container that Ghost already lists
+Cause: Crane's haptic list is a separate ordered view; Ghost presence alone does not prove the row is currently exposed
+Fix: prove the Crane list and fast-scroll toward its bottom first, checking a fresh dump after every full-range flick. New containers should appear there. Use the bounded top-to-bottom fallback only for an older/resume slot
+
+Symptom: Crane list reached a stable boundary without the requested container
+Cause: the list stopped changing and Crane did not expose that normalized slot ID; older code could also mistake SpringBoard numbers for a titleless Crane list
+Fix: require an exact Crane title or multiple letter-prefixed slot IDs. Bare numbers never prove the list. If a proven list still reaches its boundary, stop without recreating or deleting the Ghost container
+
+Symptom: Password Continue does nothing
+Cause: keyboard Continue vs bottom Continue
+Fix: dump live, tap the Continue that is on screen, wait for About you
+
+Symptom: iOS passkey / iCloud Keychain Sign In popup covers Set a password
+Cause: iOS offered to save a passkey after Reddit accepted the password
+Fix: prove both passkey actions and the underlying Set a password screen, then tap only the bounded
+top-right X once. Require About you afterward; never choose either passkey action or repeat the X tap
+
+Symptom: Sorry please try again later
+Cause: Reddit / DeviceCheck / network
+Fix: stop immediately and use the current saved decision dump. Do not take another phone dump,
+tap Continue again, change state, or retry automatically. Tell the user the slot and screen are preserved.
+
+Symptom: Join on feed
+Cause: Popular near you row
+Fix: never tap Join. Creator uses the proven Home-feed frame only as cleanup authorization, performs
+no feed gesture, and immediately starts strict cleanup
+
+Symptom: Recents opens with another app card centered
+Cause: the iPhone X app switcher can center an adjacent card after the two immediate Home presses
+Fix: allow at most one bounded horizontal swipe, re-dump transiently, and require the exact bounded
+centered `Reddit` title before one vertical dismissal flick. If Reddit is not then proven, stop
+without flicking any card
+
+Symptom: Reddit title remains after the dismissal flick
+Cause: the card was not removed, or the switcher frame did not change
+Fix: stop after the one attempt, return Home, and report the failed proof. Never flick again or clear
+a wildcard process
+
+Symptom: HME mint stuck on All Set
+Cause: tapped the All Set title, not Done
+Fix: bottom Done ~ (375,1251). Only if minting a new address; do not mint unless the user deleted the old HME
+
+Symptom: XXTouch scripts do not start
+Cause: Remote Service off, or Elite app not opened after reboot
+Fix: open XXTouch Elite once. Remote on. :46952. Unlock phone
+
+Symptom: SSH fail
+Cause: not re-jailbroken after reboot, wrong user/port, no usbmux
+Fix: palera1n userspace up. mobile on 22 via 127.0.0.1:2222. GUI password. Do not guess
+

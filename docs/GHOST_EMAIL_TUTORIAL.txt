@@ -1,0 +1,338 @@
+﻿# Ghost container + Hide My Email â€” micro tutorial (live lock 14 Sep 2026)
+
+CURRENT INSTALLATION WARNING (8 Oct 2026)
+- Historical r-slot/a-slot inventories and 750x1334 coordinates below are
+  legacy reference material, not current installation state.
+- Read logs/slots.json for slot truth. Use live iPhone X dumps and the
+  source's device-size scaling instead of example coordinates.
+
+Open Code: paste docs/LIVE_AGENT_PROMPT.txt then follow THIS file and PDF sections 9 + 6.
+This slice does NOT open or create Reddit. Does NOT SIWA.
+
+Workspace: C:\Users\overclocked\Desktop\My file pos\friend poster
+Screen: 750x1334. XXTouch Elite OpenAPI :46952. SSH mobile 127.0.0.1:2222 -> device 22.
+Ghost container NAMES: type_text_block the whole string (a0021). Char-by-char type_text dropped zeros (a0019 â†’ a19) and hit XXTouch "another script".
+HME labels / other fields: type_text is OK. Never clipboard. Never paste passwords in chat.
+After any .py edit: python -m py_compile. UTF-8.
+
+
+## FATAL
+
+Do NOT:
+- swipe Ghost Home (snaps to Reset/Erase "Yes, I'm sure!")
+- tap Generate & Apply
+- tap Albums / Albums Restrict / the info (i)
+- tap Enable if the PNG already shows ON (toggle would turn it OFF)
+- killall Ghost / Reddit / Settings
+- uiopen Reddit / Sign in with Apple
+- tap Use different address (keep Apple's first random local-part)
+- tap All Set TITLE on Hide My Email (that misses; tap bottom Done ~375,1251)
+- rename or recreate r1â€“r13
+- recreate a0014â€“a0020 (they exist as of 14 Sep 2026 ~02:09)
+- scan / scroll the Containers list BEFORE tapping New Container / Create
+- skip Formulate because the name is already on the dump (that skipped a0017 identifiers)
+- skip Formulate because Hide is visible (Advanced tab, not missing Formulate)
+- tap the Favorites heart / (36,203) (hits Back, Ghost â†’ SpringBoard)
+- tap Crane Reddit (Settings â†’ Crane looks like Ghost Containers)
+- mint a new HME over a slot that already has an address unless the user deleted it
+- attach leftover cockle.47tersest@icloud.com (label mail) to any slot
+- start Reddit account creation unless the user asked (that is LIVE_CREATE_PROMPT.txt)
+
+Do:
+- dump live. JSON always. PNG when shot=True (Ghost switches).
+- Create FIRST. Then scroll BOTTOM. Newest is chronological, above New Container.
+- If the name already exists: skip New Container only. TAP the name. Formulate. Advanced. Close.
+- close Ghost after EACH container (Home + recents flick). Reopen for the next. Never stay in Ghost for a batch.
+- next NEW name is a0021 (then a0022 â€¦ a9999, then b10000) unless the user named a hole.
+- after Ghost: mint Hide My Email ONLY if the user asked, labeled that same padded name, then STOP
+
+
+## Before you start
+
+Unlock phone. USB. Desktop iTunes/AMDS. XXTouch Elite open, Remote Service on.
+One Lua at a time.
+
+Naming (locked 14 Sep):
+- r1â€“r13 stay r1â€¦r13. Do not rename. A-Z rename of r1â€“r14 broke Ghost Reddit tap. User reverted r1â€“r13.
+- New from 14: a0014, a0015, â€¦ a9999, then b10000.
+- On the phone now: r1â€“r13 plus a0014â€“a0022. Next new container is a0023.
+- slots.json a0014: Ghost only. Label/email/Reddit/Day1 cleared. New HME when the user asks â€” do not mint now. a0015+ same (Ghost, no email, reddit no).
+- Crane may still list r1â€“r5. Ignore Crane unless the user asked Crane.
+
+ghost_live.py --from/--to uses those exact names. If the name is already on the current dump: skip Create, still tap it (CLICK), Formulate, Advanced, close.
+
+If the user names a slot that already has email: STOP. Tell them.
+If they deleted that HME in Settings: python misc/replace_slot_email.py rN
+
+
+## Exact command order (one new slot)
+
+1. Unlock. USB. iTunes/AMDS. XXTouch Elite Remote on.
+2. .\.venv\Scripts\python.exe misc\ghost_live.py --from a0021 --to a0021
+   Close leftover Ghost. Open Ghost â†’ Application List â†’ Reddit â†’ Containers.
+   Create FIRST (New Container 50pt above OCR, type_text_block a0021, Create).
+   Scroll BOTTOM until a0021. CLICK the name. Formulate. Advanced knobs. close_ghost_organic.
+3. Read GHOST_CONTAINERS=a0021 and CLICK a0021 to change identifiers.
+4. HME only if asked: .\.venv\Scripts\python.exe misc\mint_slot_email.py a0021
+5. STOP. Do not open Reddit.
+
+GUI alternative (same taps):
+  run_creator.bat -> SSH password in the field (never paste in chat)
+  Slots tab -> New Ghost container (count 1)
+  Select that new row -> Create email for selected
+
+Batch:
+  .\.venv\Scripts\python.exe misc\ghost_live.py --from a0021 --to a0024
+  Create one, CLICK, Formulate, Advanced, CLOSE, reopen, next. Never stay in Ghost across names.
+
+
+## STEP G1 â€” open Ghost to Reddit Containers
+
+Command (does this for you): ghost_live.py -> open_reddit_containers
+
+close_ghost_organic first if leftover (name sheet Create/Cancel, Advanced Hide, recents).
+
+1. Dump 621_now. If Crane (nav Edit+Applications y<120, or Make Default Container / Container Name / Protect Using Biometrics): Home first, THEN uiopen Ghost. uiopen Ghost while Settings is front leaves Crane on screen.
+2. uiopen --bundleid com.sgwc.Ghost. Dump 621_home.
+3. If dump says "Yes, I'm sure!" STOP. Ghost Home looks like Reset/Erase. Do not swipe Home. User must recover.
+4. Tap Application List via tap_row (x = label.x+180 clamped 240â€“560, y = label.center). Do NOT swipe this page.
+5. Dump 622_apps. Reddit is on Favorites already (Application List opens there). tap_row Reddit ~ (240,438). Do NOT tap the heart / All Apps.
+6. Dump 623_reddit. Must show Containers. If Applications only, Weather, Find My, or SpringBoard: Ghost crashed â€” STOP, dump, tell user.
+7. tap_row Containers. Dump 624_containers.
+   Ghost list: title Containers y<120, or New Container. Crane CONTAINERS section header is y~163 â€” that is NOT Ghost.
+
+
+## STEP G2 â€” New Container, then CLICK it
+
+create_named / select_named in ghost_live.py:
+
+1. Name = what the user said, or next_slot_id. r1â€“r13 stay rN. From 14: a0014, a0015, â€¦ After a9999 â†’ b10000.
+2. If that exact name is already in THIS dump: do NOT tap New Container. Go to step 7 (CLICK it).
+3. Do NOT sweep the list collecting ids (623_scan). User: click Create first, then scroll, you will see it.
+4. New Container OCR box sits ON the home indicator. Tapping the OCR center does nothing.
+   Tap ~50pt ABOVE the OCR center: nx, min(ny-50, 1200). Live often (376, 1199).
+   If New Container is off-screen: flick toward BOTTOM only until it is. Then Create. No A-Z scan.
+5. Dump 625_name. Must show Create (not Confirm) and "Enter the name...".
+6. Tap the placeholder "Enter the name...". type_text_block the full name (a0021). Never paste. Never type_text one key (a0019 live â†’ field showed a19).
+   Dump 626_named. Exact name must appear. If not: backspace, type_text_block once more. Tap Create.
+7. AFTER Create (or if it already existed): newest row is chronological at the BOTTOM, above New Container.
+   Flick MIDDLE of the list toward bottom: 375,720->375,360. Stuck: 375,700->375,340.
+   Do NOT 375,920->375,780 (footer / home indicator; dump never moves).
+   Do NOT 375,1000->375,500 (overshoots).
+   Do NOT reverse through r1â€“r13 looking for A-Z. Dump 627_list_N until THIS name is visible.
+   Never guess-tap the row above New Container.
+8. CLICK the NAME. Log CLICK a00NN to change identifiers. Not tap_row (UUID miss).
+   x = clamp(node.x+80, 180, 300). If name y>1140: tap 50pt above.
+9. Dump 628_after_select. Must NOT still show New Container. Must show this name on the Reddit page.
+   If still on the list: radio "9" on that row y. Still stuck -> ERROR, dump.
+
+
+## STEP G3 â€” Enable, Formulate, Advanced knobs
+
+On the Reddit page for that container only (dump must still say rN, not Default):
+
+Enable:
+  App-level. If PNG already ON, do not tap. OCR cannot see UISwitch. Skip Enable.
+
+Formulate:
+  This is how identifiers change. Always do it after CLICK. Dump must still say this name, not Default / r1.
+  Dump 650_before_formulate. Must show Formulate AND this name.
+  If Formulate missing and Hide + Pasteboard visible: you are on Advanced. Tap Spoofer. Dump 650_spoofer. Then Formulate.
+  Tiny content nudge ONLY: swipe 375,820 -> 375,780. Not Ghost Home 780->60.
+  Dump 651_after_nudge.
+  long_tap Formulate card: x = clamp(form.x+180, 240, 560), y = form.center, hold 550ms.
+  Short tap_row misses. Do NOT tap Generate & Apply.
+  Dump 652_after_formulate (Updated! / Random Data is OK).
+
+Formulate missing:
+  Do NOT skip. Spoofer tab first. If Formulate still missing after Spoofer: ERROR, dump shot=True. Do not go Advanced without Formulate.
+
+Advanced:
+  Tap Advanced. Dump 661_advanced shot=True.
+  Must show Hide.
+  OCR cannot see knobs. Trust PNG.
+  OFF = inset white circle on a dark well (dumps/543_advanced.png).
+  ON  = filled track, knob far right (dumps/482_after_hide.png, dumps/550_appium.png).
+  Identical PNG bytes after a tap = miss. Retune. Do not spam.
+
+  tap_ghost_knob(title_node): x=626, y=title.center+38, touch.on hold 140ms.
+  Settings trailing-edge math (x=688 or 662) is empty margin. Never tap_switch here.
+
+  Order:
+    1. Hide
+    2. Pasteboard Prevent (the Prevent UNDER the Pasteboard header, not a random Prevent)
+    3. Appium Prevent (the Prevent UNDER Appium). If Appium missing: swipe 375,1050 -> 375,720 once. Dump. Then knob.
+  Leave Albums Restrict. Do not tap (i). Do not scroll unless Appium is missing.
+  Dump 665_advanced_done shot=True. Log ADVANCED=OK.
+
+Batch:
+  Create one name. Formulate/Advanced. close_ghost_organic. Reopen Ghost for the next name.
+  Do not stay in Ghost across containers.
+
+upsert_ghost(rN) writes logs/slots.json ghost=true. Email still empty until STEP E.
+
+
+## STEP G4 â€” close Ghost (organic)
+
+close_ghost_organic:
+  press_home. Dump 690_home.
+  double_home(280ms) â€” 80ms stays on SpringBoard.
+  Dump 691_switcher. Recents Ghost card OCR is near the top (y<400), not the SpringBoard Ghost icon.
+  interp_flick 375,780 -> 375,60. Wait. Dump 692.
+  press_home. SpringBoard.
+  Do not treat SpringBoard "Ghost" label as the recents card remaining.
+  Not killall. Not force-stop.
+
+Log: GHOST_CONTAINERS=rN
+Do not open Reddit signup.
+
+
+## STEP E1 â€” Hide My Email for THAT rN only
+
+Command:
+  .\.venv\Scripts\python.exe misc\mint_slot_email.py rN
+
+Requires ghost=true and email empty. Label typed on iOS = rN (not a fake First Last).
+
+What hidemyemail.py does (dump-first every screen):
+
+1. uiopen prefs:root=APPLE_ACCOUNT&path=ICLOUD_SERVICE/PRIVATE_EMAIL_MANAGE
+   This MAY open the pane. After that, taps come from the live dump. Never guess.
+
+2. Dump 03_hme_before_create.
+   If "Sign in to iCloud" password sheet: type secrets.json icloud_password into Password, tap OK.
+   Never print that password. If missing, user types it on the phone. Dump 03b after unlock.
+
+3. Existing @icloud.com rows on the list are OTHER addresses. Do not tap them.
+   Do not tap Azar / SIWA / privaterelay.appleid.com rows.
+
+4. Find Create from CREATE_LABELS: "+ Create New Address", "Create new address", ...
+   Forbidden: SIWA, delete address, turn off Hide My Email, Use different address, Home.
+   If Create missing: may have landed on iCloud main (Manage Storage). Find Hide My Email row.
+   Scroll 375,1000 -> 375,650 up to 6x. Dump each time. Tap Hide My Email, then find Create.
+   Still missing: STOP. Unlock iCloud+ Hide My Email on this Apple ID. Do not guess a +.
+
+5. Tap Create center from the dump. Wait ~2.5s.
+
+6. Dump 04_hme_after_create_N. Capture the NEW @icloud.com (not in the before-set).
+   Refuse non-icloud / privaterelay (those are SIWA).
+   Confirm Continue / Use this address / Next as needed (CONTINUE_LABELS), max 2 confirms.
+   Keep the FIRST Apple random. Do NOT tap Use different address. Do NOT filter dashes/dots.
+
+7. Label your address:
+   Field OCR often ~ (209, 877) â€” dump live, tap THAT node, not last run's point.
+   type_text rN (the slot id). Never paste. Never type a person's name unless the user said to.
+   Tap Next.
+   Dump 06_hme_after_label.
+
+8. All Set:
+   All Set is the TITLE. Tapping it does nothing.
+   Tap the bottom Done. Live ~ (375, 1251). Dump; prefer Done with y>1000.
+   If Done node missing but All Set visible: tap (375, 1251).
+   Dump 07_hme_after_done.
+
+9. Save:
+   logs/hidemyemail.json append {email, label=rN, source=iphone_settings_hide_my_email}
+   logs/slots.json that row: email=addr, email_label=rN
+   Log HIDE MY EMAIL: addr label=rN
+   STOP. This slice does not open Reddit.
+
+
+## STEP E2 â€” if the user deleted the old address
+
+  .\.venv\Scripts\python.exe misc\replace_slot_email.py rN
+
+Clears the slot email then mints a new one labeled rN.
+r2 used this after the user deleted flex26karate@icloud.com -> omelette_jowls.8g@icloud.com.
+Do not run this on r1/r2 unless the user said the address is gone.
+
+
+## Debug table
+
+Symptom: Yes, I'm sure! / Reset / Erase
+Cause: swiped Ghost Home
+Fix: STOP. Do not tap Yes. User recovers. Never swipe Ghost Home again
+
+Symptom: New Container tap does nothing
+Cause: OCR box is on the home indicator
+Fix: tap 50pt above, often (376, 1199). Dump must show Create
+
+Symptom: Name field shows a19 not a0019
+Cause: type_text one key; zeros dropped; or XXTouch "another script" mid-type
+Fix: type_text_block the whole name. Dump 626 must show a0019. Cancel leftover a19 sheet. Never Create a19
+
+Symptom: Open Code scrolling before Create / 623_scan dumps
+Cause: scan_live_r_ids / full-list sweep before New Container
+Fix: tap New Container / Create FIRST. Then scroll BOTTOM. Newest is above New Container
+
+Symptom: rN / a00NN not in list after Create
+Cause: looking A-Z / reversing the list / 920->780 footer flick
+Fix: chronological BOTTOM. Mid-list 720->360. Stuck: 700->340. Name y>1140: tap 50pt above. Never tap above New Container as a guess
+
+Symptom: still on Containers after tapping the name
+Cause: tap_row hit UUID
+Fix: tap_container_name x 160â€“300 on the name y. Radio "9" fallback
+
+Symptom: "already in this viewport -> skip" and identifiers unchanged
+Cause: name existed (a0017) so the script never CLICKed it
+Fix: skip New Container only. TAP the name. Formulate. User: click 17 to change the identifiers
+
+Symptom: Formulate not on screen
+Cause: dump landed on Advanced (Hide visible)
+Fix: tap Spoofer. Then Formulate. Do NOT skip Formulate and go Advanced
+
+Symptom: Generate & Apply
+Cause: it sits near Formulate
+Fix: never tap it. long_tap Formulate 550ms after tiny nudge only
+
+Symptom: knobs stay OFF
+Cause: tap_switch x=688/662 is empty margin, or y=title center misses the glass knob
+Fix: tap_ghost_knob x=626 y=title.center+38 hold 140ms. Compare PNG bytes
+
+Symptom: Enable went OFF
+Cause: tapped Enable while already ON
+Fix: PNG first. Skip Enable when ON
+
+Symptom: Ghost still in recents
+Cause: 80ms double-Home, or flicked SpringBoard icon
+Fix: double_home 280ms. Recents card y<400. interp_flick 375,780->375,60
+
+Symptom: Lua Runtime Error / "another script" / no touch
+Cause: dump lua still running, or per-key type_text stacked
+Fix: one Lua at a time. type_text_block for Ghost names. Wait. math.floor in dump
+
+Symptom: dump looks like Ghost Containers but is Crane
+Cause: Settings â†’ Crane â†’ Reddit. CONTAINERS y~163. Edit+Applications in the nav
+Fix: Home first. Then Ghost. Do not tap Crane Reddit. Ghost title Containers is y<120 or New Container
+
+Symptom: Ghost crashed to SpringBoard after Reddit tap
+Cause: Favorites heart tap ~(36,203) hit Back
+Fix: Application List already opens Favorites. tap_row Reddit only
+
+Symptom: iCloud password sheet
+Cause: Apple ID re-auth (r7 live)
+Fix: Password field + secrets icloud_password + OK. Never print it
+
+Symptom: Create New Address missing
+Cause: uiopen landed on iCloud storage, or iCloud+ Hide My Email off
+Fix: scroll, tap Hide My Email row. If still missing, tell user. No guessed +
+
+Symptom: Use different address / dashed local-part
+Cause: agent tried to "make it less botty"
+Fix: keep first Apple random. Only type the label rN
+
+Symptom: All Set does nothing
+Cause: tapped the title
+Fix: bottom Done ~ (375,1251)
+
+Symptom: mint_slot_email ERROR already has email
+Cause: slot is full
+Fix: STOP unless user deleted it, then replace_slot_email.py
+
+Symptom: attached cockle.47tersest
+Cause: leftover mail-labeled probe
+Fix: do not attach. Each slot gets a new Create
+
+Symptom: opened Reddit / Crane picker
+Cause: wrong slice
+Fix: Ghost+email STOP here. Create is LIVE_CREATE_PROMPT.txt only when asked

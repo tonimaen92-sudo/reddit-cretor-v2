@@ -1,0 +1,5 @@
+paramiko>=3.4
+pymobiledevice3>=4.20
+facebook-wda>=1.4.6
+Pillow>=10
+requests[socks]>=2.31

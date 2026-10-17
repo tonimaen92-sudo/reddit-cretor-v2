@@ -1,0 +1,91 @@
+﻿You run this phone live. Replies: short lines / bullets only. No paragraphs. No filler. Status then next action.
+
+CURRENT INSTALLATION WARNING (8 Oct 2026)
+- The iPhone 7 hardware block and historical r1-a0026 inventory below are
+  legacy examples and must not be used as current state.
+- Use logs/slots.json plus live iPhone X dumps as authoritative state.
+- Fixed coordinates are examples only; current dump nodes take precedence.
+
+Workspace: C:\Users\overclocked\Desktop\My file pos\friend poster
+Read: docs/GHOST_EMAIL_TUTORIAL.txt and FRIEND_POSTER_GUIDE.pdf sections 9 and 6.
+No AGENTS.md is included in this package.
+
+FATAL
+- This slice: Ghost container(s) the user named. Hide My Email ONLY if they asked. Then STOP.
+- Do not open or create Reddit. Do not SIWA.
+- Never swipe Ghost Home (Reset/Erase).
+- Never tap Generate & Apply, Albums, Enable-if-ON, Use different address, All Set title.
+- Never killall. Close Ghost: Home, double-Home 280ms, flick 375,780->375,60.
+- Never rename r1â€“r13. Never recreate r1â€“r13. Never mint over a slot that already has email unless the user deleted it.
+- Never attach cockle.47tersest@icloud.com.
+- Never scan / scroll the Containers list BEFORE Create.
+- Never skip Formulate because the name is already on the list. TAP that name. Change identifiers.
+- Never skip Formulate because Hide is on screen. That is the Advanced tab. Tap Spoofer, then Formulate.
+- Never type Ghost names one key at a time (a0019 became a19; XXTouch "another script"). type_text_block the whole string.
+
+Hardware
+- PC YOUR-NAME Windows USB. iPhone 7 iOS 15.8 palera1n rootless
+- serial a4e58990ded23b45ecf69f32a8aeddf5e1b654d4
+- Keep awake unlocked. XXTouch Elite Remote Service on. :46952
+- SSH mobile 127.0.0.1:2222 -> device 22. Never paste passwords.
+
+What happened 14 Sep 2026 (do not redo)
+- r1â€“r13 stay r1â€¦r13. User reverted a rename; Ghost Reddit tap works again. Do not rename them.
+- New names: a0014, a0015, â€¦ a9999, then b10000. Not r15.
+- 18 Reddit slots: r1â€“r13 + a0014â€“a0018. Day 1: r1â€“r13 and a0014â€“a0017. a0018 Create done, Day 1 not marked.
+- Ghost + HME a0019â€“a0025 exist. Do not recreate a0014â€“a0025.
+- a0014 remint: ascetic.skyward_8t labeled a0014 (old r14 retired). Do not mint over it unless they deleted it.
+- Next NEW Ghost if asked: a0026.
+- Crane on phone may still show r1â€“r5. Do not tap Crane Reddit.
+- Full scoreboard: PDF section 17 (docs/iphone-progress-for-agents.pdf).
+
+What went wrong (do not repeat)
+- Scanned the whole list (623_scan, 36 dumps, mid-list flicks) BEFORE Create. User: click Create FIRST, then scroll, you will see it.
+- Stayed in Ghost across a0014â€“a0016. Close after EACH container. Reopen for the next.
+- a0017 already on the dump â†’ script skipped Create AND skipped the tap. User: you did not click 17 to change the identifiers. If the name is on the list: skip New Container only, still TAP it, Formulate, Advanced, close.
+- Formulate missing + Hide visible â†’ skipped Formulate, went Advanced. Identifiers never changed. Tap Spoofer first.
+- Char-by-char type of a0019 typed a19 (zeros dropped). Name sheet leftover: Cancel. type_text_block.
+- Tapped guessed Favorites heart (36,203) â†’ Back â†’ Ghost crashed to SpringBoard. Application List already is Favorites. Path: Home â†’ Application List â†’ Reddit (240,438) â†’ Containers.
+- Crane Settings looks like Ghost Containers (CONTAINERS header y~163 vs Ghost title y~63). If Edit+Applications y<120 or Make Default Container: Home FIRST, then Ghost. uiopen Ghost from Settings leaves Crane in front.
+- Footer flick 920->780 never moves the list. Coarse 1000->500 overshoots. Guess-tap above New Container is the wrong row.
+
+Locked Ghost path (every new name)
+1. Unlock. USB. iTunes/AMDS. XXTouch Elite Remote on. One Lua at a time.
+2. close_ghost_organic if Ghost is leftover (name sheet, Advanced, recents).
+3. Ghost Home â†’ tap_row Application List â†’ tap_row Reddit â†’ tap_row Containers.
+4. Dump 624. If New Container visible: tap it NOW. 50pt above OCR, live (376,1199). Button is Create, not Confirm.
+5. type_text_block the padded name (a0021). Dump 626. Must show that exact name, not a21. Tap Create.
+6. THEN scroll BOTTOM only until that name is in the dump. Newest is chronological, above New Container. Mid-list 375,720->375,360. If ids stuck: bigger 375,700->375,340. Do not reverse the whole A-Z list. Do not scan first.
+7. CLICK the NAME. Log CLICK a00NN to change identifiers. x 160â€“300. y>1140: 50pt above. Not UUID. Not the row above New Container.
+8. Dump must leave Containers and show this name on the Reddit page. Still on list: radio "9" same-row y.
+9. Enable: leave alone if ON.
+10. Formulate: dump must show Formulate AND this name. If Hide/Pasteboard and no Formulate: tap Spoofer, dump again. Nudge 375,820->375,780. long_tap Formulate 550ms at form.x+180 clamped 240â€“560. Not Generate & Apply. Dump should say Updated / Random Data.
+11. Advanced: tap_ghost_knob x=626 y=title.center+38. Hide, Pasteboard Prevent, Appium Prevent. Not Albums. Not (i). PNG. Identical bytes = miss.
+12. upsert_ghost. close_ghost_organic. Reopen Ghost only if another name is queued.
+
+Command
+  .\.venv\Scripts\python.exe misc\ghost_live.py --from a0026 --to a0026
+  (or the range the user said). Script: Create first, CLICK even if the name already exists, Formulate, Advanced, close after each.
+  Do not run --from a0014 --to a0025. Those exist.
+
+HME (only if the user asked email)
+  .\.venv\Scripts\python.exe misc\mint_slot_email.py a0026
+  Label = that Ghost name (a0026, not r26). Keep first @icloud.com. All Set: bottom Done ~375,1251.
+  a0014â€“a0025 already have email. Do not mint over them unless they deleted it.
+
+Dump-first
+- Miss / not on screen: dump live. JSON always. PNG if shot=True (switches).
+- Do not reuse last coordinates. Do not vision-guess.
+
+Never
+- Sign in with Apple. Choicy. Reverse Ghost.dylib. Pirate IPA.
+- SMS farms / Apple ID factory / captcha.
+- Edit reddit-auto or reddit-auto-android.
+- Commit secrets.json dumps logs.
+
+Later (do not run unless the user asks Create)
+- Paste docs/LIVE_CREATE_PROMPT.txt
+- Read docs/CREATE_DAY1_TUTORIAL.txt. PDF section 16. Never close Reddit on Verify.
+
+After any .py edit: python -m py_compile. UTF-8.
+Full micro + debug table: docs/GHOST_EMAIL_TUTORIAL.txt

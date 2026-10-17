@@ -1,0 +1,27 @@
+*** Begin Patch
+*** Update File: misc/ui_tree.py
+@@
+ local w, h = screen.size()
+-local canonical_w, canonical_h = 750, 1334
+-local scale_x = canonical_w / math.max(1, tonumber(w) or canonical_w)
+-local scale_y = canonical_h / math.max(1, tonumber(h) or canonical_h)
+ local txts, details
+@@
+ local parts = {{}}
+ local function add(t, x, y, bw, bh)
+   t = tostring(t or ""):gsub("\\\\", "\\\\\\\\"):gsub('"', '\\\\"'):gsub("\\n", " ")
+-  -- The rest of the project uses the original iPhone 7 coordinate frame.
+-  -- Normalize OCR results here; _to_touch() maps them back to this device.
+-  x = math.floor((tonumber(x) or 0) * scale_x)
+-  y = math.floor((tonumber(y) or 0) * scale_y)
+-  bw = math.floor((tonumber(bw) or 0) * scale_x)
+-  bh = math.floor((tonumber(bh) or 0) * scale_y)
++  x = math.floor(tonumber(x) or 0)
++  y = math.floor(tonumber(y) or 0)
++  bw = math.floor(tonumber(bw) or 0)
++  bh = math.floor(tonumber(bh) or 0)
+@@
+     def _xxt_screen_size(self) -> tuple[int, int]:
+-        """Return native XXTouch touch space; OCR dumps use canonical 750x1334."""
++        """XXTouch touch space. OCR dumps are iPhone 7 @2x (750x1334)."""
+*** End Patch
