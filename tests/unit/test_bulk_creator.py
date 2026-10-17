@@ -568,8 +568,11 @@ class BatchCreatorTests(unittest.TestCase):
         app._bulk_slot_and_entry = lambda state: (
             "a0047", state["queue"][0], date(2005, 4, 20)
         )
-        pauses = []
-        app._pause_bulk = lambda phase, reason: pauses.append((phase, reason))
+        discards = []
+        app._discard_failed_bulk_slot = (
+            lambda sid, entry, reason, **kwargs:
+            discards.append((sid, entry, reason, kwargs.get("failure_code"))) or False
+        )
 
         def rejected(*_args, **_kwargs):
             app._last_pipeline_failure_reason = (
@@ -594,9 +597,181 @@ class BatchCreatorTests(unittest.TestCase):
         ):
             creator.App._run_bulk_batch(app)
 
-        self.assertEqual(len(pauses), 1)
+        self.assertEqual(len(discards), 1)
+        self.assertEqual(discards[0][0], "a0047")
+        self.assertIn("Sorry, please try again later", discards[0][2])
+        self.assertEqual(app.bulk_state["remaining"], 1)
+
+    def test_failed_pre_account_slot_waits_five_minutes_deletes_and_is_consumed(self):
+        app = self.app(1)
+        app.bulk_state.update(
+            stage="creating",
+            slot_id="a0047",
+            verified_ip="198.51.100.47",
+            verified_at_utc="2026-10-16T12:00:00Z",
+        )
+        app._pause_bulk = lambda *_args, **_kwargs: self.fail("unexpected pause")
+        phone = mock.Mock()
+        stack = object()
+        app._connect = lambda _password: (phone, stack)
+        entry = app.bulk_state["queue"][0]
+
+        with (
+            mock.patch.object(creator, "get_slot", return_value={"reddit": False}),
+            mock.patch.object(creator, "mark_creation_terminal_failure") as terminal,
+            mock.patch.object(creator, "delete_container") as delete,
+            mock.patch.object(creator, "retire_slot_id") as retire,
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+        ):
+            self.assertTrue(
+                creator.App._discard_failed_bulk_slot(
+                    app,
+                    "a0047",
+                    entry,
+                    "Email field still invalid.",
+                )
+            )
+
+        self.assertEqual(app.stop.waits, [300])
+        terminal.assert_called_once_with(
+            "a0047",
+            creator.AUTO_DISCARD_FAILURE_CODE,
+            "Email field still invalid.",
+            app.log,
+        )
+        delete.assert_called_once_with(stack, phone, "a0047")
+        retire.assert_called_once_with("a0047")
+        phone.close.assert_called_once_with()
+        self.assertEqual(app.bulk_state["remaining"], 0)
+        self.assertEqual(app.bulk_state["stage"], "idle")
+        self.assertEqual(
+            app.bulk_state["failures"][0]["code"],
+            creator.AUTO_DISCARD_FAILURE_CODE,
+        )
+
+    def test_stop_during_failed_slot_grace_period_preserves_container_and_queue(self):
+        app = self.app(1)
+        app.bulk_state.update(stage="creating", slot_id="a0047")
+        app.stop.flag = True
+        entry = app.bulk_state["queue"][0]
+
+        with (
+            mock.patch.object(creator, "get_slot", return_value={"reddit": False}),
+            mock.patch.object(
+                creator, "delete_container", side_effect=AssertionError("deleted")
+            ),
+        ):
+            self.assertFalse(
+                creator.App._discard_failed_bulk_slot(
+                    app, "a0047", entry, "Email field still invalid."
+                )
+            )
+
+        self.assertEqual(app.stop.waits, [300])
+        self.assertEqual(app.bulk_state["remaining"], 1)
+
+    def test_failed_slot_with_reddit_checkpoint_is_never_deleted(self):
+        app = self.app(1)
+        app.bulk_state.update(stage="creating", slot_id="a0047")
+        pauses = []
+        app._pause_bulk = lambda phase, reason, **kwargs: pauses.append(
+            (phase, reason, kwargs.get("code"))
+        )
+
+        with (
+            mock.patch.object(creator, "get_slot", return_value={"reddit": True}),
+            mock.patch.object(
+                creator, "delete_container", side_effect=AssertionError("deleted")
+            ),
+        ):
+            self.assertFalse(
+                creator.App._discard_failed_bulk_slot(
+                    app,
+                    "a0047",
+                    app.bulk_state["queue"][0],
+                    "Post-account cleanup failed.",
+                )
+            )
+
+        self.assertEqual(app.stop.waits, [])
         self.assertEqual(pauses[0][0], "creation")
-        self.assertIn("Sorry, please try again later", pauses[0][1])
+        self.assertEqual(app.bulk_state["remaining"], 1)
+
+    def test_unconfirmed_failed_container_delete_pauses_without_consuming_queue(self):
+        app = self.app(1)
+        app.bulk_state.update(stage="creating", slot_id="a0047")
+        phone = mock.Mock()
+        app._connect = lambda _password: (phone, object())
+        pauses = []
+        app._pause_bulk = lambda phase, reason, **kwargs: pauses.append(
+            (phase, reason, kwargs.get("code"))
+        )
+
+        with (
+            mock.patch.object(creator, "get_slot", return_value={"reddit": False}),
+            mock.patch.object(creator, "mark_creation_terminal_failure"),
+            mock.patch.object(
+                creator,
+                "delete_container",
+                side_effect=creator.PhoneError("target row missing"),
+            ),
+            mock.patch.object(creator, "retire_slot_id") as retire,
+        ):
+            self.assertFalse(
+                creator.App._discard_failed_bulk_slot(
+                    app,
+                    "a0047",
+                    app.bulk_state["queue"][0],
+                    "Email field still invalid.",
+                )
+            )
+
+        retire.assert_not_called()
+        self.assertEqual(pauses[0][2], "container_delete_failed")
+        self.assertIn("target row missing", pauses[0][1])
+        self.assertEqual(app.bulk_state["remaining"], 1)
+
+    def test_bridge_exhaustion_pauses_without_attempting_container_delete(self):
+        app = self.app(1)
+        app.bulk_state.update(
+            stage="retry_creation",
+            slot_id="a0047",
+            verified_ip="198.51.100.47",
+            verified_at_utc="2026-10-16T12:00:00Z",
+        )
+        app._bulk_slot_and_entry = lambda state: (
+            "a0047", state["queue"][0], date(2005, 4, 20)
+        )
+        pauses = []
+        app._pause_bulk = lambda phase, reason, **kwargs: pauses.append(
+            (phase, reason, kwargs.get("code"))
+        )
+
+        def bridge_failure(*_args, **_kwargs):
+            app._last_pipeline_failure_code = "bridge_retries_exhausted"
+            app._last_pipeline_failure_reason = "USB bridge unavailable."
+            return False
+
+        app._run_creation_pipeline = bridge_failure
+        app._discard_failed_bulk_slot = lambda *_args, **_kwargs: self.fail(
+            "container deletion attempted without a working bridge"
+        )
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(
+                creator,
+                "observe_proxy_without_trigger",
+                return_value=verified_result("198.51.100.47", "198.51.100.47"),
+            ),
+            mock.patch.object(creator, "get_slot", return_value={"reddit": False}),
+            mock.patch.object(creator, "_pipeline_slot_complete", return_value=False),
+        ):
+            creator.App._run_bulk_batch(app)
+
+        self.assertEqual(
+            pauses,
+            [("creation", "USB bridge unavailable.", "bridge_retries_exhausted")],
+        )
         self.assertEqual(app.bulk_state["remaining"], 1)
 
     def test_exhausted_a0049_is_recorded_and_a0050_gets_next_row_and_fresh_ip(self):
@@ -638,6 +813,18 @@ class BatchCreatorTests(unittest.TestCase):
             [],
         )
 
+        def discard(sid, entry, reason, *, failure_code=""):
+            ready = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            app._persist_bulk(
+                bulk_creation.consume_failed(
+                    dict(app.bulk_state), sid, code=failure_code,
+                    reason=reason, ready_at_utc=ready,
+                )
+            )
+            return True
+
+        app._discard_failed_bulk_slot = discard
+
         with (
             mock.patch.object(creator, "save_bulk_state", lambda _state: None),
             mock.patch.object(
@@ -650,9 +837,6 @@ class BatchCreatorTests(unittest.TestCase):
                 "set_slot_falcon_proxy_ip",
                 side_effect=lambda sid, ip, _at: attached_ips.append((sid, ip)),
             ),
-            mock.patch.object(
-                creator, "mark_creation_terminal_failure", return_value={}
-            ) as terminal,
             mock.patch.object(
                 creator,
                 "get_slot",
@@ -669,7 +853,6 @@ class BatchCreatorTests(unittest.TestCase):
         ):
             creator.App._run_bulk_batch(app)
 
-        terminal.assert_called_once()
         self.assertEqual(
             creation_calls,
             [("a0049", "QuietMoon49"), ("a0050", "QuietMoon50")],

@@ -44,6 +44,7 @@ from friend_poster.core.bulk_creation import (
     save_state_cas as save_bulk_state_cas,
 )
 from friend_poster.core.config import LOG_DIR, REDDIT_BUNDLE, SECRETS_PATH
+from friend_poster.device.crane_delete import delete_container
 from friend_poster.device.ghost_live import apply_reddit_containers
 from friend_poster.device.hidemyemail import create_one_hide_my_email
 from friend_poster.reddit.reddit_about import BIRTH_YEAR_MAX, BIRTH_YEAR_MIN
@@ -136,6 +137,8 @@ IP_HISTORY_PATH = os.path.join(PROJECT_DIR, "ip_history.txt")
 QA_SETTINGS_PATH = os.path.join(LOG_DIR, "qa_settings.json")
 HIDE_MY_EMAIL_LOG_PATH = os.path.join(LOG_DIR, "hidemyemail.json")
 PIPELINE_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@icloud\.com", re.I)
+FAILED_CONTAINER_GRACE_SECONDS = 5 * 60
+AUTO_DISCARD_FAILURE_CODE = "creation_auto_discarded"
 
 
 def load_qa_swipes() -> int:
@@ -2135,6 +2138,99 @@ class App:
         except (tk.TclError, AttributeError):
             pass
 
+    def _discard_failed_bulk_slot(
+        self,
+        sid: str,
+        entry: dict,
+        reason: str,
+        *,
+        failure_code: str = "",
+    ) -> bool:
+        """After a bounded grace period, delete one failed pre-account slot.
+
+        Returning True means the failed queue head was safely consumed and the
+        caller may continue.  Any uncertainty pauses the batch instead.
+        """
+        code = failure_code or AUTO_DISCARD_FAILURE_CODE
+        slot = get_slot(sid)
+        if slot and slot.get("reddit") is True:
+            self.log(
+                f"BATCH {sid}: container was not auto-deleted because its Reddit "
+                "account checkpoint already exists."
+            )
+            self._pause_bulk("creation", reason, code=code)
+            return False
+
+        self.log(
+            f"BATCH {sid}: creation failed; waiting "
+            f"{FAILED_CONTAINER_GRACE_SECONDS // 60} minutes before deleting the "
+            "failed Crane container and continuing."
+        )
+        if self.stop.wait(FAILED_CONTAINER_GRACE_SECONDS):
+            self.log(
+                f"BATCH {sid}: automatic container deletion cancelled by Stop; "
+                "the queue item was preserved."
+            )
+            return False
+
+        # A checkpoint can be written by the pipeline while shutdown is settling.
+        # Re-read it immediately before the destructive device operation.
+        slot = get_slot(sid)
+        if slot and slot.get("reddit") is True:
+            self.log(
+                f"BATCH {sid}: Reddit checkpoint appeared during the wait; "
+                "container was not auto-deleted."
+            )
+            self._pause_bulk("creation", reason, code=code)
+            return False
+
+        phone = None
+        try:
+            # Reserve the ID before touching Crane so a crash can never cause a
+            # deleted container name to be silently allocated again.
+            mark_creation_terminal_failure(sid, code, reason, self.log)
+            phone, stack = self._connect(self.bulk_password)
+            delete_container(stack, phone, sid)
+            retire_slot_id(sid)
+        except Exception as exc:
+            if self.stop.is_set():
+                self.log(
+                    f"BATCH {sid}: automatic container deletion cancelled by Stop; "
+                    "the queue item was preserved."
+                )
+                return False
+            cleanup_reason = (
+                f"Automatic deletion of failed container {sid} could not be "
+                f"confirmed: {exc}. The batch did not continue."
+            )
+            self._pause_bulk("creation", cleanup_reason, code="container_delete_failed")
+            return False
+        finally:
+            if phone is not None:
+                try:
+                    phone.close()
+                except Exception:
+                    pass
+            self.phone = None
+
+        ready = datetime.now(timezone.utc) + timedelta(
+            seconds=float(entry["delay_seconds"])
+        )
+        self._persist_bulk(
+            consume_failed(
+                dict(self.bulk_state),
+                sid,
+                code=code,
+                reason=reason,
+                ready_at_utc=ready.isoformat().replace("+00:00", "Z"),
+            )
+        )
+        self.log(
+            f"BATCH {sid}: failed Crane container deleted and slot retired; "
+            "continuing with a fresh proxy IP."
+        )
+        return True
+
     def _bulk_proxy_scope(self) -> str:
         return configured_scope(self.falcon_proxy_url, SECRETS_PATH)
 
@@ -2393,45 +2489,26 @@ class App:
                     failure_code = str(
                         getattr(self, "_last_pipeline_failure_code", "") or ""
                     )
-                    if failure_code == EmailReplacementExhausted.failure_code:
-                        mark_creation_terminal_failure(
-                            sid, failure_code, reason, self.log
-                        )
-                        ready = datetime.now(timezone.utc) + timedelta(
-                            seconds=float(entry["delay_seconds"])
-                        )
-                        self._persist_bulk(
-                            consume_failed(
-                                dict(self.bulk_state),
-                                sid,
-                                code=failure_code,
-                                reason=reason,
-                                ready_at_utc=ready.isoformat().replace("+00:00", "Z"),
-                            )
-                        )
-                        self.log(
-                            f"BATCH {sid}: terminal email-verification failure recorded; "
-                            "the saved queue will continue with a fresh proxy IP."
-                        )
-                        if self.bulk_state.get("stage") == "idle":
-                            failures = len(self.bulk_state.get("failures") or [])
-                            self.log(
-                                f"BATCH complete with failures: {failures} slot(s) failed "
-                                "after exhausting replacement aliases."
-                            )
-                            status = getattr(self, "status", None)
-                            if status is not None:
-                                status.set("Batch complete with failures")
-                            return
-                        continue
                     if failure_code == "bridge_retries_exhausted":
                         self._pause_bulk("creation", reason, code=failure_code)
                         return
-                    if failure_code:
-                        self._pause_bulk("creation", reason, code=failure_code)
-                    else:
-                        self._pause_bulk("creation", reason)
-                    return
+                    if not self._discard_failed_bulk_slot(
+                        sid,
+                        entry,
+                        reason,
+                        failure_code=failure_code,
+                    ):
+                        return
+                    if self.bulk_state.get("stage") == "idle":
+                        failures = len(self.bulk_state.get("failures") or [])
+                        self.log(
+                            f"BATCH complete with failures: {failures} slot(s) failed."
+                        )
+                        status = getattr(self, "status", None)
+                        if status is not None:
+                            status.set("Batch complete with failures")
+                        return
+                    continue
                 self._assert_bulk_requested_username(sid, entry, get_slot(sid), require_saved=True)
 
                 ready = datetime.now(timezone.utc) + timedelta(seconds=float(entry["delay_seconds"]))

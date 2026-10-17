@@ -1,7 +1,7 @@
 # UTF-8
-"""Delete Crane Reddit container r1 from the list.
+"""Delete an exact Crane Reddit container from the list.
 
-Edit (top right) -> red minus on the r1 row -> Delete. Not Delete Data.
+Edit (top right) -> red minus on the named row -> Delete. Not Delete Data.
 
   python misc/crane_delete.py r1
 """
@@ -14,6 +14,7 @@ import time
 from friend_poster.device.crane_backup import (  # noqa: E402
     dump,
     find_crane_name,
+    flick_list,
     log,
     open_crane,
     open_reddit_containers,
@@ -90,16 +91,38 @@ def tap_edit(stack: TapStack, phone: Phone, nodes):
 
 
 def tap_red_delete_r1(stack: TapStack, phone: Phone, nodes, name: str):
-    """Red minus is left of the r1 row. Then the row's Delete button."""
+    """Tap the red minus and Delete button for one exact container row."""
     row = find_crane_name(nodes, name)
+    last = None
+    stuck = 0
+    for i in range(14):
+        if row is not None:
+            break
+        log(f"{name} off-screen in Edit -> scroll Crane containers")
+        flick_list(stack)
+        blob, nodes = dump(stack, phone, f"731_edit_{i}")
+        labels = visible_labels(nodes)
+        log("EDIT " + labels)
+        row = find_crane_name(nodes, name)
+        stuck = stuck + 1 if labels == last else 0
+        last = labels
+        if stuck >= 3:
+            break
     if row is None:
-        raise PhoneError("r1 row not on Edit list. See 731_edit.")
+        raise PhoneError(
+            f"{name} row not on Edit list. See 731_edit dumps."
+        )
     if row.y < 140:
-        raise PhoneError("Refusing title-bar r1. Need the CONTAINERS row.")
+        raise PhoneError(
+            f"Refusing title-bar {name}. Need the CONTAINERS row."
+        )
     # Red minus sits left of the name, same row center.
     mx = max(36, min(row.x - 24, 70))
     my = row.center()[1]
-    log(f"TAP red minus for r1 at ({mx},{my}) row={collapsed_text(row.labels())} y={row.y}")
+    log(
+        f"TAP red minus for {name} at ({mx},{my}) "
+        f"row={collapsed_text(row.labels())} y={row.y}"
+    )
     stack.tap_xy(mx, my)
     time.sleep(0.7)
     blob, nodes = dump(stack, phone, "732_minus")
@@ -116,11 +139,11 @@ def tap_red_delete_r1(stack: TapStack, phone: Phone, nodes, name: str):
     if delete is None:
         delete = find_label_exact(nodes, ("Delete",))
     if delete is None:
-        raise PhoneError("Red Delete button not on r1 row. See 732_minus.")
+        raise PhoneError(f"Red Delete button not on {name} row. See 732_minus.")
     # Do not tap a Delete that sits on Default / r2.
     if abs(delete.center()[1] - my) > 70:
-        raise PhoneError("Delete button is not on the r1 row. See 732_minus.")
-    log("TAP red Delete on r1 row")
+        raise PhoneError(f"Delete button is not on the {name} row. See 732_minus.")
+    log(f"TAP red Delete on {name} row")
     tap_label_center(stack, delete, "Delete")
     time.sleep(1.2)
     os.environ.pop("SKIP_SHOT", None)
@@ -138,6 +161,11 @@ def tap_red_delete_r1(stack: TapStack, phone: Phone, nodes, name: str):
         time.sleep(1.2)
         blob, nodes = dump(stack, phone, "734_after_alert")
         log("AFTER_ALERT " + visible_labels(nodes))
+    if find_crane_name(nodes, name) is not None:
+        raise PhoneError(
+            f"Crane container {name} is still visible after Delete; deletion "
+            "was not confirmed."
+        )
     return nodes
 
 
