@@ -17,6 +17,7 @@ from friend_poster.reddit.reddit_open import (
     FeedCleanupProof,
     crane_haptic_parent,
     crane_submenu_marker,
+    make_created_account_feed_resume_proof,
     make_feed_cleanup_proof,
     make_terminal_feed_cleanup_proof,
     normalized_slot_window,
@@ -42,6 +43,13 @@ FEED_SWIPE_DELAY_MIN_SECONDS = 1.5
 FEED_SWIPE_DELAY_MAX_SECONDS = 3.5
 FEED_SWIPE_PAUSE_MIN_SECONDS = 3.0
 FEED_SWIPE_PAUSE_MAX_SECONDS = 7.0
+
+
+class FeedVisualRecoveryExhausted(PhoneError):
+    """Every bounded local feed classifier failed on an unknown UI state."""
+
+    ai_recoverable = True
+    failure_code = "feed_visual_recovery_exhausted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,11 +99,23 @@ def _wait_interruptibly(stack: TapStack, seconds: float, stop=None) -> None:
     _check_stop(stop)
 
 
-def _checkpoint_error(nodes) -> str:
+def _checkpoint_error(nodes, *, allow_created_account_feed_proof: bool = False) -> str:
     if proven_springboard(nodes):
         return "iPhone Home appeared"
     if _proven_crane_checkpoint(nodes):
         return "Crane container UI appeared"
+    # A structurally proven Reddit feed is authoritative.  Protected-flow
+    # words such as "About you" and "Interests" can also be ordinary post or
+    # advertisement text; scanning those words first would falsely pause a
+    # healthy feed session.  Frames without feed structure still retain the
+    # full protected-marker gate below.
+    if proven_reddit_feed_structure(nodes):
+        return ""
+    if (
+        allow_created_account_feed_proof
+        and make_created_account_feed_resume_proof(nodes) is not None
+    ):
+        return ""
     marker = protected_reddit_marker(nodes)
     if marker:
         return f"protected Reddit screen '{marker}' appeared"
@@ -137,6 +157,8 @@ def _dump_checkpoint(
     *,
     stop=None,
     continue_on_unclear: bool = False,
+    recover_from_home: Callable[[int], list] | None = None,
+    allow_created_account_feed_proof: bool = False,
     dump_fn=dump_named,
 ):
     last_nodes = []
@@ -153,12 +175,47 @@ def _dump_checkpoint(
             preview=False,
         )
         last_nodes = nodes
-        error = _checkpoint_error(nodes)
+        error = _checkpoint_error(
+            nodes,
+            allow_created_account_feed_proof=allow_created_account_feed_proof,
+        )
+        if error == "iPhone Home appeared" and recover_from_home is not None:
+            logger(
+                f"Feed checkpoint {completed}: iPhone Home appeared; reopening "
+                "the saved container before any later gesture."
+            )
+            nodes = recover_from_home(completed)
+            last_nodes = nodes
+            recovery_error = _checkpoint_error(
+                nodes,
+                allow_created_account_feed_proof=allow_created_account_feed_proof,
+            )
+            if recovery_error:
+                raise PhoneError(
+                    f"Feed swipe recovery after gesture {completed} stopped because "
+                    f"{recovery_error}."
+                )
+            if not proven_reddit_feed_structure(nodes) and not (
+                allow_created_account_feed_proof
+                and make_created_account_feed_resume_proof(nodes) is not None
+            ):
+                raise FeedVisualRecoveryExhausted(
+                    f"Feed swipe recovery after gesture {completed} did not prove "
+                    "the Reddit feed; no later gesture was sent."
+                )
+            logger(
+                f"Feed checkpoint {completed}: exact saved container reopened and "
+                "Reddit feed structure proven."
+            )
+            return nodes
         if error:
             raise PhoneError(
                 f"Feed swipe checkpoint after gesture {completed} stopped because {error}."
             )
-        if proven_reddit_feed_structure(nodes):
+        if proven_reddit_feed_structure(nodes) or (
+            allow_created_account_feed_proof
+            and make_created_account_feed_resume_proof(nodes) is not None
+        ):
             logger(f"Feed checkpoint {completed}: Reddit feed structure proven.")
             return nodes
         if capture < FEED_SWIPE_FRAME_RETRIES:
@@ -174,7 +231,7 @@ def _dump_checkpoint(
             "so the configured swipe sequence will continue."
         )
         return last_nodes
-    raise PhoneError(
+    raise FeedVisualRecoveryExhausted(
         f"Reddit feed structure was not proven after gesture {completed}; "
         "no later gesture was sent."
     )
@@ -188,6 +245,7 @@ def _strict_final_proof(
     *,
     stop=None,
     allow_unclear_completion: bool = False,
+    allow_created_account_feed_proof: bool = False,
     dump_fn=dump_named,
 ) -> FeedCleanupProof | None:
     candidate_nodes = nodes
@@ -196,6 +254,8 @@ def _strict_final_proof(
         proof = make_feed_cleanup_proof(candidate_nodes)
         if proof is None:
             proof = make_terminal_feed_cleanup_proof(candidate_nodes)
+        if proof is None and allow_created_account_feed_proof:
+            proof = make_created_account_feed_resume_proof(candidate_nodes)
         if proof is not None:
             logger("Final post-swipe feed proof established for exact cleanup.")
             return proof
@@ -212,7 +272,10 @@ def _strict_final_proof(
             persist=False,
             preview=False,
         )
-        error = _checkpoint_error(candidate_nodes)
+        error = _checkpoint_error(
+            candidate_nodes,
+            allow_created_account_feed_proof=allow_created_account_feed_proof,
+        )
         if error:
             raise PhoneError(f"Final feed proof stopped because {error}.")
     if allow_unclear_completion:
@@ -221,7 +284,7 @@ def _strict_final_proof(
             "swipes completed; exact-bundle Reddit cleanup is required."
         )
         return None
-    raise PhoneError(
+    raise FeedVisualRecoveryExhausted(
         "Final Reddit feed cleanup proof remained unclear. Account creation and "
         "swipe progress were saved; Reddit was not closed from stale evidence."
     )
@@ -239,6 +302,8 @@ def run_feed_swipes(
     initial_proof: FeedCleanupProof | None = None,
     require_final_proof: bool = True,
     continue_on_unclear: bool = False,
+    recover_from_home: Callable[[int], list] | None = None,
+    allow_created_account_feed_proof: bool = False,
     dump_fn=dump_named,
     pause_count: int = 0,
     fixed_delay_seconds: float | None = None,
@@ -300,6 +365,8 @@ def run_feed_swipes(
                 completed,
                 stop=stop,
                 continue_on_unclear=continue_on_unclear,
+                recover_from_home=recover_from_home,
+                allow_created_account_feed_proof=allow_created_account_feed_proof,
                 dump_fn=dump_fn,
             )
         if gesture in pause_positions:
@@ -341,6 +408,7 @@ def run_feed_swipes(
             latest_nodes,
             stop=stop,
             allow_unclear_completion=(continue_on_unclear and completed == target),
+            allow_created_account_feed_proof=allow_created_account_feed_proof,
             dump_fn=dump_fn,
         )
     logger(f"Feed swipe sequence completed: {completed}/{target}.")

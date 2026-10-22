@@ -128,11 +128,19 @@ def find_crane_name(nodes, name: str):
         if n.ntype == "ocr-line" or not n.on_screen():
             continue
         t = collapsed_text(n.labels())
-        if len("".join(t.split())) < 2:
+        # In Crane Edit mode the red remove control is OCR'd together with the
+        # name as ``- a0103``.  Strip exactly one leading edit glyph before
+        # matching; never strip arbitrary text or accept a partial slot name.
+        candidate = t.lstrip()
+        if candidate.startswith(("-", "−", "–", "—")):
+            candidate = candidate[1:].strip()
+        if candidate == collapsed_text(name):
+            return n
+        if len("".join(candidate.split())) < 2:
             continue
-        if loose_index(t) != want:
+        if loose_index(candidate) != want:
             continue
-        has_alpha = any(c.isalpha() for c in t)
+        has_alpha = any(c.isalpha() for c in candidate)
         if best is None or (has_alpha and not best[0]) or (
             has_alpha == best[0] and n.y < best[1].y
         ):

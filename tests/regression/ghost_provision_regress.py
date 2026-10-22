@@ -41,6 +41,7 @@ class FakeStack:
     def __init__(self):
         self.taps: list[tuple[int, int]] = []
         self.flicks: list[tuple[int, int, int, int]] = []
+        self.cleared_bundles: list[str] = []
 
     def check_cancelled(self) -> None:
         return None
@@ -53,6 +54,10 @@ class FakeStack:
 
     def wait(self, _seconds: float) -> None:
         return None
+
+    def clear_app_memory(self, bundle_id: str) -> str:
+        self.cleared_bundles.append(bundle_id)
+        return "already-stopped"
 
 
 def main() -> int:
@@ -484,7 +489,7 @@ def main() -> int:
         name: getattr(ghost_live, name)
         for name in (
             "get_slot", "close_ghost_organic", "open_reddit_containers",
-            "dump_named", "scan_named_container_instances",
+            "dump_named", "scan_all_container_instances",
             "_select_named_node", "formulate_named", "advanced_named",
             "mark_ghost_container_ready",
         )
@@ -498,8 +503,10 @@ def main() -> int:
         ghost_live.close_ghost_organic = lambda *_a, **_k: True
         ghost_live.open_reddit_containers = lambda *_a, **_k: None
         ghost_live.dump_named = lambda *_a, **_k: ("", select_frame)
-        ghost_live.scan_named_container_instances = (
-            lambda *_a, **_k: ({"OLD00001", "A7A7A7A7"}, select_frame)
+        ghost_live.scan_all_container_instances = (
+            lambda *_a, **_k: (
+                {"a0007": {"OLD00001", "A7A7A7A7"}}, select_frame
+            )
         )
         ghost_live._select_named_node = (
             lambda *_a, **_k: (_ for _ in ()).throw(

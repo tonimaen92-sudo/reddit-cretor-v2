@@ -28,6 +28,7 @@ VERIFY_NODES = [
     node("Continue", 900),
 ]
 USERNAME_NODES = [node("Create your username", 150)]
+ABOUT_NODES = [node("About you", 150), node("Birthday", 300)]
 
 
 class VerifyBackProofTests(unittest.TestCase):
@@ -121,6 +122,162 @@ class SlotEmailCheckpointTests(unittest.TestCase):
 
 
 class VerificationRotationStateMachineTests(unittest.TestCase):
+    def test_post_password_verify_reuses_active_email_and_reaches_about(self):
+        state = {
+            "id": "a0049",
+            "email": "alias0@icloud.com",
+            "email_label": "a0049",
+            "email_replacement_index": 0,
+            "email_verification": None,
+        }
+        marks = []
+        clears = []
+
+        def mark(_sid, index, label, phase, _log=None):
+            marks.append((index, label, phase))
+            state["email_verification"] = {
+                "replacement_index": index,
+                "label": label,
+                "phase": phase,
+            }
+
+        with (
+            mock.patch.object(create, "get_slot", side_effect=lambda _sid: dict(state)),
+            mock.patch.object(create, "mark_email_verification", side_effect=mark),
+            mock.patch.object(
+                create,
+                "clear_email_verification",
+                side_effect=lambda *_args: clears.append("cleared"),
+            ),
+            mock.patch.object(create, "poll_reddit_code", return_value="123456") as poll,
+            mock.patch.object(create, "type_code", return_value=ABOUT_NODES),
+            mock.patch.object(
+                create,
+                "wait_verification_outcome",
+                return_value=("about", ABOUT_NODES),
+            ) as wait,
+            mock.patch.object(
+                create,
+                "run_to_verify",
+                side_effect=AssertionError("post-password Verify resubmitted email"),
+            ),
+        ):
+            result = create._verify_email_after_password(
+                "a0049", object(), object(), VERIFY_NODES
+            )
+
+        self.assertEqual(result, ABOUT_NODES)
+        self.assertEqual(marks, [(0, "a0049", "submitted")])
+        self.assertEqual(clears, ["cleared"])
+        self.assertEqual(poll.call_args.kwargs["email_hint"], "alias0@icloud.com")
+        self.assertEqual(wait.call_args.kwargs["success_outcome"], "about")
+
+    def test_post_password_verify_unknown_transition_preserves_checkpoint(self):
+        state = {
+            "id": "a0049",
+            "email": "alias0@icloud.com",
+            "email_label": "a0049",
+            "email_replacement_index": 0,
+            "email_verification": None,
+        }
+
+        def mark(_sid, index, label, phase, _log=None):
+            state["email_verification"] = {
+                "replacement_index": index,
+                "label": label,
+                "phase": phase,
+            }
+
+        with (
+            mock.patch.object(create, "get_slot", side_effect=lambda _sid: dict(state)),
+            mock.patch.object(create, "mark_email_verification", side_effect=mark),
+            mock.patch.object(create, "clear_email_verification") as clear,
+            mock.patch.object(create, "poll_reddit_code", return_value="123456"),
+            mock.patch.object(create, "type_code", return_value=[node("Unknown")]),
+            mock.patch.object(
+                create,
+                "wait_verification_outcome",
+                return_value=("unknown", [node("Unknown")]),
+            ),
+        ):
+            with self.assertRaisesRegex(PhoneError, "did not reach"):
+                create._verify_email_after_password(
+                    "a0049", object(), object(), VERIFY_NODES
+                )
+        clear.assert_not_called()
+        self.assertEqual(state["email_verification"]["phase"], "submitted")
+
+    def test_post_password_verify_accepts_proven_username_replay_screen(self):
+        state = {
+            "id": "a0049",
+            "email": "alias0@icloud.com",
+            "email_label": "a0049",
+            "email_replacement_index": 0,
+            "email_verification": None,
+        }
+
+        def mark(_sid, index, label, phase, _log=None):
+            state["email_verification"] = {
+                "replacement_index": index,
+                "label": label,
+                "phase": phase,
+            }
+
+        clears = []
+        with (
+            mock.patch.object(create, "get_slot", side_effect=lambda _sid: dict(state)),
+            mock.patch.object(create, "mark_email_verification", side_effect=mark),
+            mock.patch.object(
+                create,
+                "clear_email_verification",
+                side_effect=lambda *_args: clears.append("cleared"),
+            ),
+            mock.patch.object(create, "poll_reddit_code", return_value="123456"),
+            mock.patch.object(create, "type_code", return_value=USERNAME_NODES),
+            mock.patch.object(
+                create,
+                "wait_verification_outcome",
+                return_value=("username", USERNAME_NODES),
+            ),
+        ):
+            result = create._verify_email_after_password(
+                "a0049", object(), object(), VERIFY_NODES
+            )
+        self.assertEqual(result, USERNAME_NODES)
+        self.assertEqual(clears, ["cleared"])
+
+    def test_replacement_reopens_active_bundle_without_crane_selection(self):
+        class Stack:
+            def __init__(self):
+                self.opened = []
+
+            def open_bundle(self, bundle):
+                self.opened.append(bundle)
+
+        stack = Stack()
+        with (
+            mock.patch.object(
+                to_verify, "dump_named", return_value=("", VERIFY_NODES)
+            ),
+            mock.patch.object(
+                to_verify, "wait_ui", return_value=VERIFY_NODES
+            ),
+            mock.patch.object(to_verify, "step", return_value="VERIFY"),
+            mock.patch.object(
+                to_verify,
+                "open_container",
+                side_effect=AssertionError("replacement reselected Crane container"),
+            ),
+        ):
+            to_verify.run_to_verify(
+                stack,
+                object(),
+                "a0049",
+                "replacement@icloud.com",
+                reuse_active_container=True,
+            )
+        self.assertEqual(stack.opened, [to_verify.REDDIT_BUNDLE])
+
     def test_migrated_timeout_reopens_exact_container_from_proven_home_only(self):
         home_nodes = parse_nodes(
             (DUMP_DIR / "880_pre_alias_resume_check.json").read_text(
@@ -246,8 +403,10 @@ class VerificationRotationStateMachineTests(unittest.TestCase):
                 return "123456"
             raise VerificationCodeTimeout("TimeoutError")
 
-        def submit(*_args, **_kwargs):
-            submissions.append(state["email"])
+        def submit(*_args, **kwargs):
+            submissions.append(
+                (state["email"], bool(kwargs.get("reuse_active_container")))
+            )
 
         def dump(*_args, **_kwargs):
             return "", list(VERIFY_NODES)
@@ -301,6 +460,113 @@ class VerificationRotationStateMachineTests(unittest.TestCase):
         self.assertTrue(issubclass(create.EmailReplacementExhausted, PhoneError))
         self.assertEqual(create.MAX_EMAIL_REPLACEMENTS, 3)
         self.assertNotIn("a0049-4", self.last_labels)
+
+
+class ReplacementPreparationTests(unittest.TestCase):
+    def _app(self):
+        app = creator.App.__new__(creator.App)
+        app.log = lambda _message: None
+        app.stop = mock.Mock()
+        app.stop.is_set.return_value = False
+        return app
+
+    def test_new_alias_is_created_without_an_ip_reset(self):
+        app = self._app()
+        order = []
+        checkpoint = {
+            "replacement_index": 1,
+            "label": "a0049-1",
+            "phase": "replacement_pending",
+        }
+        with (
+            mock.patch.object(creator, "get_slot", return_value={}),
+            mock.patch.object(
+                creator, "email_verification_state", return_value=checkpoint
+            ),
+            mock.patch.object(creator, "load_slots", return_value=[]),
+            mock.patch.object(creator, "_load_pipeline_email_records", return_value=[]),
+            mock.patch.object(creator, "_reconcile_pipeline_email", return_value=None),
+            mock.patch.object(
+                creator,
+                "create_one_hide_my_email",
+                side_effect=lambda *_args, **_kwargs: (
+                    order.append("email") or "new@icloud.com"
+                ),
+            ),
+            mock.patch.object(creator, "replace_slot_email"),
+        ):
+            result = app._replace_verification_email(
+                "a0049",
+                object(),
+                object(),
+                "old@icloud.com",
+                1,
+                "a0049-1",
+            )
+        self.assertEqual(result, "new@icloud.com")
+        self.assertEqual(order, ["email"])
+
+    def test_replacement_does_not_depend_on_ip_reset_configuration(self):
+        app = self._app()
+        checkpoint = {
+            "replacement_index": 1,
+            "label": "a0049-1",
+            "phase": "replacement_pending",
+        }
+        create_alias = mock.Mock(return_value="new@icloud.com")
+        with (
+            mock.patch.object(creator, "get_slot", return_value={}),
+            mock.patch.object(
+                creator, "email_verification_state", return_value=checkpoint
+            ),
+            mock.patch.object(creator, "load_slots", return_value=[]),
+            mock.patch.object(creator, "_load_pipeline_email_records", return_value=[]),
+            mock.patch.object(creator, "_reconcile_pipeline_email", return_value=None),
+            mock.patch.object(
+                creator, "create_one_hide_my_email", create_alias
+            ),
+            mock.patch.object(creator, "replace_slot_email"),
+        ):
+            result = app._replace_verification_email(
+                "a0049",
+                object(),
+                object(),
+                "old@icloud.com",
+                1,
+                "a0049-1",
+            )
+        self.assertEqual(result, "new@icloud.com")
+        create_alias.assert_called_once()
+
+    def test_reconciled_alias_does_not_trigger_a_second_ip_reset(self):
+        app = self._app()
+        checkpoint = {
+            "replacement_index": 1,
+            "label": "a0049-1",
+            "phase": "replacement_pending",
+        }
+        with (
+            mock.patch.object(creator, "get_slot", return_value={}),
+            mock.patch.object(
+                creator, "email_verification_state", return_value=checkpoint
+            ),
+            mock.patch.object(creator, "load_slots", return_value=[]),
+            mock.patch.object(creator, "_load_pipeline_email_records", return_value=[]),
+            mock.patch.object(
+                creator,
+                "_reconcile_pipeline_email",
+                return_value="existing@icloud.com",
+            ),
+            mock.patch.object(creator, "replace_slot_email"),
+        ):
+            app._replace_verification_email(
+                "a0049",
+                object(),
+                object(),
+                "old@icloud.com",
+                1,
+                "a0049-1",
+            )
 
 
 if __name__ == "__main__":

@@ -13,10 +13,15 @@ import re
 import sys
 import tempfile
 import time
+import unicodedata
 from friend_poster.core.config import DUMP_DIR, LOG_DIR
-from friend_poster.core.slots import get_slot, write_account_text  # noqa: E402
+from friend_poster.core.slots import (  # noqa: E402
+    CREATION_PROGRESS,
+    get_slot,
+    write_account_text,
+)
 from friend_poster.device.ssh_device import Phone, PhoneError  # noqa: E402
-from friend_poster.device.ui_tree import TapStack, collapsed_text, dump_named, find_label_exact  # noqa: E402
+from friend_poster.device.ui_tree import Node, TapStack, collapsed_text, dump_named, find_label_exact  # noqa: E402
 
 os.environ["SKIP_SHOT"] = "1"
 
@@ -70,6 +75,25 @@ SHOW_MORE_TOPICS_MARKERS = (
     "Shaw More Tonirc",
     "Chaw More Tonic",
 )
+# The anchor is OCR'd inconsistently by this device's engine ("Shaw More Tonirc",
+# "Chaw More Tonic", "Chaw More Tonine", ...) and reading it at pill height clips
+# its last word ("... Topics" -> "... Tonine").  Adding every mangling to the
+# marker list is a losing game, so recognition is layout-first: a control of the
+# right size and position whose two leading words still read as "show/shaw/chaw
+# more" is the anchor even when its tail is unreadable.
+SHOW_MORE_PREFIX_FIRST = ("show", "shaw", "chaw")
+SHOW_MORE_PREFIX_SECOND = {"more"}
+# A partially clipped anchor is rebuilt from its first words; a whole extra word
+# that Reddit never renders (the observed "tonine") is dropped rather than trusted.
+SHOW_MORE_CANONICAL = "show more topics"
+SHOW_MORE_KEEP_WORDS = 2
+# Photographing a pill at glyph height cuts its descenders, so the anchor is only
+# trusted when its lower edge sits clearly inside the captured frame.
+SHOW_MORE_RELATIVE_Y_MAX = 0.95
+CUSTOMIZE_ANCHOR_FIX_SCROLLS = 2
+CUSTOMIZE_ANCHOR_FIX_SETTLE_SECONDS = 0.6
+CUSTOMIZE_PENDING_VERIFY_RETRIES = 3
+CUSTOMIZE_PENDING_VERIFY_SETTLE_SECONDS = 0.8
 CUSTOMIZE_TITLE_Y = (140, 260)
 CUSTOMIZE_ACTION_Y = (1180, 1285)
 CUSTOMIZE_ANCHOR_X = (20, 350)
@@ -107,6 +131,7 @@ def small_scroll(stack: TapStack, back: bool = False) -> None:
         stack.interp_flick(375, 720, 375, 880, steps=16, ms=28)
     else:
         stack.interp_flick(375, 880, 375, 720, steps=16, ms=28)
+    CREATION_PROGRESS.note()
 
 
 def interests_screen(nodes) -> bool:
@@ -168,25 +193,63 @@ def customize_action_nodes(nodes):
     return skip, continue_node
 
 
+def _label_words(node) -> list[str]:
+    return [w for w in collapsed_text(node.labels()).split() if w]
+
+
+def _reads_show_more(node) -> bool:
+    """True when a node's leading words still identify the Show-More control."""
+    words = _label_words(node)
+    return (
+        len(words) >= 2
+        and words[0] in SHOW_MORE_PREFIX_FIRST
+        and words[1] in SHOW_MORE_PREFIX_SECOND
+    )
+
+
 def show_more_topics_node(nodes):
-    """Return Reddit's unique lower-page topic anchor on a proven action layout."""
+    """Return Reddit's unique lower-page topic anchor on a proven action layout.
+
+    Named markers are matched first.  When OCR mangles the tail, the control is
+    recognised from its shape and its surviving "show/shaw/chaw more" prefix, and
+    its label is normalised to the canonical ``show more topics`` so the clipped
+    reading can never leak in as a topic.
+    """
     skip, continue_node = customize_action_nodes(nodes)
     if skip is None or continue_node is None:
         return None
     action_top = min(skip.y, continue_node.y)
-    hits = [
-        node
-        for node in nodes
-        if node.ntype != "ocr-line"
-        and node.on_screen()
-        and collapsed_text(node.labels())
-        in tuple(collapsed_text(label) for label in SHOW_MORE_TOPICS_MARKERS)
-        and CUSTOMIZE_ANCHOR_Y[0] <= node.y <= CUSTOMIZE_ANCHOR_Y[1]
-        and CUSTOMIZE_ANCHOR_X[0] <= node.x <= CUSTOMIZE_ANCHOR_X[1]
-        and 140 <= node.w <= 320
-        and 12 <= node.h <= 35
-        and node.y + node.h < action_top
-    ]
+    named = tuple(collapsed_text(label) for label in SHOW_MORE_TOPICS_MARKERS)
+    hits = []
+    for node in nodes:
+        if node.ntype == "ocr-line" or not node.on_screen():
+            continue
+        if not (CUSTOMIZE_ANCHOR_Y[0] <= node.y <= CUSTOMIZE_ANCHOR_Y[1]):
+            continue
+        if not (CUSTOMIZE_ANCHOR_X[0] <= node.x <= CUSTOMIZE_ANCHOR_X[1]):
+            continue
+        if not (140 <= node.w <= 320 and 12 <= node.h <= 35):
+            continue
+        if not node.y + node.h < action_top:
+            continue
+        blob = collapsed_text(node.labels())
+        if blob in named:
+            hits.append(node)
+        elif _reads_show_more(node):
+            hits.append(Node(
+                ntype=node.ntype,
+                name=node.name,
+                label=SHOW_MORE_CANONICAL,
+                value=node.value,
+                text=SHOW_MORE_CANONICAL,
+                x=node.x,
+                y=node.y,
+                w=node.w,
+                h=node.h,
+                visible=node.visible,
+                enabled=node.enabled,
+                raw=node.raw,
+            ))
     return hits[0] if len(hits) == 1 else None
 
 
@@ -227,8 +290,21 @@ def customize_screen(nodes) -> bool:
 
 
 def customize_topic_label(node) -> str:
-    """Ignore OCR's leading checkmark mark on a selected topic label."""
-    return re.sub(r"^[~✓✔☑√]\s*", "", collapsed_text(node.labels()))
+    """Ignore OCR's leading checkmark mark on a selected topic label.
+
+    The checkmark is only stripped when the remainder still reads like a topic.
+    OCR renders a checked pill's glyph as ``~``/``v``-ish, and the real glyph was
+    observed inside a genuine name (a0060 ``"~ Productivity"``), so a blind strip
+    silently renames the topic and breaks every checkpoint comparison.  A bare
+    ``~x``/``v x`` remainder (no second word) is therefore kept verbatim.
+    """
+    label = collapsed_text(node.labels())
+    stripped = re.sub("^[\\u007e\\u2713\\u2714\\u2611\\u221a]\\s*", "", label)
+    # Only strip when the remainder still reads like a topic; a lone glyph with no
+    # second word (e.g. a genuine "~ x") is left verbatim.
+    if stripped != label and len(stripped.split()) >= 2:
+        return stripped
+    return label
 
 
 def _customize_titled_but_unproven(nodes) -> bool:
@@ -285,7 +361,17 @@ def native_notification_prompt(nodes) -> bool:
 
 def ads_reject_node(nodes):
     """Return the bounded Reject action on the proven ads-consent page."""
-    if find_label_exact(nodes, ("Your ads personalization choices",)) is None:
+    blob = _label_blob(nodes)
+    has_title = find_label_exact(
+        nodes, ("Your ads personalization choices",)
+    ) is not None
+    has_settings_copy = (
+        "reddit allows you to manage your ads" in blob
+        and "privacy policy" in blob
+        and "cookie policy" in blob
+        and find_label_exact(nodes, ("Accept",)) is not None
+    )
+    if not (has_title or has_settings_copy):
         return None
     for node in nodes:
         if node.ntype == "ocr-line" or not node.on_screen():
@@ -299,8 +385,35 @@ def ads_reject_node(nodes):
 
 
 def ads_personalization_screen(nodes) -> bool:
-    """Reddit's dedicated post-signup ads-consent page."""
+    """Reddit's dedicated post-signup ads-consent page.
+
+    Some app versions open this as a Settings sheet without rendering the old
+    ``Your ads personalization choices`` heading.  Require the distinctive
+    Reddit explanation, both policy names, and both bounded actions before
+    accepting that layout; generic Settings pages remain excluded.
+    """
     return ads_reject_node(nodes) is not None
+
+
+def ads_close_node(nodes):
+    """Return the bounded close action on the proven ads-consent sheet.
+
+    After Reject, some Reddit builds raise the notification explanation over
+    the still-visible ads sheet.  Dismissing that explanation reveals a close
+    action in the sheet header; the preference has already been recorded and
+    tapping Reject again would be both unnecessary and ambiguous.
+    """
+    if not ads_personalization_screen(nodes):
+        return None
+    for node in nodes:
+        if node.ntype == "ocr-line" or not node.on_screen():
+            continue
+        if collapsed_text(node.labels()) not in ("x", "х", "×"):
+            continue
+        if node.x < 630 or node.x + node.w > 750 or node.y < 100 or node.y > 240:
+            continue
+        return node
+    return None
 
 
 def proven_home_feed(nodes) -> bool:
@@ -454,6 +567,7 @@ def tap_continue_bar(
 def _wait_screen_close(stack, phone, predicate, stem: str, label: str):
     last = None
     for attempt in range(INTERESTS_TRANSITION_MAX_DUMPS):
+        CREATION_PROGRESS.note()
         time.sleep(0.9)
         dump_stem = stem if attempt == 0 else f"{stem}_{attempt}"
         _blob, last = dump_named(
@@ -487,12 +601,21 @@ def _wait_after_single_tap(
     predicate,
     stem: str,
     label: str,
+    *,
+    transition_predicates=(),
 ):
     last = None
     for attempt in range(POST_INTERESTS_MAX_DUMPS):
+        CREATION_PROGRESS.note()
         time.sleep(0.9)
         dump_stem = stem if attempt == 0 else f"{stem}_{attempt}"
         _blob, last = dump_named(stack, phone, dump_stem, log, shot=True)
+        if any(transition(last) for transition in transition_predicates):
+            log(
+                f"{label} produced a distinct verified follow-up prompt; "
+                "treating the original tap as complete."
+            )
+            return last
         if predicate(last):
             log(
                 f"{label} transition pending; no second tap "
@@ -518,6 +641,7 @@ def advance_post_interests(stack: TapStack, phone: Phone, *, initial_nodes=None)
     notification_tapped = False
     native_tapped = False
     ads_tapped = False
+    ads_close_tapped = False
     for _stage in range(4):
         if proven_home_feed(nodes):
             log("POST_INTERESTS=HOME_FEED")
@@ -565,9 +689,30 @@ def advance_post_interests(stack: TapStack, phone: Phone, *, initial_nodes=None)
 
         if ads_personalization_screen(nodes):
             if ads_tapped:
-                raise PhoneError(
-                    "Ads personalization remained after exact Reject. Did not tap again."
+                close = ads_close_node(nodes)
+                if close is None or ads_close_tapped:
+                    raise PhoneError(
+                        "Ads personalization remained after exact Reject and has no "
+                        "single unused bounded close action. Did not tap again."
+                    )
+                log(
+                    f"Ads personalization preference saved; close sheet "
+                    f"[{close.x},{close.y} {close.w}x{close.h}]"
                 )
+                stack.tap_xy(*close.center())
+                ads_close_tapped = True
+                nodes = _wait_after_single_tap(
+                    stack,
+                    phone,
+                    ads_personalization_screen,
+                    "932_after_ads_close",
+                    "ads close",
+                    transition_predicates=(
+                        notification_sheet,
+                        native_notification_prompt,
+                    ),
+                )
+                continue
             reject = ads_reject_node(nodes)
             if reject is None:
                 raise PhoneError("Ads personalization has no exact Reject. Did not tap.")
@@ -580,6 +725,10 @@ def advance_post_interests(stack: TapStack, phone: Phone, *, initial_nodes=None)
                 ads_personalization_screen,
                 "931_after_ads_reject",
                 "ads Reject",
+                transition_predicates=(
+                    notification_sheet,
+                    native_notification_prompt,
+                ),
             )
             continue
 
@@ -693,12 +842,118 @@ def _save_customize_checkpoint(sid: str, state: dict) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        # OneDrive and antivirus scanners can briefly open the existing target
+        # without delete sharing.  On Windows that makes an otherwise atomic
+        # replace fail with PermissionError/WinError 5.  Keep the fully flushed
+        # temp file and retry the replace instead of pausing a healthy phone run.
+        for attempt in range(10):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(min(0.25 * (attempt + 1), 1.0))
     except OSError as exc:
         raise PhoneError("Interests checkpoint could not be saved.") from exc
     finally:
         if temporary and os.path.exists(temporary):
-            os.unlink(temporary)
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _canonical_checked_label(label: str, expected: set[str]) -> str:
+    """Map any one-glyph checkmark OCR prefix to any expected topic label.
+
+    This is topic-agnostic: ``expected`` comes from the durable checkpoint made
+    before the tap, so new Reddit topic names need no code change.  A prefix is
+    removed only when the entire remaining label is an exact expected topic and
+    the prefix is one OCR glyph shaped like punctuation/symbol (or the observed
+    ASCII ``V`` checkmark).  Ordinary words are never trimmed.
+    """
+    if label in expected:
+        return label
+    matches: list[str] = []
+    for candidate in expected:
+        if not candidate:
+            continue
+        prefix = ""
+        remainder = ""
+        if label.endswith(candidate):
+            prefix = label[: -len(candidate)].strip()
+            remainder = candidate
+        else:
+            parts = label.split(maxsplit=1)
+            if len(parts) == 2:
+                prefix, remainder = parts
+        if len(prefix) != 1:
+            continue
+        category = unicodedata.category(prefix)
+        is_checkmark_prefix = prefix.casefold() == "v" or category.startswith(("P", "S"))
+        if is_checkmark_prefix and (
+            remainder == candidate or _at_most_one_ocr_edit(remainder, candidate)
+        ):
+            matches.append(candidate)
+    if len(matches) == 1:
+        return matches[0]
+    return label
+
+
+def _at_most_one_ocr_edit(observed: str, expected: str) -> bool:
+    """Return True for one OCR insertion, deletion, or substitution.
+
+    Reddit can repaint a selected pill with a checkmark and move its text.  On
+    the live a0231 frame the same topic changed from ``prut`` to ``pr$ut``.
+    This deliberately small comparison is only used after the pill fill has
+    already been classified as selected and the row still matches the durable
+    pending-tap checkpoint.
+    """
+    left = observed.casefold()
+    right = expected.casefold()
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > 1:
+        return False
+    if len(left) == len(right):
+        return sum(a != b for a, b in zip(left, right)) == 1
+    if len(left) < len(right):
+        left, right = right, left
+    # ``left`` is exactly one character longer.  Removing one glyph must make
+    # it equal to ``right``; no broader fuzzy matching is allowed.
+    for index in range(len(left)):
+        if left[:index] + left[index + 1 :] == right:
+            return True
+    return False
+
+
+class CustomizeSelectionUnclear(PhoneError):
+    """A pending Customize tap that local evidence cannot safely reconcile."""
+
+    ai_recoverable = False
+
+
+def _pending_checked_pill_matches(node, label: str, pending: dict) -> bool:
+    """Bind one checked pill to the single tap saved before the live action.
+
+    Exact labels survive Reddit's grid reflow.  OCR-drifted labels normally
+    require the old row plus bounded proximity.  A selected pill may also gain
+    a checkmark and expose/lose a diacritic (real a0244: the pending OCR and the
+    checked OCR differed by more than one edit).  In that case, actual overlap
+    with the saved pre-tap bounds on the same row is a stronger identity than
+    the label.  Adjacent pills cannot satisfy the overlap gate.
+    """
+    canonical = str(pending["label"])
+    px, py, pw, ph = pending["bounds"]
+    same_row = abs(node.center()[1] - (py + ph / 2)) <= 24
+    overlaps = min(node.x + node.w, px + pw) > max(node.x, px)
+    nearby = abs(node.center()[0] - (px + pw / 2)) <= 160
+    if label == canonical:
+        return True
+    if same_row and (overlaps or nearby) and _at_most_one_ocr_edit(label, canonical):
+        return True
+    return same_row and overlaps and nearby
 
 
 def _selected_customize_topics(
@@ -753,29 +1008,21 @@ def _selected_customize_topics(
                             classifications.append("unknown")
                 if classifications.count("selected") >= 5:
                     # A checked pill's glyph is occasionally merged into its
-                    # OCR label as an ASCII "V" (a0051: "V RPGs").  Only
-                    # remove that prefix when the remainder exactly matches a
-                    # selection already expected by the resumable checkpoint;
-                    # this avoids corrupting genuine V-prefixed topic names.
-                    if label[:2] in ("v ", "/ ", "\\ ") and label[2:] in expected:
-                        label = label[2:]
+                    # OCR label as a checkmark-like prefix (a0051: "V RPGs";
+                    # a0145: "• Hiking").  Only remove that prefix when the
+                    # remainder exactly matches a selection already expected
+                    # by the resumable checkpoint; this avoids corrupting
+                    # genuine V- or symbol-prefixed topic names.
+                    label = _canonical_checked_label(label, expected)
                     if pending is not None:
                         canonical = str(pending["label"])
-                        px, py, pw, ph = pending["bounds"]
-                        same_row = abs(node.center()[1] - (py + ph / 2)) <= 24
-                        overlaps = min(node.x + node.w, px + pw) > max(node.x, px)
-                        one_drift = (
-                            len(label) == len(canonical)
-                            and sum(a != b for a, b in zip(label, canonical)) <= 1
-                        )
                         # Reddit reflows the pill grid when a selected pill
                         # grows to make room for its checkmark (observed on
                         # a0056: Formula 1 moved onto the following row). An
                         # exact canonical label is still a unique identity
-                        # after that reflow. OCR-drift recovery stays stricter
-                        # and still requires the original row and overlap.
-                        exact_label = label == canonical
-                        if exact_label or (same_row and overlaps and one_drift):
+                        # after that reflow. OCR-drift recovery stays stricter:
+                        # it requires the original row and bounded proximity.
+                        if _pending_checked_pill_matches(node, label, pending):
                             pending_matches.append((label, node))
                             label = canonical
                     selected.add(label)
@@ -810,6 +1057,113 @@ def _capture_customize_state(
     )
 
 
+def _capture_pending_customize_state(
+    stack: TapStack,
+    phone: Phone,
+    stem: str,
+    expected_labels: set[str],
+    pending: dict,
+):
+    """Re-capture a pending tap without ever issuing a second tap.
+
+    Reddit can paint the selected fill before OCR settles on the checkmark
+    glyph.  A bounded series of fresh screenshots safely resolves that visual
+    race.  If every frame remains ambiguous, a typed non-AI error preserves the
+    checkpoint and pauses rather than spending recovery API calls.
+    """
+    last_error: PhoneError | None = None
+    for attempt in range(CUSTOMIZE_PENDING_VERIFY_RETRIES + 1):
+        retry_stem = stem if attempt == 0 else f"{stem}_retry_{attempt}"
+        try:
+            return _capture_customize_state(
+                stack,
+                phone,
+                retry_stem,
+                expected_labels,
+                pending=pending,
+            )
+        except PhoneError as exc:
+            last_error = exc
+            if attempt >= CUSTOMIZE_PENDING_VERIFY_RETRIES:
+                raise CustomizeSelectionUnclear(str(exc)) from exc
+            log(
+                "Pending Customize selection is not yet proven; waiting for "
+                f"a fresh frame ({attempt + 1}/{CUSTOMIZE_PENDING_VERIFY_RETRIES})."
+            )
+            time.sleep(CUSTOMIZE_PENDING_VERIFY_SETTLE_SECONDS)
+    raise last_error or PhoneError("Pending Customize selection could not be proven.")
+
+
+def _anchor_fully_visible(anchor, height: int) -> bool:
+    """True when the anchor is clearly inside the frame, not cut by its bottom."""
+    return anchor.y + anchor.h <= SHOW_MORE_RELATIVE_Y_MAX * height
+
+
+def _prove_customize_anchor(
+    stack: TapStack,
+    phone: Phone,
+    nodes,
+    stem: str,
+    *,
+    expected_labels: set[str] | None = None,
+):
+    """Prove the topic-list boundary before any pill is classified.
+
+    A clipped "Show More Topics" control is not a confident boundary: its mangled
+    label can slip into the topic list (the a0140 "Chaw More Tonine" failure) and
+    the topics below it are not yet on screen.  Take a fresh snapshot, nudge the
+    list with a bounded number of small scrolls until the control is fully
+    visible, then re-prove.  If it never becomes reliable, stop without tapping.
+    """
+    for attempt in range(CUSTOMIZE_ANCHOR_FIX_SCROLLS + 1):
+        anchor = show_more_topics_node(nodes)
+        if anchor is not None and _label_words(anchor):
+            # Only the saved png can prove the lower edge is inside the frame;
+            # without it, a labelled marker is still trusted.
+            from PIL import Image
+
+            png_path = os.path.join(DUMP_DIR, stem + ".png")
+            if not os.path.isfile(png_path):
+                return nodes
+            with Image.open(png_path) as source:
+                height = source.height
+            if _anchor_fully_visible(anchor, height):
+                return nodes
+        if attempt == CUSTOMIZE_ANCHOR_FIX_SCROLLS:
+            break
+        log("Customize topic anchor is clipped; scrolling once to prove the topic list.")
+        small_scroll(stack)
+        time.sleep(CUSTOMIZE_ANCHOR_FIX_SETTLE_SECONDS)
+        stem = stem + "_anchor_fix"
+        _blob, nodes = dump_named(stack, phone, stem, log, shot=True)
+    raise PhoneError(
+        "Customize topic list boundary (Show More Topics) is clipped or could not be "
+        "proven; saved a fresh screenshot and did not tap any topic."
+    )
+
+
+def _clip_leading_words(node, keep: int):
+    """Keep only the first ``keep`` OCR words of a node, preserving its bounds."""
+    words = _label_words(node)
+    if len(words) <= keep:
+        return node
+    trimmed = " ".join(words[:keep])
+    return Node(
+        ntype=node.ntype,
+        name=node.name,
+        label=trimmed,
+        value=node.value,
+        text=trimmed,
+        x=node.x,
+        y=node.y,
+        w=node.w,
+        h=node.h,
+        visible=node.visible,
+        enabled=node.enabled,
+        raw=node.raw,
+    )
+
+
 def pick_customize_feed(
     stack: TapStack,
     phone: Phone,
@@ -831,12 +1185,18 @@ def pick_customize_feed(
     expected = set(checkpoint["customize"])
     if pending is not None:
         expected.add(str(pending["label"]))
+    # Prove the topic-list boundary from the live screen before anything else is
+    # classified or tapped.  A clipped boundary is the a0140 failure mode.
+    anchor_nodes = initial_nodes if initial_nodes is not None else []
+    nodes = _prove_customize_anchor(
+        stack, phone, anchor_nodes, "924_customize_live", expected_labels=expected
+    )
     if pending is None:
         nodes, selected = _capture_customize_state(
             stack, phone, "924_customize_live", expected
         )
     else:
-        nodes, selected = _capture_customize_state(
+        nodes, selected = _capture_pending_customize_state(
             stack, phone, "924_customize_live", expected, pending=pending
         )
     saved = set(checkpoint["customize"])
@@ -850,6 +1210,7 @@ def pick_customize_feed(
             )
         checkpoint["customize"] = sorted(selected)
         _save_customize_checkpoint(sid, checkpoint)
+        CREATION_PROGRESS.note()
     if len(selected) > INTEREST_SELECTION_COUNT:
         raise PhoneError("Customize your feed has more than four selected topics; no topic was tapped.")
     checkpoint["customize"] = sorted(selected)
@@ -861,7 +1222,22 @@ def pick_customize_feed(
         checkpoint["pending_customize"] = None
         _save_customize_checkpoint(sid, checkpoint)
     while len(selected) < want:
-        pool = {customize_topic_label(node): node for node in customize_topics(nodes)}
+        anchor = show_more_topics_node(nodes)
+        pool: dict[str, object] = {}
+        for node in customize_topics(nodes):
+            if anchor is not None and _reads_show_more(node):
+                # Belt and braces for the clipped boundary: even if the anchor's
+                # mangled tail survived the shape filter, only its canonical
+                # "show more" head may ever enter the pool - never as a topic.
+                node = _clip_leading_words(node, SHOW_MORE_KEEP_WORDS)
+            # Selected pills may expose their checkmark as an OCR prefix
+            # (``V Italy``, ``• Hiking``, etc.).  Canonicalize every visible
+            # row against the already verified selections before constructing
+            # the candidate pool, so an existing selection can never be
+            # offered and tapped a second time under its prefixed spelling.
+            visible_label = customize_topic_label(node)
+            canonical_label = _canonical_checked_label(visible_label, selected)
+            pool[canonical_label] = node
         choices = [label for label in pool if label not in selected]
         if len(choices) < want - len(selected):
             raise PhoneError("Customize your feed has too few unselected topics; no topic was tapped.")
@@ -878,7 +1254,7 @@ def pick_customize_feed(
         log(f"tap customize {label!r} [{found.x},{found.y} {found.w}x{found.h}]")
         stack.tap_xy(*found.center())
         time.sleep(0.45)
-        nodes, observed = _capture_customize_state(
+        nodes, observed = _capture_pending_customize_state(
             stack,
             phone,
             f"925_customize_verified_{len(selected) + 1}",
@@ -894,13 +1270,14 @@ def pick_customize_feed(
         checkpoint["customize"] = sorted(selected)
         checkpoint["pending_customize"] = None
         _save_customize_checkpoint(sid, checkpoint)
+        CREATION_PROGRESS.note()
 
     if checkpoint["pending_customize"] is None:
         ready, confirmed = _capture_customize_state(
             stack, phone, "926_customize_picked", selected
         )
     else:
-        ready, confirmed = _capture_customize_state(
+        ready, confirmed = _capture_pending_customize_state(
             stack, phone, "926_customize_picked", selected,
             pending=checkpoint["pending_customize"],
         )
@@ -980,6 +1357,7 @@ def pick_interests(stack: TapStack, phone: Phone, sid: str) -> list[str]:
                 raise PhoneError(
                     "Interests screen changed before all selected categories were tapped."
                 )
+            CREATION_PROGRESS.note()
             for n in chips(nodes):
                 if interest_name(n, grid=grid) == label:
                     found = n
@@ -995,6 +1373,7 @@ def pick_interests(stack: TapStack, phone: Phone, sid: str) -> list[str]:
         log(f"tap {label!r} [{found.x},{found.y} {found.w}x{found.h}]")
         stack.tap_xy(*found.center())
         tapped.append(label)
+        CREATION_PROGRESS.note()
         time.sleep(0.45)
 
     if not tapped:

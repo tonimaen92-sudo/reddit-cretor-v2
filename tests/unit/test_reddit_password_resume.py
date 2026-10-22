@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw
 from friend_poster.reddit import reddit_create_day1 as create
 from friend_poster.reddit import reddit_password as password
 from friend_poster.device.ssh_device import PhoneError
-from friend_poster.device.ui_tree import Node
+from friend_poster.device.ui_tree import Node, OperationCancelled
 
 
 def node(text: str, x: int, y: int, w: int = 180, h: int = 30) -> Node:
@@ -40,6 +40,24 @@ def expired_code_nodes() -> list[Node]:
     ]
 
 
+def selected_email_nodes(email: str = "fixture_grands.6h@icloud.com") -> list[Node]:
+    return [
+        Node(ntype="ocr", text="Hi new friend,", x=370, y=200, w=334, h=41),
+        Node(ntype="ocr", text="welcome to Reddit", x=368, y=244, w=444, h=30),
+        Node(
+            ntype="ocr",
+            text="Create an account to get started",
+            x=370,
+            y=316,
+            w=509,
+            h=25,
+        ),
+        Node(ntype="ocr", text="Email", x=95, y=424, w=72, h=15),
+        Node(ntype="ocr", text=email, x=292, y=455, w=500, h=30),
+        Node(ntype="ocr", text="Continue", x=300, y=800, w=140, h=40),
+    ]
+
+
 def valid_password_png() -> bytes:
     image = Image.new("RGB", (1125, 2436), "white")
     draw = ImageDraw.Draw(image)
@@ -51,9 +69,11 @@ def valid_password_png() -> bytes:
 
 
 class Stack:
-    def __init__(self, png: bytes):
+    def __init__(self, png: bytes, *, cancel_on_wait: int | None = None):
         self.png = png
         self.taps: list[tuple[int, int]] = []
+        self.wait_calls = 0
+        self.cancel_on_wait = cancel_on_wait
 
     def screenshot_png(self):
         return self.png
@@ -61,8 +81,118 @@ class Stack:
     def tap_xy(self, x: int, y: int):
         self.taps.append((x, y))
 
+    def wait(self, _seconds: float):
+        self.wait_calls += 1
+        if self.wait_calls == self.cancel_on_wait:
+            raise OperationCancelled("180-second inactivity watchdog fired")
+
 
 class RedditPasswordResumeTests(unittest.TestCase):
+    def test_new_password_uses_one_bounded_xxtouch_script(self):
+        class TypingStack(Stack):
+            def __init__(self):
+                super().__init__(valid_password_png())
+                self.typed: list[tuple[str, int]] = []
+
+            def type_human(self, value: str, ms: int = 95):
+                self.typed.append((value, ms))
+
+        stack = TypingStack()
+        requested = "Fixture-Password-7"
+        frames = iter([
+            password_nodes(),
+            password_nodes(),
+            [node("About you", 120, 150, 300)],
+        ])
+        with (
+            mock.patch.object(
+                password,
+                "get_slot",
+                return_value={"email": "saved@example.invalid", "username": "saved-user"},
+            ),
+            mock.patch.object(password, "set_slot_password"),
+            mock.patch.object(password, "write_account_text", return_value="fixture.txt"),
+            mock.patch.object(
+                password,
+                "dump_named",
+                side_effect=lambda *_args, **_kwargs: ("", next(frames)),
+            ),
+            mock.patch.object(password.time, "sleep", return_value=None),
+        ):
+            result = password.type_password(
+                stack, object(), "a0047", requested_password=requested
+            )
+
+        self.assertEqual(result, requested)
+        self.assertEqual(stack.typed, [(requested, 95)])
+
+    def test_expired_code_try_again_resubmits_selected_email_once(self):
+        stack = Stack(valid_password_png())
+        advanced = [node("Verify your email", 120, 150, 300)]
+        frames = iter([selected_email_nodes(), advanced])
+        logs: list[str] = []
+        with mock.patch.object(
+            password,
+            "dump_named",
+            side_effect=lambda *_args, **_kwargs: ("", next(frames)),
+        ):
+            result = password.recover_expired_verification(
+                stack,
+                object(),
+                expired_code_nodes(),
+                "fixture_grands.6h@icloud.com",
+                logs.append,
+            )
+        self.assertIs(result, advanced)
+        self.assertEqual(stack.taps, [(645, 275), (370, 820)])
+
+    def test_expired_code_email_continue_retries_exactly_once(self):
+        stack = Stack(valid_password_png())
+        selected = selected_email_nodes()
+        advanced = [node("Verify your email", 120, 150, 300)]
+        frames = iter([selected, selected, advanced])
+        logs: list[str] = []
+        with (
+            mock.patch.object(password, "EXPIRED_EMAIL_TRANSITION_POLLS", 1),
+            mock.patch.object(
+                password,
+                "dump_named",
+                side_effect=lambda *_args, **_kwargs: ("", next(frames)),
+            ),
+        ):
+            result = password.recover_expired_verification(
+                stack,
+                object(),
+                expired_code_nodes(),
+                "fixture_grands.6h@icloud.com",
+                logs.append,
+            )
+        self.assertIs(result, advanced)
+        self.assertEqual(stack.taps, [(645, 275), (370, 820), (370, 820)])
+        self.assertTrue(any("retrying the exact Continue once" in line for line in logs))
+
+    def test_expired_code_email_continue_never_taps_a_third_time(self):
+        stack = Stack(valid_password_png())
+        selected = selected_email_nodes()
+        frames = iter([selected, selected, selected])
+        with (
+            mock.patch.object(password, "EXPIRED_EMAIL_TRANSITION_POLLS", 1),
+            mock.patch.object(
+                password,
+                "dump_named",
+                side_effect=lambda *_args, **_kwargs: ("", next(frames)),
+            ),
+        ):
+            with self.assertRaisesRegex(PhoneError, "one allowed Continue retry"):
+                password.recover_expired_verification(
+                    stack,
+                    object(),
+                    expired_code_nodes(),
+                    "fixture_grands.6h@icloud.com",
+                    lambda _message: None,
+                )
+        self.assertEqual(stack.taps, [(645, 275), (370, 820), (370, 820)])
+
     def test_saved_password_taps_continue_once_and_reaches_about(self):
         stack = Stack(valid_password_png())
         about = [node("About you", 120, 150, 300)]
@@ -76,21 +206,62 @@ class RedditPasswordResumeTests(unittest.TestCase):
         self.assertIs(result, about)
         self.assertEqual(stack.taps, [(375, 1205)])
 
-    def test_saved_password_rejection_is_explicit_and_not_retried(self):
-        stack = Stack(valid_password_png())
+    def test_saved_password_retry_later_retries_once_then_yields_to_watchdog(self):
+        stack = Stack(valid_password_png(), cancel_on_wait=4)
+        logs: list[str] = []
         with (
-            mock.patch.object(password.time, "sleep", return_value=None),
+            mock.patch.object(password, "PASSWORD_TRANSITION_POLLS", 1),
             mock.patch.object(
                 password,
                 "dump_named",
                 return_value=("", password_nodes(retry_later=True)),
             ),
         ):
-            with self.assertRaisesRegex(PhoneError, "Sorry, please try again later"):
+            with self.assertRaisesRegex(OperationCancelled, "watchdog fired"):
+                password.resume_saved_password(
+                    stack, object(), password_nodes(), logs.append
+                )
+        self.assertEqual(stack.taps, [(375, 1205), (375, 1205)])
+        self.assertTrue(any("retrying the exact enabled Continue once" in line for line in logs))
+        self.assertTrue(any("180-second inactivity watchdog" in line for line in logs))
+
+    def test_unrecognized_retry_toast_still_retries_once_then_yields_to_watchdog(self):
+        stack = Stack(valid_password_png(), cancel_on_wait=4)
+        with (
+            mock.patch.object(password, "PASSWORD_TRANSITION_POLLS", 1),
+            mock.patch.object(
+                password,
+                "dump_named",
+                return_value=("", password_nodes()),
+            ),
+        ):
+            with self.assertRaisesRegex(OperationCancelled, "watchdog fired"):
                 password.resume_saved_password(
                     stack, object(), password_nodes(), lambda _message: None
                 )
-        self.assertEqual(stack.taps, [(375, 1205)])
+        self.assertEqual(stack.taps, [(375, 1205), (375, 1205)])
+
+    def test_second_continue_can_reach_about(self):
+        stack = Stack(valid_password_png())
+        about = [node("About you", 120, 150, 300)]
+        frames = iter([
+            password_nodes(retry_later=True),
+            password_nodes(),
+            about,
+        ])
+        with (
+            mock.patch.object(password, "PASSWORD_TRANSITION_POLLS", 1),
+            mock.patch.object(
+                password,
+                "dump_named",
+                side_effect=lambda *_args, **_kwargs: ("", next(frames)),
+            ),
+        ):
+            result = password.resume_saved_password(
+                stack, object(), password_nodes(), lambda _message: None
+            )
+        self.assertIs(result, about)
+        self.assertEqual(stack.taps, [(375, 1205), (375, 1205)])
 
     def test_missing_green_and_orange_visual_proof_never_taps(self):
         empty = io.BytesIO()

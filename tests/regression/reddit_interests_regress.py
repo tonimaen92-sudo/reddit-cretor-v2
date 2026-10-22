@@ -137,6 +137,14 @@ def main() -> int:
         "selected-checkmark-ocr-normalized",
         interests.customize_topic_label(ocr("~ TV Dramas", 350, 850, 125)) == "tv dramas",
     )
+    check(
+        "a0145-bullet-checkmark-reconciled-to-pending-hiking",
+        interests._canonical_checked_label("• hiking", {"hiking"}) == "hiking",
+    )
+    check(
+        "unexpected-bullet-prefix-is-not-stripped",
+        interests._canonical_checked_label("• hiking", {"movies"}) == "• hiking",
+    )
     check("saved-a0038-layout-recognized", interests.customize_screen(saved_a0038))
     check("selected-layout-y970-recognized", interests.customize_screen(selected_layout))
     check(
@@ -377,6 +385,62 @@ def main() -> int:
         "v football" in v_literal,
     )
     check("ambiguous-pill-color-stops", "ambiguous" in ambiguous)
+
+    # --- a0140: the live "Show More Topics" control was OCR'd as "Chaw More
+    # Tonine" and slipped into the topic list, so classification stopped for a
+    # non-topic.  Recognition is now layout-first and the clipped label can never
+    # enter the pool, while the twenty real topics stay available.
+    a0140_path = Path(interests.DUMP_DIR) / "924_after_interests.json"
+    a0140_nodes = parse_nodes(a0140_path.read_text(encoding="utf-8"))
+    a0140_anchor = interests.show_more_topics_node(a0140_nodes)
+    a0140_labels = [
+        interests.customize_topic_label(node)
+        for node in interests.customize_topics(a0140_nodes)
+    ]
+    check(
+        "a0140-clipped-chaw-more-tonine-is-the-anchor-not-a-topic",
+        interests.customize_screen(a0140_nodes)
+        and a0140_anchor is not None
+        and interests.customize_topic_label(a0140_anchor) == "show more topics"
+        and "chaw more tonine" not in a0140_labels
+        and len(a0140_labels) == 20,
+    )
+
+    with tempfile.TemporaryDirectory() as temporary:
+        for stem in ("924_after_interests", "924_customize_live"):
+            for ext in (".json", ".png"):
+                source = Path(interests.DUMP_DIR) / (stem + ext)
+                if source.is_file():
+                    Path(temporary, stem + ext).write_bytes(source.read_bytes())
+        original_dir = interests.DUMP_DIR
+        try:
+            interests.DUMP_DIR = temporary
+            a0140_selected = interests._selected_customize_topics(
+                a0140_nodes, "924_after_interests"
+            )
+        finally:
+            interests.DUMP_DIR = original_dir
+    check(
+        "a0140-clipped-anchor-classifies-as-no-selection",
+        a0140_selected == set(),
+    )
+
+    clipped_anchor = ocr("Chaw More Tonine", 44, 1152, 230, 15)
+    check(
+        "a0140-clipped-anchor-excluded-by-the-pool-guard",
+        interests._reads_show_more(clipped_anchor)
+        and interests.customize_topic_label(
+            interests._clip_leading_words(clipped_anchor, interests.SHOW_MORE_KEEP_WORDS)
+        ) == "show more",
+    )
+    check(
+        "a0140-unrelated-mangled-text-is-not-an-anchor",
+        not interests._reads_show_more(ocr("Chase More Money", 44, 1152, 230, 15))
+        and interests.show_more_topics_node(
+            [node for node in a0140_nodes if node.x != 159]
+            + [ocr("Chase More Money", 159, 1159, 230, 15)]
+        ) is None,
+    )
 
     a0055_after_path = Path(interests.DUMP_DIR) / "a0055_recovery_fresh.json"
     a0055_after = parse_nodes(a0055_after_path.read_text(encoding="utf-8"))

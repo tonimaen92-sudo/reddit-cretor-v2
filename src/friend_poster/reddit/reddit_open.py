@@ -18,9 +18,14 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 from friend_poster.core.config import REDDIT_BUNDLE  # noqa: E402
+from friend_poster.device import ghost_live  # noqa: E402
 from friend_poster.device.ghost_live import name_keys  # noqa: E402
-from friend_poster.reddit.reddit_interests import proven_home_feed  # noqa: E402
+from friend_poster.reddit.reddit_interests import (  # noqa: E402
+    ads_personalization_screen,
+    proven_home_feed,
+)
 from friend_poster.core.slots import (  # noqa: E402
+    CREATION_PROGRESS,
     get_slot,
     index_to_name,
     loose_index,
@@ -28,6 +33,7 @@ from friend_poster.core.slots import (  # noqa: E402
 )
 from friend_poster.device.ssh_device import Phone, PhoneError  # noqa: E402
 from friend_poster.device.ui_tree import (  # noqa: E402
+    OperationCancelled,
     TapStack,
     collapsed_text,
     dump_named,
@@ -38,6 +44,18 @@ from friend_poster.device.ui_tree import (  # noqa: E402
 os.environ["SKIP_SHOT"] = "1"
 
 LogFn = Callable[[str], None]
+
+
+class ContainerSelectionError(PhoneError):
+    """The requested Crane container was not safely selected and confirmed."""
+
+    failure_code = "reddit_container_selection_failed"
+
+
+class CraneDoorwayUnavailable(ContainerSelectionError):
+    """Stock iOS haptic had no Crane doorway and UUID recovery failed."""
+
+
 FEED_TRANSITION_MIN_SHIFT = 40
 FEED_TRANSITION_MAX_SHIFT = 220
 FEED_TRANSITION_MAX_X_DRIFT = 12
@@ -331,7 +349,12 @@ def switcher_app_removed_or_home(before_nodes, after_nodes, app_name: str) -> bo
 def proven_springboard(nodes) -> bool:
     """Recognize any SpringBoard page without depending on one app icon."""
     search = find_label_exact(nodes, ("Q Search",))
-    if search is None or search.center()[1] < 1050:
+    # The real SpringBoard Search pill occupies the lower launcher band, but
+    # remains above the dock. Reddit posts can contain screenshots whose OCR
+    # includes their own ``Q Search`` close to the very bottom (observed at
+    # y=1272 in a Fortnite image). Without an upper bound, four labels inside
+    # that image falsely prove SpringBoard and abort a healthy feed swipe.
+    if search is None or not 1050 <= search.center()[1] <= 1200:
         return False
     icon_like = 0
     for node in nodes or []:
@@ -679,6 +702,55 @@ def make_terminal_feed_cleanup_proof(nodes) -> FeedCleanupProof | None:
         min_text_length=FEED_SPARSE_MIN_TEXT_LENGTH,
     )
     if len(anchors) < FEED_SPARSE_MIN_MATCHES:
+        return None
+    return FeedCleanupProof(tuple(nodes or ()), sparse_continuity=True)
+
+
+def make_created_account_feed_resume_proof(nodes) -> FeedCleanupProof | None:
+    """Prove a card feed only for a durably completed-account resume.
+
+    A deeply scrolled Reddit feed can hide its header and bottom navigation.
+    The normal classifier must stay strict because the same generic labels can
+    occur during signup.  A caller that already owns a durable ``reddit_created``
+    checkpoint may use this narrower two-card proof: two well-separated exact
+    Join controls plus several unique content anchors, with no SpringBoard,
+    login doorway, or prominent onboarding title.
+    """
+    if proven_springboard(nodes) or day1_sparse_launch_blocker(nodes):
+        return None
+
+    prominent_blockers = (
+        "Verify your email",
+        "Create your username",
+        "Set a password",
+        "Tell us about yourself",
+        "Choose your interests",
+        "Customize your feed",
+        "Please turn on notifications",
+        "Your ads personalization choices",
+        "Building your home feed",
+    )
+    for label in prominent_blockers:
+        blocker = find_label_exact(nodes, (label,))
+        if blocker is not None and blocker.center()[1] <= 650:
+            return None
+
+    join_rows = sorted(
+        int(node.center()[1])
+        for node in nodes or ()
+        if node.ntype != "ocr-line"
+        and node.on_screen()
+        and node.visible
+        and collapsed_text(node.labels()) == "join"
+        and 100 <= node.center()[1] <= 1160
+    )
+    if len(join_rows) < 2 or join_rows[-1] - join_rows[0] < 400:
+        return None
+    anchors = _unique_feed_content_positions(
+        nodes,
+        min_text_length=FEED_SPARSE_MIN_TEXT_LENGTH,
+    )
+    if len(anchors) < FEED_TRANSITION_MIN_MATCHES:
         return None
     return FeedCleanupProof(tuple(nodes or ()), sparse_continuity=True)
 
@@ -1155,6 +1227,40 @@ def _bottommost_exact_alpha_row(nodes, name: str):
     return bottom[0], ""
 
 
+def _visible_newest_exact_row(nodes, name: str):
+    """Return a uniquely visible exact row when it is already the newest row.
+
+    This is the safe no-scroll path for a freshly appended container.  It is
+    deliberately narrower than ordinary name matching: the canonical alpha
+    label must occur exactly once, have the greatest visible slot index, and
+    be the lowest visible Crane row.  Otherwise the existing duplicate-safe
+    bottom scan remains responsible for resolving the target.
+    """
+    wanted = name_to_index(name)
+    if wanted is None:
+        return None
+    exact = []
+    visible_rows = []
+    canonical = collapsed_text(index_to_name(wanted))
+    for text, node in r_nodes(nodes):
+        if node.y < CRANE_LIST_BODY_MIN_Y:
+            continue
+        index = _crane_slot_index(text)
+        if index is None:
+            continue
+        visible_rows.append((index, node))
+        if collapsed_text(node.labels()) == canonical:
+            exact.append(node)
+    if len(exact) != 1 or not visible_rows:
+        return None
+    row = exact[0]
+    if wanted != max(index for index, _node in visible_rows):
+        return None
+    if row.center()[1] != max(node.center()[1] for _index, node in visible_rows):
+        return None
+    return row
+
+
 def _bottommost_exact_in_complete_visible_prefix(nodes, name: str):
     """Resolve a row when Crane renders its complete compact prefix at once.
 
@@ -1241,9 +1347,196 @@ def crane_container_list(nodes) -> bool:
     return len(indices) >= 2
 
 
+def compact_crane_target_row(nodes, name: str):
+    """Return an exact row from Crane's fully proven compact picker.
+
+    The compact long-press layout is not a normal Crane list: its ``Container``
+    heading sits in the body band and the iOS ``Remove App`` OCR is frequently
+    corrupted.  Do not relax :func:`crane_container_list` for that layout.
+    Instead require one of the two complete, target-aware orderings observed
+    on-device::
+
+        Container -> Default -> Default -> aNNNN -> New Container -> Settings
+        Container -> aNNNN(active) -> Default -> NNNN -> New Container -> Settings
+
+    The second layout can OCR the selectable row either as ``aNNNN`` or as the
+    bare zero-padded suffix ``NNNN``.  A bare number is accepted *only* in this
+    fully anchored paired layout, strictly below the matching canonical active
+    row and ``Default``.  It never becomes a general Crane row identity.
+
+    ``New Container`` proves the visible list bottom.  The returned node is
+    always the lower selectable row, never the active-container label.
+    """
+    if find_label_exact(nodes, HIDE_MY_EMAIL_TITLE) is not None:
+        return None
+    wanted = name_to_index(name)
+    if wanted is None:
+        return None
+    canonical = collapsed_text(index_to_name(wanted))
+    visible = [
+        node
+        for node in nodes
+        if node.ntype != "ocr-line" and node.on_screen() and node.visible
+    ]
+
+    def exact(label: str):
+        normalized = collapsed_text(label)
+        return [
+            node
+            for node in visible
+            if collapsed_text(node.labels()) == normalized
+        ]
+
+    headings = exact("Container")
+    defaults = sorted(exact("Default"), key=lambda node: node.center()[1])
+    new_rows = exact("New Container")
+    settings_rows = exact("Settings")
+    if not (
+        len(headings) == 1
+        and len(new_rows) == 1
+        and len(settings_rows) == 1
+    ):
+        return None
+
+    heading = headings[0]
+    new_container = new_rows[0]
+    settings = settings_rows[0]
+    heading_y = heading.center()[1]
+    new_y = new_container.center()[1]
+    settings_y = settings.center()[1]
+    if not heading_y < new_y < settings_y:
+        return None
+
+    canonical_rows = exact(canonical)
+    # Slot-shaped text anywhere inside the anchored compact menu participates
+    # in the proof, including rows above/between Defaults and the band between
+    # New Container and Settings.  This prevents an otherwise valid suffix of
+    # the menu from hiding an extra or wrong container row earlier or later.
+    menu_alpha_rows = [
+        (index, node)
+        for text, node in r_nodes(visible)
+        if heading_y < node.center()[1] < settings_y
+        and (index := _crane_slot_index(text)) is not None
+    ]
+    menu_numeric_rows = [
+        node
+        for node in visible
+        if heading_y < node.center()[1] < settings_y
+        and (text := collapsed_text(node.labels())).isdigit()
+        and len(text) >= 4
+    ]
+
+    # Original observed layout: two Default anchors followed by one unique,
+    # canonical selectable row.  Keep this branch exact and letter-prefixed.
+    if (
+        len(defaults) == 2
+        and len(canonical_rows) == 1
+        and not exact(canonical[1:])
+    ):
+        first_default, second_default = defaults
+        target = canonical_rows[0]
+        ordered_y = [
+            heading_y,
+            first_default.center()[1],
+            second_default.center()[1],
+            target.center()[1],
+            new_y,
+            settings_y,
+        ]
+        if ordered_y != sorted(ordered_y) or len(set(ordered_y)) != len(ordered_y):
+            return None
+        if (
+            len(menu_alpha_rows) != 1
+            or menu_alpha_rows[0][0] != wanted
+            or menu_alpha_rows[0][1] is not target
+            or menu_numeric_rows
+        ):
+            return None
+        return target
+
+    # Current observed layout: the active canonical row is above Default and
+    # the selectable row is below it.  OCR may drop only the leading Crane
+    # letter from the selectable row; no other bare numeric label is trusted.
+    if len(defaults) != 1:
+        return None
+    default = defaults[0]
+    default_y = default.center()[1]
+    if not heading_y < default_y < new_y:
+        return None
+
+    active_rows = [
+        node
+        for node in canonical_rows
+        if heading_y < node.center()[1] < default_y
+    ]
+    selectable_labels = {canonical, canonical[1:]}
+    selectable_rows = [
+        node
+        for node in visible
+        if default_y < node.center()[1] < new_y
+        and collapsed_text(node.labels()) in selectable_labels
+    ]
+    if len(active_rows) != 1 or len(selectable_rows) != 1:
+        return None
+    active = active_rows[0]
+    target = selectable_rows[0]
+    if active is target:
+        return None
+    target_label = collapsed_text(target.labels())
+    bare_rows = exact(canonical[1:])
+    if target_label == canonical:
+        if len(canonical_rows) != 2 or bare_rows:
+            return None
+    elif (
+        target_label != canonical[1:]
+        or len(canonical_rows) != 1
+        or len(bare_rows) != 1
+        or bare_rows[0] is not target
+    ):
+        return None
+
+    # Reject another letter-prefixed slot anywhere in the compact Crane body.
+    # For the lower band also reject any other four-or-more digit value: inside
+    # these exact anchors it is another possible slot, not safe menu noise.
+    expected_alpha_nodes = {id(active)}
+    if target_label == canonical:
+        expected_alpha_nodes.add(id(target))
+    if (
+        any(index != wanted for index, _node in menu_alpha_rows)
+        or {id(node) for _index, node in menu_alpha_rows} != expected_alpha_nodes
+    ):
+        return None
+    if menu_numeric_rows and (
+        len(menu_numeric_rows) != 1
+        or menu_numeric_rows[0] is not target
+        or target_label != canonical[1:]
+    ):
+        return None
+    return target
+
+
 def crane_submenu_marker(nodes):
     """Return only an exact, allow-listed Crane haptic submenu marker."""
     return find_label_exact(nodes, CRANE_SUBMENU_LABELS)
+
+
+def _decorated_container_parent_marker(nodes):
+    """Find the singular Container row when OCR prefixes a chevron/glyph.
+
+    Crane's compact haptic parent is often read with a leading chevron glyph
+    (for example ``"~ Container"``) rather than an exact label.  The leading
+    decoration is not part of the row identity; ignore only non-letters before
+    the word.
+    """
+    for node in nodes:
+        if node.ntype == "ocr-line" or not node.on_screen() or not node.visible:
+            continue
+        text = collapsed_text(node.labels()).strip()
+        if not text or text == "container":
+            continue
+        if re.sub(r"^[^a-z]+", "", text).strip() == "container":
+            return node
+    return None
 
 
 def crane_singular_parent_marker(nodes):
@@ -1251,6 +1544,8 @@ def crane_singular_parent_marker(nodes):
     if haptic_system_action(nodes) is None:
         return None
     marker = find_label_exact(nodes, ("Container", "> Container"))
+    if marker is None:
+        marker = _decorated_container_parent_marker(nodes)
     if marker is None:
         return None
     _cx, cy = marker.center()
@@ -1344,6 +1639,56 @@ def crane_parent_entry(nodes, name: str, *, require_list: bool = False):
         return "current-slot", node, sid
 
     return "unsafe", None, ""
+
+
+def stock_haptic_without_crane_doorway(nodes, name: str) -> bool:
+    """Prove the stock iOS app menu has no safe Crane-list doorway.
+
+    This predicate authorizes no tap.  It exists only to route an
+    instance-bound slot to Ghost's UUID-aware selector when a correct Reddit
+    icon long-press exposes the stock iOS actions but no Crane entry at all.
+    """
+    if haptic_system_action(nodes) is None or protected_reddit_marker(nodes):
+        return False
+    if compact_crane_target_row(nodes, name) is not None:
+        return False
+    _kind, doorway, _entry_slot = crane_parent_entry(
+        nodes, name, require_list=True
+    )
+    return doorway is None
+
+
+def _haptic_container_option_row(nodes, name: str):
+    """Resolve the selectable row in Crane's compact haptic second level.
+
+    This layout repeats the active slot immediately below ``Container`` and
+    then renders the actual choices between exact ``Default`` and
+    ``New Container`` sentinels.  Treating both same-name labels as ordinary
+    rows makes an instance-bound resume look ambiguous.  The two sentinels,
+    an iOS system action, and one exact canonical row strictly between them
+    identify the selectable choice without relying on a stale coordinate.
+    """
+    if haptic_system_action(nodes) is None:
+        return None
+    default = find_label_exact(nodes, ("Default",))
+    new_container = find_label_exact(nodes, ("New Container",))
+    if default is None or new_container is None:
+        return None
+    lower = default.center()[1]
+    upper = new_container.center()[1]
+    if lower >= upper:
+        return None
+    wanted = name_to_index(name)
+    if wanted is None:
+        return None
+    candidates = [
+        node
+        for text, node in r_nodes(nodes)
+        if lower < node.center()[1] < upper
+        and _crane_slot_index(text) == wanted
+        and collapsed_text(node.labels()) == collapsed_text(index_to_name(wanted))
+    ]
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def slow_list_nudge(stack: TapStack) -> None:
@@ -1453,6 +1798,13 @@ def _locate_bound_container_from_bottom(
     allow_complete_visible_prefix: bool = False,
 ):
     """Resolve a provisioned duplicate by scanning backward from proven bottom."""
+    visible_newest = _visible_newest_exact_row(nodes, name)
+    if visible_newest is not None:
+        lg(
+            f"{name} is the unique exact newest visible Crane row; "
+            "selecting it immediately without a scroll"
+        )
+        return visible_newest
     if allow_complete_visible_prefix:
         anchored, anchored_error = _bottommost_exact_in_complete_visible_prefix(
             nodes, name
@@ -1480,6 +1832,7 @@ def _locate_bound_container_from_bottom(
     # Do not inspect a matching row until the bottom is proven.  An exact row
     # visible earlier in the journey can be an older same-name container.
     for jump in range(6):
+        CREATION_PROGRESS.note()
         lg(f"{name} is instance-bound -> prove Crane bottom {jump + 1}/6")
         fast_list_to_bottom(stack)
         time.sleep(0.65)
@@ -1515,6 +1868,7 @@ def _locate_bound_container_from_bottom(
     previous = _list_search_state(nodes)
     unchanged = 0
     for scan in range(25):
+        CREATION_PROGRESS.note()
         if scan:
             lg(f"{name} not in bottom window -> scan older {scan}/24")
             slow_list_to_older(stack)
@@ -1600,6 +1954,7 @@ def _locate_container_in_list(
     previous = _list_search_state(nodes)
     unchanged = 0
     for jump in range(4):
+        CREATION_PROGRESS.note()
         lg(f"{name} not in Crane list -> fast bottom {jump + 1}/4")
         fast_list_to_bottom(stack)
         time.sleep(0.65)
@@ -1628,6 +1983,7 @@ def _locate_container_in_list(
     unchanged = 0
     top_confirmed = False
     for jump in range(4):
+        CREATION_PROGRESS.note()
         lg(f"{name} not in Crane list -> calibrate top {jump + 1}/4")
         stack.interp_flick(375, 350, 375, 1050, steps=14, ms=22)
         time.sleep(0.6)
@@ -1656,6 +2012,7 @@ def _locate_container_in_list(
     previous = _list_search_state(nodes)
     unchanged = 0
     for nudge in range(24):
+        CREATION_PROGRESS.note()
         lg(f"{name} not in Crane list -> scan forward {nudge + 1}/24")
         slow_list_nudge(stack)
         time.sleep(0.55)
@@ -1695,6 +2052,16 @@ def _tap_requested_container(
 ) -> str:
     """Use at most one parent navigation tap and one proven-list row tap."""
     log_crane_summary(nodes, lg, "Crane parent")
+    compact_target = compact_crane_target_row(nodes, name)
+    if compact_target is not None:
+        lg(
+            f"Crane compact live picker exact container {name} "
+            f"[{compact_target.x},{compact_target.y} "
+            f"{compact_target.w}x{compact_target.h}]"
+        )
+        stack.tap_xy(*compact_target.center())
+        return "compact-live-list"
+
     # A long-press parent may contain a list title or multiple slot-looking
     # rows. Exact iOS haptic actions take precedence so the first slot tap is
     # treated as navigation and the resulting list receives the final tap.
@@ -1756,24 +2123,48 @@ def _tap_requested_container(
             f"{level2_summary}. Did not guess."
         )
 
+    compact_option = compact_crane_target_row(level2_nodes, name)
+    if compact_option is not None:
+        lg(
+            f"Crane compact level2 exact container {name} "
+            f"[{compact_option.x},{compact_option.y} "
+            f"{compact_option.w}x{compact_option.h}]"
+        )
+        stack.tap_xy(*compact_option.center())
+        return "list"
+
+    compact_option = _haptic_container_option_row(level2_nodes, name)
+    if compact_option is not None and not protected_reddit_marker(level2_nodes):
+        lg(
+            f"Crane haptic level2 bounded exact container {name} "
+            f"[{compact_option.x},{compact_option.y} "
+            f"{compact_option.w}x{compact_option.h}]"
+        )
+        stack.tap_xy(*compact_option.center())
+        return "list"
+
     # After one verified parent-navigation tap, accept a changed bounded
     # second level with two different letter-prefixed slot IDs and the exact
     # requested body row.  It may remain haptic or become Crane-owned.
-    level2_slot_ids = {
-        index_to_name(index)
-        for text, _node in r_nodes(level2_nodes)
-        if (index := _crane_slot_index(text)) is not None
-    }
-    level2_named = find_container_list_row(level2_nodes, name)
+    wanted_index = name_to_index(name)
+    level2_exact_rows = [
+        node
+        for text, node in r_nodes(level2_nodes)
+        if node.y >= CRANE_LIST_BODY_MIN_Y
+        and wanted_index is not None
+        and _crane_slot_index(text) == wanted_index
+    ]
+    level2_named = (
+        level2_exact_rows[0] if len(level2_exact_rows) == 1 else None
+    )
     # A changed second level can be rendered either inside the iOS haptic
     # surface or as Crane's own short list after the haptic parent closes.
-    # Multiple distinct letter-prefixed slots plus the exact requested body
-    # row prove that bounded second level.  Keep this shortcut disabled for
-    # instance-bound duplicates, which still require stable-bottom proof.
+    # The parent was already a verified Crane/iOS doorway and this is a freshly
+    # changed second level. One unique exact requested body row is sufficient,
+    # even when it is the only row or the slot is UUID-bound. Other slot names
+    # are harmless; duplicate occurrences of the requested name remain unsafe.
     bounded_level2 = (
-        not newest_bound
-        and len(level2_slot_ids) >= 2
-        and level2_named is not None
+        level2_named is not None
         and not protected_reddit_marker(level2_nodes)
     )
     if bounded_level2:
@@ -1783,7 +2174,7 @@ def _tap_requested_container(
             else "non-haptic"
         )
         lg(
-            f"Crane {surface} level2 container {name} "
+            f"Crane {surface} level2 unique exact container {name} "
             f"[{level2_named.x},{level2_named.y} "
             f"{level2_named.w}x{level2_named.h}]"
         )
@@ -1837,6 +2228,8 @@ def _meaningful_nodes(nodes):
 
 def reddit_ui(nodes) -> bool:
     """Recognize known Reddit signup or feed UI without accepting any app."""
+    if ads_personalization_screen(nodes):
+        return True
     if protected_reddit_marker(nodes):
         return True
     if find_label_exact(nodes, REDDIT_EXACT_MARKERS) is not None:
@@ -1920,70 +2313,140 @@ def _confirm_container_launch(
     """
     time.sleep(1.2)
     launch_tapped = False
-    for attempt in range(8):
-        blob, nodes = _transient_dump(
+    relaunch_used = False
+    probes_per_launch = 16
+    while True:
+        for attempt in range(probes_per_launch):
+            CREATION_PROGRESS.note()
+            probe_phase = "relaunch" if relaunch_used else "initial"
+            blob, nodes = _transient_dump(
+                stack,
+                phone,
+                f"820_post_select_{probe_phase}_probe_{attempt}",
+                lg,
+            )
+            warn_siwa(nodes, lg)
+            state = post_selection_state(nodes, name)
+            if state == "menu":
+                raise PhoneError(
+                    f"{name} selection did not close the Crane/haptic menu. Did not continue."
+                )
+            if state == "springboard":
+                if launch_tapped:
+                    raise PhoneError(
+                        f"{name} was selected, but Reddit remained on SpringBoard after one "
+                        "verified icon tap. Did not retry."
+                    )
+                icon = springboard_reddit(nodes)
+                if icon is None:
+                    raise PhoneError("SpringBoard detected but the Reddit icon was not proven.")
+                x, y = reddit_icon_point(icon)
+                lg(
+                    f"Crane selected {name} and returned Home -> "
+                    f"tap freshly detected Reddit icon ({x},{y}) once"
+                )
+                tap_home_icon(stack, icon)
+                launch_tapped = True
+                time.sleep(1.4)
+                continue
+            if (
+                allow_existing_sparse_feed
+                and state in {"reddit", "unknown"}
+                and not proven_home_feed(nodes)
+            ):
+                landing_marker = day1_sparse_launch_blocker(nodes)
+                if landing_marker:
+                    lg(
+                        f"{name}: sparse Day 1 launch proof refused because a Reddit "
+                        "login/signup landing marker is visible."
+                    )
+                else:
+                    terminal_proof = make_terminal_feed_cleanup_proof(nodes)
+                    if isinstance(terminal_proof, FeedCleanupProof):
+                        lg(
+                            f"{name}: existing sparse Reddit feed proven after container "
+                            "selection; returning cleanup-only proof for a fresh "
+                            "no-gesture Day 1 check."
+                        )
+                        return terminal_proof
+            if state == "reddit":
+                _save_confirmed_reddit_dump(blob, lg)
+                return None
+            if state == "unknown":
+                raise PhoneError(
+                    "Unrecognized screen after Crane container selection. "
+                    "Did not tap or continue."
+                )
+            phase = "app relaunch" if relaunch_used else (
+                "icon launch" if launch_tapped else "Crane selection"
+            )
+            lg(
+                f"Reddit still loading after {phase} -> "
+                f"wait {attempt + 1}/{probes_per_launch}"
+            )
+            time.sleep(1.2)
+
+        if relaunch_used:
+            raise PhoneError(
+                "Reddit stayed blank after the doubled loading window and one "
+                "verified Home -> Reddit relaunch. Did not continue."
+            )
+
+        lg(
+            f"{name}: Reddit feed stayed blank for the doubled loading window; "
+            "exit to Home and tap the freshly detected Reddit app once."
+        )
+        icon = _find_reddit_from_home(stack, phone, lg, "820_blank_relaunch")
+        x, y = reddit_icon_point(icon)
+        lg(f"{name}: retry Reddit app from Home -> tap verified icon ({x},{y}) once")
+        tap_home_icon(stack, icon)
+        launch_tapped = True
+        relaunch_used = True
+        time.sleep(1.4)
+
+
+def select_existing_container_from_compact_menu(
+    stack: TapStack,
+    phone: Phone,
+    lg: LogFn,
+    name: str,
+    *,
+    allow_existing_sparse_feed: bool = False,
+) -> FeedCleanupProof | None:
+    """Select and verify ``name`` only from a live proven compact Crane menu.
+
+    This is the narrow recovery entry point used by the UI recovery supervisor.
+    It never opens a menu, scrolls, creates, deletes, or accepts another slot.
+    """
+    _blob, nodes = _transient_dump(
+        stack, phone, "810_recovery_compact_picker", lg
+    )
+    target = compact_crane_target_row(nodes, name)
+    if target is None:
+        raise ContainerSelectionError(
+            f"Live compact Crane picker did not uniquely prove exact target {name}. "
+            "Did not tap, create, delete, or resume."
+        )
+    lg(
+        f"Crane recovery compact exact container {name} "
+        f"[{target.x},{target.y} {target.w}x{target.h}]"
+    )
+    stack.tap_xy(*target.center())
+    try:
+        launch_proof = _confirm_container_launch(
             stack,
             phone,
-            f"820_post_select_probe_{attempt}",
             lg,
+            name,
+            allow_existing_sparse_feed=allow_existing_sparse_feed,
         )
-        warn_siwa(nodes, lg)
-        state = post_selection_state(nodes, name)
-        if state == "menu":
-            raise PhoneError(
-                f"{name} selection did not close the Crane/haptic menu. Did not continue."
-            )
-        if state == "springboard":
-            if launch_tapped:
-                raise PhoneError(
-                    f"{name} was selected, but Reddit remained on SpringBoard after one "
-                    "verified icon tap. Did not retry."
-                )
-            icon = springboard_reddit(nodes)
-            if icon is None:
-                raise PhoneError("SpringBoard detected but the Reddit icon was not proven.")
-            x, y = reddit_icon_point(icon)
-            lg(
-                f"Crane selected {name} and returned Home -> "
-                f"tap freshly detected Reddit icon ({x},{y}) once"
-            )
-            tap_home_icon(stack, icon)
-            launch_tapped = True
-            time.sleep(1.4)
-            continue
-        if (
-            allow_existing_sparse_feed
-            and state in {"reddit", "unknown"}
-            and not proven_home_feed(nodes)
-        ):
-            landing_marker = day1_sparse_launch_blocker(nodes)
-            if landing_marker:
-                lg(
-                    f"{name}: sparse Day 1 launch proof refused because a Reddit "
-                    "login/signup landing marker is visible."
-                )
-            else:
-                terminal_proof = make_terminal_feed_cleanup_proof(nodes)
-                if isinstance(terminal_proof, FeedCleanupProof):
-                    lg(
-                        f"{name}: existing sparse Reddit feed proven after container "
-                        "selection; returning cleanup-only proof for a fresh "
-                        "no-gesture Day 1 check."
-                    )
-                    return terminal_proof
-        if state == "reddit":
-            _save_confirmed_reddit_dump(blob, lg)
-            return None
-        if state == "unknown":
-            raise PhoneError(
-                "Unrecognized screen after Crane container selection. "
-                "Did not tap or continue."
-            )
-        phase = "icon launch" if launch_tapped else "Crane selection"
-        lg(f"Reddit still loading after {phase} -> wait {attempt + 1}/8")
-        time.sleep(1.2)
-    phase = "the verified icon tap" if launch_tapped else "Crane container selection"
-    raise PhoneError(f"Reddit stayed blank after {phase}. Did not continue.")
+    except PhoneError as exc:
+        raise ContainerSelectionError(
+            f"Exact compact Crane row {name} was tapped but Reddit launch was "
+            f"not proven: {exc}"
+        ) from exc
+    lg(f"CRANE_ACTIVE_CONFIRMED={name}")
+    return launch_proof
 
 
 def open_container(
@@ -2022,42 +2485,151 @@ def open_container(
             "Did not press Home or open the haptic menu."
         )
 
-    # Ordinary callers may reuse an already open Crane list. Recovery must
-    # prove the full Home -> Reddit long-press -> Crane path from scratch.
-    if crane_container_list(nodes) and not require_home_menu:
-        lg("Existing Crane container list detected; selecting from the live screen.")
-        selection_path = _tap_requested_container(
-            stack,
-            phone,
-            lg,
-            name,
-            nodes,
-            newest_bound=newest_bound,
-            allow_complete_visible_prefix=allow_complete_visible_prefix,
-        )
-    else:
-        icon = _find_reddit_from_home(stack, phone, lg, "800")
-        long_press_home_icon(stack, icon, lg)
-        time.sleep(0.8)
-        _blob, nodes = _transient_dump(stack, phone, "810_haptic", lg)
-        selection_path = _tap_requested_container(
-            stack,
-            phone,
-            lg,
-            name,
-            nodes,
-            newest_bound=newest_bound,
-            allow_complete_visible_prefix=allow_complete_visible_prefix,
-        )
+    # Reuse only a globally proven list or the stricter target-aware compact
+    # picker.  ``require_home_menu`` still forces a fresh path for every other
+    # screen, but must not discard a fully proven compact recovery state.
+    try:
+        if compact_crane_target_row(nodes, name) is not None:
+            lg(
+                "Existing compact Crane picker proved the exact requested row; "
+                "selecting from the live screen without returning Home."
+            )
+            selection_path = _tap_requested_container(
+                stack,
+                phone,
+                lg,
+                name,
+                nodes,
+                newest_bound=newest_bound,
+                allow_complete_visible_prefix=allow_complete_visible_prefix,
+            )
+        elif crane_container_list(nodes) and not require_home_menu:
+            lg("Existing Crane container list detected; selecting from the live screen.")
+            selection_path = _tap_requested_container(
+                stack,
+                phone,
+                lg,
+                name,
+                nodes,
+                newest_bound=newest_bound,
+                allow_complete_visible_prefix=allow_complete_visible_prefix,
+            )
+        else:
+            icon = _find_reddit_from_home(stack, phone, lg, "800")
+            long_press_home_icon(stack, icon, lg)
+            time.sleep(0.8)
+            _blob, nodes = _transient_dump(stack, phone, "810_haptic", lg)
+            recorded_instance = str(
+                slot.get("ghost_container_instance") or ""
+            ).strip()
+            doorway_unavailable = stock_haptic_without_crane_doorway(
+                nodes, name
+            )
+            if doorway_unavailable:
+                if not recorded_instance:
+                    raise CraneDoorwayUnavailable(
+                        f"Crane exposed only the stock iOS haptic menu for {name}, "
+                        "and the slot has no recorded Ghost container identity. "
+                        "Did not tap an unknown action."
+                    )
+                lg(
+                    f"{name}: stock iOS haptic menu has no Crane doorway; "
+                    "selecting the exact recorded container through Ghost's "
+                    "validated full inventory."
+                )
+                try:
+                    ghost_live.select_recorded_container(
+                        stack,
+                        phone,
+                        lg,
+                        name,
+                        recorded_instance,
+                    )
+                except OperationCancelled:
+                    raise
+                except Exception as ghost_exc:
+                    raise CraneDoorwayUnavailable(
+                        f"Could not safely select recorded Ghost container {name} "
+                        "after Crane exposed only the stock iOS haptic menu: "
+                        f"{ghost_exc}"
+                    ) from ghost_exc
+                selection_path = "ghost-recorded-instance"
+            else:
+                selection_path = _tap_requested_container(
+                    stack,
+                    phone,
+                    lg,
+                    name,
+                    nodes,
+                    newest_bound=newest_bound,
+                    allow_complete_visible_prefix=allow_complete_visible_prefix,
+                )
+    except OperationCancelled:
+        raise
+    except ContainerSelectionError:
+        raise
+    except PhoneError as exc:
+        raise ContainerSelectionError(
+            f"Could not safely select exact Crane container {name}: {exc}"
+        ) from exc
 
     lg(f"CRANE_SELECTION_PATH={selection_path}")
-    launch_proof = _confirm_container_launch(
-        stack,
-        phone,
-        lg,
-        name,
-        allow_existing_sparse_feed=allow_existing_sparse_feed,
-    )
+    try:
+        launch_proof = _confirm_container_launch(
+            stack,
+            phone,
+            lg,
+            name,
+            allow_existing_sparse_feed=allow_existing_sparse_feed,
+        )
+    except OperationCancelled:
+        raise
+    except PhoneError as first_exc:
+        if selection_path == "ghost-recorded-instance":
+            raise CraneDoorwayUnavailable(
+                f"Recorded Ghost container {name} was selected exactly, but "
+                f"Reddit launch was not locally proven: {first_exc}"
+            ) from first_exc
+        # One bounded recovery for a missed row tap or launch transition. Never
+        # reuse the stale coordinate: return Home, reopen the verified Crane
+        # doorway, resolve the requested row from a fresh frame, and confirm the
+        # launch once more.
+        lg(
+            f"{name}: first Crane selection/launch was not confirmed "
+            f"({first_exc}); retrying the verified Home -> Crane route once."
+        )
+        try:
+            retry_icon = _find_reddit_from_home(stack, phone, lg, "800_retry")
+            long_press_home_icon(stack, retry_icon, lg)
+            time.sleep(0.8)
+            _blob, retry_nodes = _transient_dump(
+                stack, phone, "810_haptic_retry", lg
+            )
+            retry_path = _tap_requested_container(
+                stack,
+                phone,
+                lg,
+                name,
+                retry_nodes,
+                newest_bound=newest_bound,
+                allow_complete_visible_prefix=allow_complete_visible_prefix,
+            )
+            lg(f"CRANE_SELECTION_RETRY_PATH={retry_path}")
+            launch_proof = _confirm_container_launch(
+                stack,
+                phone,
+                lg,
+                name,
+                allow_existing_sparse_feed=allow_existing_sparse_feed,
+            )
+        except OperationCancelled:
+            raise
+        except PhoneError as retry_exc:
+            raise ContainerSelectionError(
+                f"Exact Crane row {name} was not confirmed after one bounded "
+                f"fresh-route retry: {retry_exc}"
+            ) from retry_exc
+    lg(f"CRANE_ACTIVE_CONFIRMED={name}")
     lg(f"OPENED {name} email={email}")
     lg("Stopped before signup. Did not type email. Did not tap Continue with Apple.")
     return launch_proof

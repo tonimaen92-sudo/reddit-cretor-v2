@@ -7,12 +7,13 @@ import json
 import os
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable
 
 from friend_poster.core.config import CONTINUE_LABELS, CREATE_LABELS, DUMP_DIR, FORBIDDEN_HME_LABELS, HME_SETTINGS_URL, LOG_DIR
 from friend_poster.device.ssh_device import Phone, PhoneError, load_secrets
-from friend_poster.device.ui_tree import TapStack, collapsed_text, dump_named, find_label, find_label_exact
+from friend_poster.device.ui_tree import Node, TapStack, collapsed_text, dump_named, find_label, find_label_exact
 
 LogFn = Callable[[str], None]
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@icloud\.com", re.I)
@@ -66,64 +67,655 @@ def _save_address(addr: str, log: LogFn, label: str = "") -> str:
     return path
 
 
-def _icloud_password_sheet_controls(nodes):
-    """Find only the observed, centered iCloud password sheet controls.
+class ICloudPasswordEntryError(PhoneError):
+    """The saved iCloud password could not be entered on the re-auth sheet."""
 
-    XXTouch OCR has rendered the right button as Cyrillic ОК. Limit that
-    confusable-label allowance to this sheet and require all four controls
-    in their separate, bounded positions before entering a password.
+    failure_code = "icloud_password_entry_failed"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        credentials_rejected: bool = False,
+        focus_never_proven: bool = False,
+        verified_sheet=None,
+        selection_overlay: bool = False,
+    ):
+        super().__init__(message)
+        # True only when iCloud visibly refused the submitted password.  A
+        # rejection is not a recoverable input hiccup: it must never be
+        # Cancel-retried or automatically resubmitted.
+        self.credentials_rejected = bool(credentials_rejected)
+        # Internal recovery evidence. A caller may dismiss/re-open a stuck
+        # sheet only when the failed focus path retained the immediately prior
+        # verified modal identity; arbitrary changed screens remain terminal.
+        self.focus_never_proven = bool(focus_never_proven)
+        self.verified_sheet = verified_sheet
+        self.selection_overlay = bool(selection_overlay)
+
+
+@dataclass(frozen=True)
+class _ICloudPasswordSheet:
+    """A verified iCloud "Sign in to iCloud" password sheet.
+
+    ``field`` is the real OCR placeholder node when the layout exposes one
+    (older XXTouch builds did).  When the secure field is empty XXTouch omits
+    it entirely, so ``field_point`` is then derived from the verified modal.
+    ``instruction``/``apple_id`` are the extra modal labels the derived layout
+    must prove; they may be absent on the older layout.
     """
-    title = find_label_exact(nodes, ("Sign in to iCloud",))
-    field = find_label_exact(nodes, ("Password",))
+
+    title: Node
+    instruction: Node | None
+    apple_id: Node | None
+    cancel: Node
+    ok: Node
+    field: Node | None
+    field_point: tuple[int, int]
+
+    @property
+    def derived(self) -> bool:
+        return self.field is None
+
+
+_SHEET_TITLE = "Sign in to iCloud"
+_PASSWORD_INSTRUCTION = "Enter the password for your Apple ID"
+_OK_LABELS = {"ok", "ок", "оk", "oк"}
+# Phrases iOS uses when the submitted password was refused.  They never appear
+# on a healthy password sheet, so they are a safe immediate-failure signal.
+_AUTH_ERROR_MARKERS = (
+    "incorrect",
+    "invalid password",
+    "wrong password",
+    "could not sign in",
+    "unable to sign in",
+    "sign-in failed",
+    "sign in failed",
+    "verification failed",
+    "try again",
+)
+# The on-screen keyboard is OCR-visible while a text field has focus.
+_KEYBOARD_WORDS = {"space", "return"}
+_KEYBOARD_MIN_Y = 700
+_SHEET_SUBMIT_WAIT_SECONDS = 15.0
+_SHEET_POLL_SECONDS = 1.5
+# One verified tap is enough. The old long-press/Select-All/backspace oracle
+# could select the Apple-ID row and could send a control character as text.
+# Entry now starts only from the explicit empty ``Password`` placeholder and
+# the saved password is sent exactly once.
+_FOCUS_ATTEMPTS_TOTAL = 1
+_FOCUS_KEYBOARD = "keyboard_visible"
+_FOCUS_OVERLAY = "verified_selection_overlay"
+_FOCUS_UNFOCUSED = "verified_unfocused_sheet"
+_FOCUS_UNKNOWN = "unknown"
+_ANCHOR_TOLERANCE = 12
+
+
+def _sheet_gone(nodes) -> bool:
+    """True when no iCloud password sheet is on the dumped screen."""
+    return _SHEET_TITLE.casefold() not in " ".join(
+        n.labels().casefold() for n in nodes
+    )
+
+
+def _icloud_apple_id_line(nodes, instruction, cancel):
+    """The Apple ID line just below the password instruction (holds an '@')."""
+    iy = instruction.center()[1]
+    cy = cancel.center()[1]
+    best = None
+    for node in nodes:
+        if node.ntype != "ocr" or not node.visible or not node.on_screen():
+            continue
+        if "@" not in node.labels():
+            continue
+        if not iy < node.center()[1] < cy:
+            continue
+        if best is None or node.y < best.y:
+            best = node
+    return best
+
+
+def _derive_icloud_password_point(title, instruction, apple_id, cancel, ok):
+    """Derive the invisible secure field's tap point from the verified modal.
+
+    The empty secure field sits on its own row between the Apple ID line and
+    the Cancel/OK row, spanning the modal body.  Tap the horizontal middle of
+    the verified modal at the vertical middle of that gap.  Returns ``None``
+    when the derived point leaves the bounded modal band.
+    """
+    left = min(title.x, instruction.x, apple_id.x, cancel.x, ok.x)
+    right = max(
+        title.x + title.w,
+        instruction.x + instruction.w,
+        apple_id.x + apple_id.w,
+        cancel.x + cancel.w,
+        ok.x + ok.w,
+    )
+    fx = (left + right) // 2
+    apple_bottom = apple_id.y + apple_id.h
+    fy = apple_bottom + (cancel.y - apple_bottom) // 2
+    if not (100 <= fx <= 600 and 430 <= fy <= 550):
+        return None
+    return (fx, fy)
+
+
+def _icloud_password_sheet_controls(nodes):
+    """Verify the centered iCloud password sheet in either known layout.
+
+    XXTouch OCR has rendered the right button as Cyrillic ОК.  Limit that
+    confusable-label allowance to this sheet and require the controls in their
+    separate, bounded positions before entering a password.
+
+    * Older layout: an explicit ``Password`` placeholder marks the empty secure
+      field, and it is used directly (this is the layout that must keep working).
+    * Current layout: XXTouch omits the empty secure field, so every modal label
+      (title, instruction, Apple ID line, Cancel, one OK) and the strict
+      geometry are required and the tap point is derived from that modal.
+    """
+    title = find_label_exact(nodes, (_SHEET_TITLE,))
     cancel = find_label_exact(nodes, ("Cancel",))
     oks = [
         n for n in nodes
         if n.ntype == "ocr" and n.visible and n.on_screen()
-        and collapsed_text(n.labels()) in {"ok", "ок", "оk", "oк"}
+        and collapsed_text(n.labels()) in _OK_LABELS
     ]
-    if not (title and field and cancel and len(oks) == 1):
+    if not (title and cancel and len(oks) == 1):
         return None
     ok = oks[0]
     tx, ty = title.center()
-    fx, fy = field.center()
     cx, cy = cancel.center()
     ox, oy = ok.center()
     if not (
         200 <= tx <= 550 and 250 <= ty <= 450
-        and 100 <= fx <= 400 and 430 <= fy <= 550
         and 100 <= cx <= 350 and 530 <= cy <= 650
         and 420 <= ox <= 650 and 530 <= oy <= 650
-        and ty < fy < cy and abs(cy - oy) <= 35
+        and abs(cy - oy) <= 35
     ):
         return None
-    return field, ok
+
+    field = find_label_exact(nodes, ("Password",))
+    if field is not None:
+        # Preserved older layout: the empty secure field is OCR-visible.
+        fx, fy = field.center()
+        if not (100 <= fx <= 400 and 430 <= fy <= 550 and ty < fy < cy):
+            return None
+        return _ICloudPasswordSheet(
+            title=title,
+            instruction=None,
+            apple_id=None,
+            cancel=cancel,
+            ok=ok,
+            field=field,
+            field_point=(fx, fy),
+        )
+
+    # Derived layout: the empty secure field is invisible, so every modal label
+    # must be present in its bounded position before the tap point is derived.
+    instruction = find_label(nodes, (_PASSWORD_INSTRUCTION,))
+    if instruction is None:
+        return None
+    apple_id = _icloud_apple_id_line(nodes, instruction, cancel)
+    if apple_id is None:
+        return None
+    ix, iy = instruction.center()
+    ax, ay = apple_id.center()
+    if not (
+        150 <= ix <= 600 and ty < iy <= 470
+        and 150 <= ax <= 600 and iy <= ay <= 500
+        and ay < cy
+    ):
+        return None
+    point = _derive_icloud_password_point(title, instruction, apple_id, cancel, ok)
+    if point is None:
+        return None
+    return _ICloudPasswordSheet(
+        title=title,
+        instruction=instruction,
+        apple_id=apple_id,
+        cancel=cancel,
+        ok=ok,
+        field=None,
+        field_point=point,
+    )
+
+
+def _keyboard_present(nodes) -> bool:
+    """True when the on-screen keyboard is OCR-visible (secure-field focus)."""
+    for node in nodes:
+        if not node.on_screen() or node.y < _KEYBOARD_MIN_Y:
+            continue
+        if set(collapsed_text(node.labels()).split()) & _KEYBOARD_WORDS:
+            return True
+    return False
+
+
+def _keyboard_verified(stack, nodes, log) -> bool:
+    """Confirm keyboard visibility semantically, retaining OCR as fallback."""
+    semantic_probe = getattr(stack, "semantic_keyboard_present", None)
+    if callable(semantic_probe):
+        try:
+            semantic = semantic_probe()
+        except PhoneError as exc:
+            log(
+                "iCloud password keyboard accessibility probe failed safely "
+                f"({type(exc).__name__}); using OCR fallback."
+            )
+            semantic = None
+        if semantic is True:
+            return True
+        if semantic is False:
+            # Retain the established OCR route for XXTouch builds whose
+            # keyboard-role exposure is incomplete.
+            return _keyboard_present(nodes)
+    return _keyboard_present(nodes)
+
+
+def _centers_match(first, second, tolerance: int = _ANCHOR_TOLERANCE) -> bool:
+    """True when two freshly observed controls occupy the same modal anchor."""
+    if first is None or second is None:
+        return False
+    ax, ay = first.center()
+    bx, by = second.center()
+    return abs(ax - bx) <= tolerance and abs(ay - by) <= tolerance
+
+
+def _selection_overlay_sheet(nodes, previous):
+    """Return an anchored sheet for the exact a0083 selection-overlay state.
+
+    The overlay partially corrupts the instruction and Apple-ID OCR, so the
+    normal full-sheet parser must reject it. This narrow transition is trusted
+    only when the title, Cancel and sole OK button still match the immediately
+    preceding verified sheet and one OCR node contains both ``Select All`` and
+    an iCloud address in the bounded strip above that sheet's secure-field
+    point. The menu itself is never tapped.
+    """
+    if previous is None:
+        return None
+    title = find_label_exact(nodes, (_SHEET_TITLE,))
+    cancel = find_label_exact(nodes, ("Cancel",))
+    oks = [
+        node for node in nodes
+        if node.ntype == "ocr" and node.visible and node.on_screen()
+        and collapsed_text(node.labels()) in _OK_LABELS
+    ]
+    if not (
+        _centers_match(title, previous.title)
+        and _centers_match(cancel, previous.cancel)
+        and len(oks) == 1
+        and _centers_match(oks[0], previous.ok)
+    ):
+        return None
+
+    _fx, fy = previous.field_point
+    instruction_y = (
+        previous.instruction.center()[1]
+        if previous.instruction is not None
+        else previous.title.center()[1]
+    )
+    overlay = None
+    for node in nodes:
+        if node.ntype != "ocr" or not node.visible or not node.on_screen():
+            continue
+        label = collapsed_text(node.labels())
+        cx, cy = node.center()
+        if (
+            "select all" in label
+            and "@icloud.com" in label
+            and 100 <= cx <= 650
+            and instruction_y - 20 <= cy <= fy - 20
+        ):
+            overlay = node
+            break
+    if overlay is None:
+        return None
+    return _ICloudPasswordSheet(
+        title=title,
+        instruction=previous.instruction,
+        apple_id=previous.apple_id,
+        cancel=cancel,
+        ok=oks[0],
+        field=previous.field,
+        field_point=previous.field_point,
+    )
+
+
+def _classify_icloud_focus_frame(nodes, previous, *, keyboard_visible=False):
+    """Classify one post-focus frame without weakening the keyboard gate."""
+    fresh = _icloud_password_sheet_controls(nodes)
+    if fresh is not None:
+        if keyboard_visible or _keyboard_present(nodes):
+            return _FOCUS_KEYBOARD, fresh
+        return _FOCUS_UNFOCUSED, fresh
+    overlay = _selection_overlay_sheet(nodes, previous)
+    if overlay is not None:
+        if keyboard_visible:
+            return _FOCUS_KEYBOARD, overlay
+        return _FOCUS_OVERLAY, overlay
+    return _FOCUS_UNKNOWN, None
+
+
+def _icloud_auth_error(nodes) -> str:
+    """The first authentication-error label shown on the sheet, else ``""``."""
+    for node in nodes:
+        blob = node.labels().casefold()
+        if not blob:
+            continue
+        for marker in _AUTH_ERROR_MARKERS:
+            if marker in blob:
+                return collapsed_text(node.labels())[:80]
+    return ""
+
+
+def _focus_icloud_password_field(stack, phone, log, sheet, stop, *, remaining, stem_prefix):
+    """Focus an explicitly empty password field with one verified short tap.
+
+    A fully verified sheet supplies the password-row target. OCR keyboard labels
+    are useful evidence but are not mandatory because the live iOS keyboard can
+    be visibly open while XXTouch omits those labels. A selection overlay or
+    changed modal is never typed into.
+    """
+    budget = int(remaining)
+    if budget <= 0:
+        raise ICloudPasswordEntryError(
+            "iCloud password sheet: no secure-field focus attempts remain in "
+            "the bounded budget; did not type the password."
+        )
+    if stop and stop.is_set():
+        raise PhoneError("Stopped.")
+    if not stack.can_tap():
+        raise ICloudPasswordEntryError(
+            "iCloud password sheet: no tap backend is available to focus the "
+            "verified empty Password field; did not type the password."
+        )
+    proof = "explicit empty Password field" if sheet.field is not None else "fully verified password row"
+    log(f"iCloud password field: tapping {proof} {sheet.field_point} once.")
+    stack.tap_xy(*sheet.field_point)
+    time.sleep(0.8)
+    if stop and stop.is_set():
+        raise PhoneError("Stopped.")
+    _blob, nodes = dump_named(stack, phone, f"{stem_prefix}_1", log)
+    keyboard_visible = _keyboard_verified(stack, nodes, log)
+    state, fresh = _classify_icloud_focus_frame(
+        nodes, sheet, keyboard_visible=keyboard_visible
+    )
+    if state == _FOCUS_OVERLAY:
+        raise ICloudPasswordEntryError(
+            "iCloud password field opened a selection overlay; Select All was "
+            "not tapped and the password was not typed.",
+            focus_never_proven=True,
+            verified_sheet=sheet,
+            selection_overlay=True,
+        )
+    if state == _FOCUS_UNKNOWN or fresh is None:
+        raise ICloudPasswordEntryError(
+            "iCloud password sheet changed after the verified field tap; the "
+            "password was not typed into an unknown screen."
+        )
+    if not keyboard_visible:
+        log(
+            "iCloud password field: keyboard labels were absent from the dump; "
+            "continuing because the tap targeted the freshly verified password "
+            "row and the same modal was freshly re-verified."
+        )
+    return fresh, nodes, 1
+
+
+def _type_and_submit_icloud_password(stack, phone, log, sheet, pwd) -> None:
+    """Type the saved password (never logged) once, then submit it once.
+
+    The OK control is re-acquired from a fresh verified dump after typing, so
+    the single submission tap never uses a stale coordinate.
+    """
+    log("iCloud password sheet: typing the saved password (value not logged).")
+    stack.type_text(pwd)
+    time.sleep(0.4)
+    if not stack.can_tap():
+        raise ICloudPasswordEntryError(
+            "iCloud password sheet: the password was typed, but there is no tap "
+            "backend to reach the verified OK control. Did not submit blindly."
+        )
+    _blob, nodes = dump_named(stack, phone, "03_hme_password_before_ok", log)
+    fresh = _icloud_password_sheet_controls(nodes)
+    if fresh is None:
+        raise ICloudPasswordEntryError(
+            "iCloud password sheet could not be re-verified after typing; did not "
+            "tap OK from a stale frame."
+        )
+    log("iCloud password sheet: re-verified after one type; submitting once via the fresh OK control.")
+    stack.tap_xy(*fresh.ok.center())
+
+
+def _poll_icloud_sheet(stack, phone, log, stop, *, stem, timeout):
+    """Poll until the sheet closes; raise at once on an authentication error."""
+    deadline = time.monotonic() + timeout
+    nodes: list = []
+    while True:
+        if stop and stop.is_set():
+            raise PhoneError("Stopped.")
+        time.sleep(_SHEET_POLL_SECONDS)
+        _blob, nodes = dump_named(stack, phone, stem, log)
+        if _sheet_gone(nodes):
+            return True, nodes
+        error = _icloud_auth_error(nodes)
+        if error:
+            raise ICloudPasswordEntryError(
+                f"iCloud rejected the saved password ({error!r}); did not type it again.",
+                credentials_rejected=True,
+            )
+        if time.monotonic() >= deadline:
+            return False, nodes
+
+
+_SETTINGS_DESTINATION_MARKERS = (
+    "hide my email",
+    "icloud+",
+    "icloud mail",
+    "show all",
+    "manage account",
+    "passwords and keychain",
+    "private relay",
+    "icloud backup",
+    "name, phone numbers",
+    "password & security",
+    "media & purchases",
+)
+
+
+def _authenticated_destination(nodes) -> bool:
+    """Positive evidence the dismissed sheet returned to signed-in Settings.
+
+    The full Apple ID sign-in wizard means authentication did NOT hold and is
+    explicitly rejected; otherwise the frame must show a known Settings
+    marker, so a sheet that merely vanished (SpringBoard, a blank screen)
+    never passes as success.
+    """
+    if _full_apple_id_signin(nodes):
+        return False
+    joined = " ".join(n.labels().casefold() for n in nodes)
+    return any(marker in joined for marker in _SETTINGS_DESTINATION_MARKERS)
+
+
+def _require_authenticated_destination(nodes) -> list:
+    if not _authenticated_destination(nodes):
+        raise ICloudPasswordEntryError(
+            "iCloud password sheet closed, but the authenticated Settings "
+            "destination could not be verified; did not continue or submit again."
+        )
+    return nodes
+
+
+def dismiss_icloud_password_sheet(
+    stack, phone, log, stop=None, *, known_sheet=None
+) -> bool:
+    """Dismiss a stuck iCloud password sheet with ONE verified Cancel tap.
+
+    The Cancel control must be re-verified from a fresh dump and dismissal is
+    confirmed by a second fresh dump.  Exactly one tap is ever attempted;
+    an unverifiable sheet or an unconfirmed dismissal returns ``False``
+    without any blind retry.
+    """
+    if not stack.can_tap() or (stop and stop.is_set()):
+        return False
+    _blob, nodes = dump_named(stack, phone, "03_hme_icloud_cancel_attempt", log)
+    sheet = _icloud_password_sheet_controls(nodes)
+    if sheet is None and known_sheet is not None:
+        overlay_sheet = _selection_overlay_sheet(nodes, known_sheet)
+        if overlay_sheet is not None:
+            log(
+                "iCloud sheet dismissal: a verified selection overlay covers "
+                "the modal; tapping the retained secure-field point once to "
+                "close it. Select All will not be tapped."
+            )
+            stack.tap_xy(*known_sheet.field_point)
+            time.sleep(0.8)
+            if stop and stop.is_set():
+                return False
+            _blob, nodes = dump_named(
+                stack, phone, "03_hme_icloud_overlay_closed", log
+            )
+            sheet = _icloud_password_sheet_controls(nodes)
+    if sheet is None:
+        log(
+            "iCloud sheet dismissal: the sheet controls could not be verified "
+            "from a fresh frame; no Cancel tap was made."
+        )
+        return False
+    log(
+        "iCloud sheet dismissal: tapping the verified Cancel control once at "
+        f"{sheet.cancel.center()}."
+    )
+    stack.tap_xy(*sheet.cancel.center())
+    time.sleep(1.0)
+    if stop and stop.is_set():
+        return False
+    _blob, fresh = dump_named(stack, phone, "03_hme_icloud_cancelled", log)
+    if not _sheet_gone(fresh):
+        log(
+            "iCloud sheet dismissal: the sheet is still present after the single "
+            "verified Cancel tap; not repeating it."
+        )
+        return False
+    log("iCloud sheet dismissal: confirmed dismissed from a fresh frame.")
+    return True
 
 
 def _unlock_icloud_if_needed(stack, phone, log, nodes, stop) -> list:
     """If Settings is sitting on the Apple ID password sheet, type the saved iCloud password."""
-    joined = " ".join(n.labels().casefold() for n in nodes)
-    if "sign in to icloud" not in joined:
+    if _sheet_gone(nodes):
         return nodes
     pwd = str(load_secrets().get("icloud_password") or "").strip()
     if not pwd:
         raise PhoneError("iCloud password sheet is on screen, but no saved iCloud password is available. Enter it on the phone; do not paste it in chat.")
-    controls = _icloud_password_sheet_controls(nodes)
-    if controls is None or not stack.can_tap():
-        raise PhoneError("iCloud password sheet is visible, but its bounded Password/OK controls could not be verified. Did not type or tap.")
-    field, ok = controls
-    log("iCloud password sheet: tapping Password field, typing saved iCloud password, tapping OK.")
-    stack.tap_xy(*field.center())
-    time.sleep(0.6)
-    stack.type_text(pwd)
-    time.sleep(0.4)
-    stack.tap_xy(*ok.center())
-    time.sleep(3.0)
+    sheet = _icloud_password_sheet_controls(nodes)
+    if sheet is None and stack.can_tap():
+        # The Settings animation can overlap the modal with the underlying
+        # iCloud rows for one OCR frame (the live a0236 frame merged Cancel/OK
+        # into those rows).  Re-dump once without tapping, typing or reopening
+        # the pane.  Only a fully verified fresh modal may continue.
+        log(
+            "iCloud password sheet: controls were incomplete in the first "
+            "frame; waiting for one fresh local verification."
+        )
+        time.sleep(0.8)
+        _blob, fresh_nodes = dump_named(
+            stack, phone, "03_hme_password_controls_retry", log
+        )
+        fresh_sheet = _icloud_password_sheet_controls(fresh_nodes)
+        if fresh_sheet is not None:
+            nodes = fresh_nodes
+            sheet = fresh_sheet
+            log(
+                "iCloud password sheet: fresh frame verified the bounded "
+                "Password, Cancel and OK controls."
+            )
+    if sheet is None or not stack.can_tap():
+        raise ICloudPasswordEntryError("iCloud password sheet is visible, but its bounded controls could not be verified. Did not type or tap.")
+    focused = _focus_icloud_password_field(
+        stack, phone, log, sheet, stop,
+        remaining=_FOCUS_ATTEMPTS_TOTAL, stem_prefix="03_hme_password_focus",
+    )
+    sheet, nodes, _focus_used = focused
     if stop and stop.is_set():
         raise PhoneError("Stopped.")
-    _blob, nodes = dump_named(stack, phone, "03b_hme_after_icloud_unlock", log)
-    if "sign in to icloud" in " ".join(n.labels().casefold() for n in nodes):
-        raise PhoneError("iCloud password sheet remained after one saved-password attempt. Did not retry the password or scroll behind the sheet.")
-    return nodes
+    _type_and_submit_icloud_password(stack, phone, log, sheet, pwd)
+    dismissed, nodes = _poll_icloud_sheet(
+        stack, phone, log, stop,
+        stem="03_hme_after_icloud_submit",
+        timeout=_SHEET_SUBMIT_WAIT_SECONDS,
+    )
+    if dismissed:
+        return _require_authenticated_destination(nodes)
+    raise ICloudPasswordEntryError(
+        "iCloud password sheet remained after one password submission; the "
+        "password was not typed or submitted again."
+    )
+
+
+_FRESH_SHEET_STEM = "03_hme_after_fresh_sheet"
+
+
+def _focus_never_proven(exc: BaseException) -> bool:
+    """True when the secure field never raised a keyboard (not a layout change).
+
+    Distinguishes the live failure seen on a0076/a0078/a0079 -- the sheet
+    verified, the tap came from that fresh verification, and the field still
+    never became first responder -- from a sheet whose layout changed and
+    therefore must not be re-tapped at a stale point.
+    """
+    return bool(getattr(exc, "focus_never_proven", False)) or (
+        "keyboard did not appear within the bounded focus attempts" in str(exc)
+    )
+
+
+def _unlock_icloud_with_fresh_sheet_retry(stack, phone, log, nodes, stop) -> list:
+    """Unlock iCloud once; on a never-focused secure field, unlock a fresh sheet.
+
+    A sheet that ignores touches cannot be fixed by touching it again, so the
+    only recovery this path already trusts is used: dismiss the stuck sheet with
+    ONE verified Cancel tap (dismissal re-confirmed from a fresh frame), re-open
+    the Hide My Email pane so iOS presents a *new* sheet, and unlock once more.
+
+    Nothing here types into an unknown frame. Every tap is derived from a frame
+    dumped after the dismissal, the password is sent once only after the fresh
+    sheet is re-verified, and a second failure re-raises instead of looping.
+    """
+    try:
+        return _unlock_icloud_if_needed(stack, phone, log, nodes, stop)
+    except ICloudPasswordEntryError as exc:
+        if not _focus_never_proven(exc):
+            raise
+        if not stack.can_tap() or (stop and stop.is_set()):
+            raise
+        log(
+            "iCloud recovery: the secure field never focused on this sheet, so "
+            "re-tapping it cannot help. Dismissing it with the verified Cancel "
+            "control and re-opening a fresh sheet once."
+        )
+        if not dismiss_icloud_password_sheet(
+            stack,
+            phone,
+            log,
+            stop,
+            known_sheet=getattr(exc, "verified_sheet", None),
+        ):
+            log(
+                "iCloud recovery: the stuck sheet could not be dismissed; not "
+                "opening a second sheet."
+            )
+            raise
+        stack.open_url(HME_SETTINGS_URL)
+        time.sleep(3.0)
+        if stop and stop.is_set():
+            raise PhoneError("Stopped.")
+        _blob, fresh = dump_named(stack, phone, _FRESH_SHEET_STEM, log)
+        if _sheet_gone(fresh):
+            log(
+                "iCloud recovery: no fresh sheet appeared after re-opening Hide "
+                "My Email; returning that frame without guessing."
+            )
+            return fresh
+        log("iCloud recovery: a fresh sheet is up; unlocking it now.")
+        return _unlock_icloud_if_needed(stack, phone, log, fresh, stop)
 
 
 def _full_apple_id_signin(nodes) -> bool:
@@ -298,7 +890,7 @@ def create_one_hide_my_email(
         log("Hide My Email: dumping the live screen (already open).")
 
     blob, nodes = dump_named(stack, phone, "03_hme_before_create", log)
-    nodes = _unlock_icloud_if_needed(stack, phone, log, nodes, stop)
+    nodes = _unlock_icloud_with_fresh_sheet_retry(stack, phone, log, nodes, stop)
     if _full_apple_id_signin(nodes):
         raise PhoneError(
             "Apple ID is signed out: the full Email or Phone sign-in screen "
@@ -325,7 +917,7 @@ def create_one_hide_my_email(
             stack.swipe(375, 1000, 375, 650)
             time.sleep(0.7)
             blob, nodes = dump_named(stack, phone, f"03_hme_before_create_scroll_{attempt}", log)
-            nodes = _unlock_icloud_if_needed(stack, phone, log, nodes, stop)
+            nodes = _unlock_icloud_with_fresh_sheet_retry(stack, phone, log, nodes, stop)
             if _full_apple_id_signin(nodes):
                 raise PhoneError(
                     "Apple ID is signed out on the full Email or Phone sign-in screen. "
@@ -336,7 +928,7 @@ def create_one_hide_my_email(
             stack.tap_xy(*hme.center())
             time.sleep(1.5)
             blob, nodes = dump_named(stack, phone, "03_hme_before_create_retry", log)
-            nodes = _unlock_icloud_if_needed(stack, phone, log, nodes, stop)
+            nodes = _unlock_icloud_with_fresh_sheet_retry(stack, phone, log, nodes, stop)
             if _full_apple_id_signin(nodes):
                 raise PhoneError(
                     "Apple ID is signed out on the full Email or Phone sign-in screen. "
@@ -357,7 +949,7 @@ def create_one_hide_my_email(
                 had_password_sheet = (
                     "sign in to icloud" in " ".join(n.labels().casefold() for n in nodes)
                 )
-                nodes = _unlock_icloud_if_needed(stack, phone, log, nodes, stop)
+                nodes = _unlock_icloud_with_fresh_sheet_retry(stack, phone, log, nodes, stop)
                 # Authentication dismisses back to the overview instead of
                 # completing the row navigation.  One verified post-unlock
                 # re-entry is safe; it is not a blind repeat.
@@ -392,7 +984,7 @@ def create_one_hide_my_email(
                     had_password_sheet = (
                         "sign in to icloud" in " ".join(n.labels().casefold() for n in nodes)
                     )
-                    nodes = _unlock_icloud_if_needed(stack, phone, log, nodes, stop)
+                    nodes = _unlock_icloud_with_fresh_sheet_retry(stack, phone, log, nodes, stop)
                     overview_row = _icloud_main_hme_row(nodes)
                     if had_password_sheet and overview_row is not None:
                         log("Delayed iCloud unlock returned to the overview; re-entering the verified Hide My Email row once.")

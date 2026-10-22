@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import copy
 import json
+import errno
 import ipaddress
 import math
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -26,12 +28,29 @@ STAGES = {
     "between", "retry_ip", "retry_creation", "paused", "stopped",
 }
 RECOVERY_DELAYS_SECONDS = (5, 15, 30, 60, 120)
+# A distinct code for the new preserve-and-skip recovery.  It never deletes a
+# container or retires an id, so it is deliberately not a "deleted" status.
+AUTO_SKIP_FAILURE_CODE = "creation_preserved_skipped"
+BULK_INACTIVITY_TIMEOUT_CODE = "bulk_inactivity_timeout"
+LEGACY_CREATION_FAILURE_CODE = "legacy_creation_failure"
 _LOCK = threading.RLock()
 USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{1,28}$")
+REDDIT_PASSWORD_MIN_LENGTH = 8
+REDDIT_PASSWORD_MAX_LENGTH = 128
 
 
 class BulkError(RuntimeError):
     """A safe configuration or persistence error without pasted data."""
+
+
+class BulkSaveError(BulkError):
+    """The bulk state file could not be saved; unsaved, so pause the workflow.
+
+    Carries a sanitized OSError detail (errno/winerror/strerror, never a
+    path).  ``save_state_cas``/``_persist_bulk`` leave in-memory state and the
+    durable file unchanged on this error, so the caller must pause rather than
+    keep acting on state that was not persisted.
+    """
 
 
 def utc_now() -> str:
@@ -40,7 +59,7 @@ def utc_now() -> str:
 
 def empty_state() -> dict:
     return {
-        "version": 5, "revision": 0, "run_id": None, "writer_id": None,
+        "version": 6, "revision": 0, "run_id": None, "writer_id": None,
         "recovery": None,
         "queue": [], "requested": 0, "remaining": 0,
         "stage": "idle", "slot_id": None, "baseline_ip": None,
@@ -49,6 +68,11 @@ def empty_state() -> dict:
         "failure_phase": None, "failure_reason": None, "failure_code": None,
         "failures": [],
         "ip_attempt": None,
+        # Durable per-batch policy: newly started batches request automatic
+        # deletion of each completed account's local container.  Any batch
+        # saved before this flag existed keeps its previous (no-delete)
+        # behavior and is never used to delete historical containers.
+        "delete_containers": False,
     }
 
 
@@ -73,6 +97,31 @@ def _failure_code_from_reason(reason: object) -> str | None:
 
 def _lines(value: str) -> list[str]:
     return [part.strip() for part in str(value).splitlines()]
+
+
+def parse_username_password(value: str) -> tuple[str, str]:
+    """Parse one optional ``username`` or ``username:password`` editor row.
+
+    Only the first colon is a separator, so a password may itself contain
+    colons. Password-bearing rows fail closed instead of silently falling back
+    to a generated Reddit username.
+    """
+    raw = str(value or "").strip()
+    if ":" not in raw:
+        return raw, ""
+    username, _separator, password = raw.partition(":")
+    username = username.strip()
+    if USERNAME_RE.fullmatch(username) is None:
+        raise BulkError("A username:password row has an invalid username.")
+    if (
+        len(password) < REDDIT_PASSWORD_MIN_LENGTH
+        or len(password) > REDDIT_PASSWORD_MAX_LENGTH
+        or any(ord(char) < 32 or ord(char) == 127 for char in password)
+    ):
+        raise BulkError(
+            "A username:password row must contain a password of 8–128 printable characters."
+        )
+    return username, password
 
 
 def parse_queue(
@@ -125,19 +174,28 @@ def parse_queue(
         # Usernames are optional per row. Missing, malformed, or repeated
         # values fall back to Reddit's suggestion instead of blocking the
         # whole batch. A valid unique value is still used exactly.
-        username = usernames[index - 1] if index <= len(usernames) else ""
+        raw_username = usernames[index - 1] if index <= len(usernames) else ""
+        username, reddit_password = parse_username_password(raw_username)
         if USERNAME_RE.fullmatch(username) is not None:
             folded = username.casefold()
             if folded not in seen_usernames:
                 seen_usernames.add(folded)
                 item["username"] = username
+                if reddit_password:
+                    item["password"] = reddit_password
+            elif reddit_password:
+                raise BulkError(
+                    f"Entry {index} repeats a username with a supplied password."
+                )
         queue.append(item)
     return requested, queue
 
 
 def _validate(state: object) -> dict:
     blank = empty_state()
-    if not isinstance(state, dict) or set(state) != set(blank) or state.get("version") != 5:
+    if not isinstance(state, dict) or set(state) != set(blank) or state.get("version") != 6:
+        raise BulkError("Saved bulk configuration is malformed.")
+    if type(state["delete_containers"]) is not bool:
         raise BulkError("Saved bulk configuration is malformed.")
     if type(state["revision"]) is not int or state["revision"] < 0:
         raise BulkError("Saved bulk configuration is malformed.")
@@ -179,6 +237,7 @@ def _validate(state: object) -> dict:
             not isinstance(item, dict) or set(item) not in (
                 {"birth_date", "swipes", "delay_seconds"},
                 {"birth_date", "swipes", "delay_seconds", "username"},
+                {"birth_date", "swipes", "delay_seconds", "username", "password"},
             )
             or not isinstance(item["birth_date"], str)
             or re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", item["birth_date"]) is None
@@ -189,6 +248,13 @@ def _validate(state: object) -> dict:
             or ("username" in item and (
                 not isinstance(item["username"], str)
                 or USERNAME_RE.fullmatch(item["username"]) is None
+            ))
+            or ("password" in item and (
+                "username" not in item
+                or not isinstance(item["password"], str)
+                or len(item["password"]) < REDDIT_PASSWORD_MIN_LENGTH
+                or len(item["password"]) > REDDIT_PASSWORD_MAX_LENGTH
+                or any(ord(char) < 32 or ord(char) == 127 for char in item["password"])
             ))
         ):
             raise BulkError("Saved bulk configuration is malformed.")
@@ -246,6 +312,7 @@ def _validate(state: object) -> dict:
         if not isinstance(item, dict) or set(item) not in (
             {"birth_date", "swipes", "delay_seconds"},
             {"birth_date", "swipes", "delay_seconds", "username"},
+            {"birth_date", "swipes", "delay_seconds", "username", "password"},
         ):
             raise BulkError("Saved bulk configuration is malformed.")
         try:
@@ -280,47 +347,61 @@ def load_state(path: Path = STATE_PATH) -> dict:
         with _LOCK:
             with path.open(encoding="utf-8") as handle:
                 state = json.load(handle)
-            v4_fields = set(empty_state()) - {
+            v5_fields = set(empty_state()) - {
+                "delete_containers",
+            }
+            v4_fields = v5_fields - {
                 "revision", "run_id", "writer_id", "recovery",
             }
+            v3_fields = v4_fields - {"failure_code", "failures"}
+            v2_fields = v3_fields - {"failure_reason"}
+            legacy_fields = v2_fields - {"ip_attempt"}
+            if isinstance(state, dict) and state.get("version") == 5 and set(state) == v5_fields:
+                # A pre-policy batch keeps its previous behavior: no automatic
+                # container deletion, and no retroactive deletion of anything.
+                migrated = {**state, "version": 6, "delete_containers": False}
+                _validate(migrated)
+                save_state(migrated, path)
+                return migrated
             if isinstance(state, dict) and state.get("version") == 4 and set(state) == v4_fields:
                 migrated = {
-                    **state, "version": 5, "revision": 0, "run_id": None,
+                    **state, "version": 6, "revision": 0, "run_id": None,
                     "writer_id": None, "recovery": None,
+                    "delete_containers": False,
                 }
                 _validate(migrated)
                 save_state(migrated, path)
                 return migrated
-            v3_fields = v4_fields - {"failure_code", "failures"}
-            v2_fields = v3_fields - {"failure_reason"}
-            legacy_fields = v2_fields - {"ip_attempt"}
             if isinstance(state, dict) and state.get("version") == 1 and set(state) == legacy_fields:
                 migrated = {
-                    **state, "version": 5, "ip_attempt": None,
+                    **state, "version": 6, "ip_attempt": None,
                     "failure_reason": None, "failure_code": None, "failures": [],
                     "revision": 0, "run_id": None, "writer_id": None,
                     "recovery": None,
+                    "delete_containers": False,
                 }
                 _validate(migrated)
                 save_state(migrated, path)
                 return migrated
             if isinstance(state, dict) and state.get("version") == 2 and set(state) == v2_fields:
                 migrated = {
-                    **state, "version": 5, "failure_reason": None,
+                    **state, "version": 6, "failure_reason": None,
                     "failure_code": None, "failures": [],
                     "revision": 0, "run_id": None, "writer_id": None,
                     "recovery": None,
+                    "delete_containers": False,
                 }
                 _validate(migrated)
                 save_state(migrated, path)
                 return migrated
             if isinstance(state, dict) and state.get("version") == 3 and set(state) == v3_fields:
                 migrated = {
-                    **state, "version": 5,
+                    **state, "version": 6,
                     "failure_code": _failure_code_from_reason(state.get("failure_reason")),
                     "failures": [],
                     "revision": 0, "run_id": None, "writer_id": None,
                     "recovery": None,
+                    "delete_containers": False,
                 }
                 _validate(migrated)
                 save_state(migrated, path)
@@ -331,27 +412,78 @@ def load_state(path: Path = STATE_PATH) -> dict:
 
 
 def save_state(state: dict, path: Path = STATE_PATH) -> None:
+    """Atomically save state; retry transient sharing errors, then fail loud.
+
+    A recognized transient sharing/lock error (Windows sharing violation
+    winerror 32/33, or errno EACCES/EAGAIN/EBUSY) is retried at most twice.
+    Any unresolved failure raises :class:`BulkSaveError` (a ``BulkError``)
+    carrying a sanitized OSError detail (errno/winerror/strerror only — never
+    a filesystem path), so the caller can log the actual cause and pause the
+    workflow instead of continuing on unsaved state.  The save stays atomic:
+    a temp file is ``os.replace``-d over the target, so a failure never
+    leaves a half-written state file.
+    """
     _validate(state)
-    temporary = None
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with _LOCK, tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=path.parent, prefix=".bulk-", suffix=".tmp", delete=False
-        ) as handle:
-            temporary = Path(handle.name)
-            json.dump(state, handle, ensure_ascii=False, separators=(",", ":"))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    except OSError:
-        raise BulkError("Bulk configuration could not be saved.") from None
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+    transient = (PermissionError, BlockingIOError)
+    transient_winerrors = {32, 33}  # ERROR_SHARING_VIOLATION / LOCK_VIOLATION
+    transient_errnos = {errno.EACCES, errno.EAGAIN, errno.EBUSY}
+    attempts = 0
+    last_detail = ""
+    while True:
+        attempts += 1
+        temporary = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with _LOCK, tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=path.parent, prefix=".bulk-", suffix=".tmp", delete=False
+            ) as handle:
+                temporary = Path(handle.name)
+                json.dump(state, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            return
+        except OSError as exc:
+            last_detail = _sanitized_os_error(exc)
+            winerror = getattr(exc, "winerror", None)
+            is_transient = (
+                isinstance(exc, transient)
+                or (winerror is not None and winerror in transient_winerrors)
+                or (getattr(exc, "errno", None) in transient_errnos)
+            )
+            # Retry a recognized transient sharing error at most twice.
+            if is_transient and attempts <= 2:
+                time.sleep(0.25 * attempts)
+                continue
+            raise BulkSaveError(
+                f"Bulk configuration could not be saved ({last_detail})."
+            ) from None
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+def _sanitized_os_error(exc: OSError) -> str:
+    """Machine-readable OSError detail with no filesystem path or secret."""
+    parts = [type(exc).__name__]
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        parts.append(f"winerror={winerror}")
+    errno_name = getattr(exc, "errno", None)
+    if errno_name is not None:
+        try:
+            parts.append(f"errno={errno_name}({errno.errorcode.get(errno_name, '?')})")
+        except Exception:
+            parts.append(f"errno={errno_name}")
+    strerror = getattr(exc, "strerror", None)
+    if strerror:
+        # strerror is OS text ("Access is denied"); it never carries a path.
+        parts.append(str(strerror)[:120])
+    return " | ".join(p for p in parts if p)
 
 
 class _StateFileLock:
@@ -519,24 +651,68 @@ def extend_queue(state: dict, additions: list[dict]) -> dict:
     return updated
 
 
+def _unique_archive_path(path: Path, label: str, stamp: str) -> Path:
+    candidate = path.with_name(f"{path.stem}.{label}-{stamp}{path.suffix}")
+    serial = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}.{label}-{stamp}-{serial}{path.suffix}")
+        serial += 1
+    return candidate
+
+
 def archive_state(
     state: dict,
     path: Path = STATE_PATH,
     *,
     stamp: datetime | None = None,
+    label: str = "pre-reconcile",
 ) -> Path:
     """Durably preserve a stopped state before replacing its unused tail."""
     _validate(state)
+    if re.fullmatch(r"[a-z][a-z-]*", label) is None:
+        raise BulkError("Archive label is malformed.")
     moment = (stamp or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    suffix = moment.strftime("%Y%m%d-%H%M%S")
-    candidate = path.with_name(f"{path.stem}.pre-reconcile-{suffix}{path.suffix}")
-    serial = 1
-    while candidate.exists():
-        candidate = path.with_name(
-            f"{path.stem}.pre-reconcile-{suffix}-{serial}{path.suffix}"
-        )
-        serial += 1
+    candidate = _unique_archive_path(path, label, moment.strftime("%Y%m%d-%H%M%S"))
     save_state(copy.deepcopy(state), candidate)
+    return candidate
+
+
+def archive_draft(
+    path: Path = DRAFT_PATH,
+    *,
+    stamp: datetime | None = None,
+    label: str = "superseded",
+) -> Path | None:
+    """Durably preserve the raw editor draft before a fresh batch replaces it.
+
+    Returns ``None`` when no draft file exists yet.  A failed copy raises
+    ``BulkError`` so callers never overwrite a draft they could not preserve.
+    """
+    if not path.exists():
+        return None
+    if re.fullmatch(r"[a-z][a-z-]*", label) is None:
+        raise BulkError("Archive label is malformed.")
+    moment = (stamp or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    candidate = _unique_archive_path(path, label, moment.strftime("%Y%m%d-%H%M%S"))
+    temporary = None
+    try:
+        with path.open("rb") as source, tempfile.NamedTemporaryFile(
+            "wb", dir=str(candidate.parent),
+            prefix=".bulk-draft-archive-", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            shutil.copyfileobj(source, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, candidate)
+    except OSError:
+        raise BulkError("Batch draft could not be archived.") from None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
     return candidate
 
 
@@ -660,9 +836,14 @@ def consume_completed(state: dict, slot_id: str, *, ready_at_utc: str) -> dict:
     next_state["remaining"] -= 1
     next_state["stage"] = "between" if next_state["remaining"] else "idle"
     next_state["slot_id"] = None
-    next_state["baseline_ip"] = None
-    next_state["verified_ip"] = None
-    next_state["verified_at_utc"] = None
+    # A delete-enabled creation batch starts every next account only after the
+    # prior container was removed and a new IP was verified.  Clearing this
+    # proof makes the normal next ``ip_pending`` stage submit exactly one reset.
+    # Legacy/non-deleting batches retain their original one-IP-per-batch rule.
+    if not next_state["remaining"] or bool(next_state.get("delete_containers")):
+        next_state["baseline_ip"] = None
+        next_state["verified_ip"] = None
+        next_state["verified_at_utc"] = None
     next_state["trigger_deadline_utc"] = None
     next_state["ready_at_utc"] = ready_at_utc if next_state["remaining"] else None
     next_state["failure_phase"] = None
@@ -701,6 +882,69 @@ def consume_failed(
             "failed_at_utc": utc_now(),
         },
     ]
+    next_state["stage"] = "between" if next_state["remaining"] else "idle"
+    next_state["slot_id"] = None
+    # A delete-enabled creation batch treats every successor as a genuinely
+    # new account attempt.  Whether the prior head completed or was explicitly
+    # preserved-and-skipped, the next slot must start at ip_pending and submit
+    # its own verified reset.  Legacy/non-deleting batches retain the original
+    # shared-IP behavior.
+    if not next_state["remaining"] or bool(next_state.get("delete_containers")):
+        next_state["baseline_ip"] = None
+        next_state["verified_ip"] = None
+        next_state["verified_at_utc"] = None
+    next_state["trigger_deadline_utc"] = None
+    next_state["ready_at_utc"] = ready_at_utc if next_state["remaining"] else None
+    next_state["failure_phase"] = None
+    next_state["failure_reason"] = None
+    next_state["failure_code"] = None
+    next_state["ip_attempt"] = None
+    _validate(next_state)
+    return next_state
+
+
+def consume_skipped(
+    state: dict,
+    slot_id: str,
+    *,
+    code: str,
+    reason: str,
+    ready_at_utc: str,
+) -> dict:
+    """Record one preserved "skipped by bulk" queue head and advance exactly once.
+
+    This shares :func:`consume_failed`'s validation, writer-ownership guard and
+    single-head consumption so a crash cannot consume twice or retry the slot.
+    The preserved attempt's container, alias and checkpoints are untouched.
+    """
+    return consume_failed(
+        state, slot_id, code=code, reason=reason, ready_at_utc=ready_at_utc
+    )
+
+
+def consume_stalled(
+    state: dict,
+    slot_id: str,
+    *,
+    ready_at_utc: str,
+) -> dict:
+    """Drop one stalled queue head without archiving its credentials.
+
+    A confirmed inactivity stall discards the whole account attempt: the caller
+    has already deleted that attempt's container and recorded the slot as
+    abandoned.  Nothing from the attempt (username, password, birth date) is
+    copied into ``failures``, so a later resume can never resurrect it.  The
+    next queue head supplies a fresh identity.
+
+    The IP proof is always cleared: a stall reset must start the next attempt
+    with a freshly verified address, even for a legacy non-deleting batch.
+    """
+    _validate(state)
+    if state["slot_id"] != slot_id or state["remaining"] < 1 or not state["queue"]:
+        raise BulkError("Batch stall reset does not match its saved queue head.")
+    next_state = dict(state)
+    next_state["queue"] = state["queue"][1:]
+    next_state["remaining"] -= 1
     next_state["stage"] = "between" if next_state["remaining"] else "idle"
     next_state["slot_id"] = None
     next_state["baseline_ip"] = None

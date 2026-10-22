@@ -16,6 +16,33 @@ from friend_poster.core.paths import PROJECT_ROOT
 LOG_DIR = str(PROJECT_ROOT / "logs")
 CRASH_PATH = os.path.join(LOG_DIR, "crash.log")
 _INSTALLED = False
+_SINKS: "list" = []
+
+
+def add_sink(callback) -> None:
+    """Register a callback(kind, text) that also receives captured crashes.
+
+    Sinks are optional observers (e.g. the Creator diagnostic panel).  A broken
+    sink must never break crash-file handling or the process, so every call is
+    guarded and duplicate registrations are ignored.
+    """
+    if callback not in _SINKS:
+        _SINKS.append(callback)
+
+
+def remove_sink(callback) -> None:
+    try:
+        _SINKS.remove(callback)
+    except ValueError:
+        pass
+
+
+def _notify(kind: str, text: str) -> None:
+    for callback in list(_SINKS):
+        try:
+            callback(kind, text)
+        except Exception:
+            pass
 
 
 def _write(kind: str, text: str) -> None:
@@ -26,6 +53,7 @@ def _write(kind: str, text: str) -> None:
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"), kind, text))
     except OSError:
         pass
+    _notify(kind, text)
 
 
 def _excepthook(etype, value, tb) -> None:

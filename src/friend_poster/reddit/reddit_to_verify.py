@@ -14,11 +14,13 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass
+from friend_poster.core.config import REDDIT_BUNDLE  # noqa: E402
 from friend_poster.reddit.reddit_open import open_container, proven_springboard, warn_siwa  # noqa: E402
 from friend_poster.reddit.reddit_interests import proven_home_feed  # noqa: E402
-from friend_poster.core.slots import get_slot  # noqa: E402
+from friend_poster.core.slots import CREATION_PROGRESS, get_slot  # noqa: E402
 from friend_poster.device.ssh_device import Phone, PhoneError  # noqa: E402
 from friend_poster.device.ui_tree import (  # noqa: E402
+    Node,
     OperationCancelled,
     TapStack,
     collapsed_text,
@@ -55,6 +57,19 @@ SORRY_STOP_MESSAGE = (
     "Reddit rejected the email submission. No automatic retry was attempted; "
     "the slot and phone screen were preserved. Retry manually later."
 )
+
+
+class EmailFieldInvalid(PhoneError):
+    """Reddit's email field never accepted the exact saved @icloud.com address.
+
+    Raised only for the terminal 873 condition: after the one authorized type
+    and at most one proven single-missing-character retype, the field still
+    does not hold the saved address, so no further type, retype, or Continue
+    tap is allowed.  ``failure_code`` is the machine-readable identity consumed
+    by the Creator batch pipeline; it is never derived from message text.
+    """
+
+    failure_code = "reddit_email_field_invalid"
 
 
 def log(msg: str) -> None:
@@ -213,7 +228,7 @@ def home_feed_you_node(nodes):
     if not proven_home_feed(nodes):
         return None
 
-    def bottom_exact(label: str, min_x: int, max_x: int):
+    def exact_hits(label: str, min_x: int, max_x: int, min_y: int, max_y: int):
         hits = []
         for node in nodes:
             if node.ntype == "ocr-line" or not node.on_screen() or not node.visible:
@@ -221,25 +236,64 @@ def home_feed_you_node(nodes):
             if collapsed_text(node.labels()) != collapsed_text(label):
                 continue
             cx, _cy = node.center()
-            if node.y < 1180 or node.y > 1315 or cx < min_x or cx > max_x:
+            if node.y < min_y or node.y > max_y or cx < min_x or cx > max_x:
                 continue
-            if node.w > 180 or node.h > 60:
+            if node.w > 400 or node.h > 80:
                 continue
             hits.append(node)
-        return hits[0] if len(hits) == 1 else None
+        return hits
 
-    search = find_label_exact(nodes, ("Search Reddit",))
-    home = bottom_exact("Home", 20, 240)
-    inbox = bottom_exact("Inbox", 250, 500)
-    you = bottom_exact("You", 510, 730)
-    if search is None or search.y < 70 or search.y > 180:
+    search_hits = exact_hits("Search Reddit", 120, 560, 70, 180)
+    login_hits = exact_hits("Log in", 520, 740, 70, 180)
+    home_hits = exact_hits("Home", 20, 240, 1180, 1315)
+    inbox_hits = exact_hits("Inbox", 250, 500, 1180, 1315)
+    you_hits = exact_hits("You", 510, 730, 1180, 1315)
+    if len(search_hits) != 1 or len(home_hits) != 1 or len(inbox_hits) != 1:
         return None
-    if home is None or inbox is None or you is None:
+    search, home, inbox = search_hits[0], home_hits[0], inbox_hits[0]
+    if len(you_hits) > 1:
         return None
-    nav_y = (home.center()[1], inbox.center()[1], you.center()[1])
-    if max(nav_y) - min(nav_y) > 35:
+    if len(you_hits) == 1:
+        you = you_hits[0]
+        nav_y = (home.center()[1], inbox.center()[1], you.center()[1])
+        if max(nav_y) - min(nav_y) > 35:
+            return None
+        return you
+
+    # XXTouch can repeatedly omit only the rightmost "You" label even though
+    # the icon and label are visibly present.  Infer that tab only on the exact
+    # logged-out layout observed in production: unique Search Reddit + Log in
+    # top anchors and unique, aligned Home + Inbox bottom anchors.  Their equal
+    # spacing determines the third tab center; no content or absolute blind
+    # coordinate is accepted.
+    if len(login_hits) != 1:
         return None
-    return you
+    login = login_hits[0]
+    if abs(search.center()[1] - login.center()[1]) > 45:
+        return None
+    home_x, home_y = home.center()
+    inbox_x, inbox_y = inbox.center()
+    spacing = inbox_x - home_x
+    inferred_x = inbox_x + spacing
+    inferred_y = round((home_y + inbox_y) / 2)
+    if not (
+        180 <= spacing <= 320
+        and 540 <= inferred_x <= 710
+        and 1180 <= inferred_y <= 1310
+        and abs(home_y - inbox_y) <= 35
+    ):
+        return None
+    return Node(
+        ntype="inferred-bottom-nav",
+        text="You",
+        x=inferred_x - 40,
+        y=inferred_y - 40,
+        w=80,
+        h=80,
+        visible=True,
+        enabled=True,
+        raw="inferred from logged-out Search/Log in/Home/Inbox anchors",
+    )
 
 
 def _signup_doorway_row_text(node) -> str:
@@ -252,7 +306,7 @@ def _signup_doorway_row_text(node) -> str:
 def signup_customize_doorway_node(nodes):
     """Return the one safe Sign up / Log in row on Reddit's logged-out You sheet."""
 
-    def exact_hits(label: str, xmin: int, xmax: int, ymin: int, ymax: int, maxw: int, maxh: int):
+    def exact_hits(label: str):
         wanted = collapsed_text(label)
         return [
             node
@@ -261,13 +315,9 @@ def signup_customize_doorway_node(nodes):
             and node.on_screen()
             and node.visible
             and collapsed_text(node.labels()) == wanted
-            and xmin <= node.x <= xmax
-            and ymin <= node.y <= ymax
-            and node.w <= maxw
-            and node.h <= maxh
         ]
 
-    def icon_row_hits(label: str, xmin: int, xmax: int, ymin: int, ymax: int, maxw: int):
+    def icon_row_hits(label: str):
         wanted = collapsed_text(label)
         return [
             node
@@ -277,32 +327,48 @@ def signup_customize_doorway_node(nodes):
             and node.visible
             and node.enabled
             and _signup_doorway_row_text(node) == wanted
-            and xmin <= node.x <= xmax
-            and ymin <= node.y <= ymax
-            and node.w <= maxw
-            and node.h <= 70
         ]
 
-    search = exact_hits("Search Reddit", 150, 500, 70, 180, 350, 70)
-    login = exact_hits("Log in", 540, 730, 70, 180, 180, 70)
-    title = exact_hits(SIGNUP_CUSTOMIZE_TITLE, 0, 580, 940, 1050, 600, 70)
-    body_1 = exact_hits(SIGNUP_CUSTOMIZE_BODY_1, 0, 700, 1010, 1110, 700, 70)
-    body_2 = exact_hits(SIGNUP_CUSTOMIZE_BODY_2, 0, 650, 1050, 1140, 650, 70)
-    action = icon_row_hits(SIGNUP_CUSTOMIZE_ACTION, 20, 430, 1100, 1210, 430)
-    settings = icon_row_hits(SIGNUP_CUSTOMIZE_SETTINGS, 20, 350, 1170, 1295, 350)
-    close = exact_hits("X", 620, 730, 940, 1060, 110, 80)
-    groups = (search, login, title, body_1, body_2, action, settings, close)
+    search = exact_hits("Search Reddit")
+    login = exact_hits("Log in")
+    title = exact_hits(SIGNUP_CUSTOMIZE_TITLE)
+    action = icon_row_hits(SIGNUP_CUSTOMIZE_ACTION)
+    settings = icon_row_hits(SIGNUP_CUSTOMIZE_SETTINGS)
+    # The close glyph is decorative and XXTouch OCR does not reliably expose it.
+    # Prove the drawer from the stable top bar, title, and both actionable rows;
+    # the script never needs to tap or otherwise depend on the close glyph.
+    groups = (search, login, title, action, settings)
     if any(len(group) != 1 for group in groups):
         return None
+    search_node, login_node = search[0], login[0]
+    title_node, action_node, settings_node = title[0], action[0], settings[0]
+    search_x, search_y = search_node.center()
+    login_x, login_y = login_node.center()
+    title_x, title_y = title_node.center()
+    action_x, action_y = action_node.center()
+    settings_x, settings_y = settings_node.center()
+
+    # Semantic/relative proof: the Reddit top bar is above one lower-screen
+    # drawer whose title, action, and Settings rows retain their order and
+    # spacing even when the sheet moves vertically by dozens of pixels.
     if not (
-        title[0].center()[1]
-        < body_1[0].center()[1]
-        < body_2[0].center()[1]
-        < action[0].center()[1]
-        < settings[0].center()[1]
+        search_y < 250
+        and login_y < 250
+        and abs(search_y - login_y) <= 45
+        and search_x < login_x
+        and title_y > 700
+        and 80 <= action_y - title_y <= 260
+        and 35 <= settings_y - action_y <= 150
+        and title_x < 500
+        and action_x < 450
+        and settings_x < 400
+        and 250 <= title_node.w <= 700
+        and 140 <= action_node.w <= 450
+        and 80 <= settings_node.w <= 350
+        and title_node.h <= 80
+        and action_node.h <= 80
+        and settings_node.h <= 80
     ):
-        return None
-    if abs(close[0].center()[1] - title[0].center()[1]) > 55:
         return None
     if existing_account_profile(nodes):
         return None
@@ -363,6 +429,26 @@ def post_you_state(nodes) -> str:
     return "unknown"
 
 
+def _tap_signup_doorway(stack: TapStack, doorway) -> None:
+    """Tap a freshly located doorway row after validating current geometry."""
+
+    center = doorway.center()
+    if not (0 <= center[0] <= 750 and 0 <= center[1] <= 1334):
+        raise PhoneError(
+            "Reddit signup doorway was outside the canonical screen; did not tap."
+        )
+    refresh = getattr(stack, "refresh_screen_geometry", None)
+    if callable(refresh):
+        width, height = refresh()
+        ratio = height / max(1, width)
+        if height <= width or not 1.5 <= ratio <= 2.5:
+            raise PhoneError(
+                f"Reddit signup doorway requires verified portrait geometry; "
+                f"device reported {width}x{height}. Did not tap."
+            )
+    stack.tap_xy(*center)
+
+
 def dump_after_you(stack: TapStack, phone: Phone):
     """Permit continuation only from a proven signup landing/provider sheet."""
 
@@ -386,41 +472,64 @@ def dump_after_you(stack: TapStack, phone: Phone):
 
 
 def wait_after_signup_doorway(stack: TapStack, phone: Phone, *, stop=None, log_fn=None):
-    """Wait for one doorway tap to reach an already-supported signup state."""
+    """Wait for the doorway transition, with one verified same-row retry."""
 
     emit = log_fn or log
-    for i in range(8):
-        _check_stop(stop)
-        _blob, nodes = dump_named(
-            stack,
-            phone,
-            f"872_after_signup_doorway_{i}",
-            emit,
-            shot=True,
-        )
-        if existing_account_profile(nodes):
-            raise PhoneError(
-                "Signup doorway opened an existing account/profile. Stopped without "
-                "logging out or changing it."
+    last_nodes = []
+    for attempt in range(2):
+        for i in range(8):
+            _check_stop(stop)
+            CREATION_PROGRESS.note()
+            _blob, nodes = dump_named(
+                stack,
+                phone,
+                f"872_after_signup_doorway_{attempt}_{i}",
+                emit,
+                shot=True,
             )
-        if (
-            signup_landing_or_provider(nodes)
-            or welcome(nodes)
-            or at_verify(nodes)
-            or at_sorry(nodes)
-        ):
-            emit("Signup doorway advanced to a proven Reddit signup state.")
-            return nodes
-        if i < 7:
-            if signup_customize_doorway_node(nodes) is not None:
-                emit(f"Signup doorway transition pending; no second tap ({i + 1}/8)")
-            else:
-                emit(f"Signup doorway next screen still loading ({i + 1}/8)")
-            _wait(stop, 1.2)
+            last_nodes = nodes
+            if existing_account_profile(nodes):
+                raise PhoneError(
+                    "Signup doorway opened an existing account/profile. Stopped without "
+                    "logging out or changing it."
+                )
+            if (
+                signup_landing_or_provider(nodes)
+                or welcome(nodes)
+                or at_verify(nodes)
+                or at_sorry(nodes)
+            ):
+                emit("Signup doorway advanced to a proven Reddit signup state.")
+                return nodes
+            if i < 7:
+                if signup_customize_doorway_node(nodes) is not None:
+                    emit(
+                        "Signup doorway transition pending "
+                        f"({attempt + 1}/2 tap, {i + 1}/8 frame)."
+                    )
+                else:
+                    emit(
+                        "Signup doorway next screen still loading "
+                        f"({attempt + 1}/2 tap, {i + 1}/8 frame)."
+                    )
+                _wait(stop, 1.2)
+
+        retry = signup_customize_doorway_node(last_nodes)
+        if attempt == 0 and retry is not None:
+            _check_stop(stop)
+            emit(
+                "Signup doorway remained exactly verified after the first tap; "
+                "retrying Sign up / Log in once."
+            )
+            _tap_signup_doorway(stack, retry)
+            _wait(stop, 1.4)
+            continue
+        break
+
     raise PhoneError(
         "Signup doorway did not advance to a proven Reddit login/signup screen "
-        "after one tap and 8 fresh frames. Did not repeat the tap. "
-        "See 872_after_signup_doorway_7."
+        "after at most two verified taps and bounded fresh frames. "
+        "No blind tap was attempted. See 872_after_signup_doorway_1_7."
     )
 
 
@@ -869,7 +978,7 @@ def step(
             f"[{signup_doorway.x},{signup_doorway.y} "
             f"{signup_doorway.w}x{signup_doorway.h}]"
         )
-        stack.tap_xy(*signup_doorway.center())
+        _tap_signup_doorway(stack, signup_doorway)
         signup_doorway_taps[0] += 1
         _wait(stop, 1.4)
         return "DOORWAY_TAP"
@@ -1021,7 +1130,7 @@ def step(
         if typed_once[0] >= 1:
             _log_email_validation_failure(nodes, email)
             dump_named(stack, phone, "873_email_still_invalid", log, shot=True)
-            raise PhoneError(
+            raise EmailFieldInvalid(
                 "Email field still invalid after one type and at most one bounded "
                 "single-missing-character retype (need the exact saved @icloud.com "
                 "address in Reddit's email form and no 'Please enter a valid email'). "
@@ -1042,6 +1151,7 @@ def wait_ui(stack: TapStack, phone: Phone, stem: str, nodes, *, stop=None, log_f
     emit = log_fn or log
     for i in range(8):
         _check_stop(stop)
+        CREATION_PROGRESS.note()
         if proven_springboard(nodes):
             raise PhoneError(
                 "Reddit left the foreground and iPhone Home is visible. "
@@ -1077,6 +1187,7 @@ def run_to_verify(
     *,
     stop=None,
     log_fn=None,
+    reuse_active_container: bool = False,
 ) -> None:
     """Locked taps through signup until Verify your email. No SIWA. No Skip."""
     emit = log_fn or log
@@ -1085,7 +1196,19 @@ def run_to_verify(
     emit("Goal: Verify your email. No SIWA. No Skip.")
     blob, nodes = dump_named(stack, phone, "870_now", emit, shot=True)
     opened = [False]
-    if proven_springboard(nodes):
+    if reuse_active_container:
+        _check_stop(stop)
+        emit(
+            "Replacement email: reopening Reddit directly in the already active "
+            "Crane container; container selection is not repeated."
+        )
+        stack.open_bundle(REDDIT_BUNDLE)
+        opened[0] = True
+        _check_stop(stop)
+        blob, nodes = dump_named(
+            stack, phone, "871_after_active_container_reopen", emit, shot=True
+        )
+    elif proven_springboard(nodes):
         _check_stop(stop)
         emit(
             "Initial iPhone Home detected -> open the exact selected Crane "
@@ -1132,6 +1255,7 @@ def run_to_verify(
 
     for i in range(14):
         _check_stop(stop)
+        CREATION_PROGRESS.note()
         result = step(
             stack,
             phone,

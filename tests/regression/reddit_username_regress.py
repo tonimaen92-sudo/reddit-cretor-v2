@@ -124,6 +124,7 @@ def run_keep_case(
         "get_slot": username.get_slot,
         "set_slot_username": username.set_slot_username,
         "write_account_text": username.write_account_text,
+        "claim_username": username.claim_username,
         "choose": username._choose_generated_username,
         "sleep": username.time.sleep,
         "log": username.log,
@@ -145,6 +146,9 @@ def run_keep_case(
             writes.append(("write", sid, email, name)),
             "fixture-account.txt",
         )[-1]
+        username.claim_username = lambda name, sid: {
+            "username": name, "slot_id": sid, "status": "processing",
+        }
         username._choose_generated_username = lambda choices: choices[1]
         username.time.sleep = lambda _seconds: None
         username.log = lambda message: events.append("log:" + message)
@@ -160,6 +164,7 @@ def run_keep_case(
         username.get_slot = originals["get_slot"]
         username.set_slot_username = originals["set_slot_username"]
         username.write_account_text = originals["write_account_text"]
+        username.claim_username = originals["claim_username"]
         username._choose_generated_username = originals["choose"]
         username.time.sleep = originals["sleep"]
         username.log = originals["log"]
@@ -289,7 +294,7 @@ def main() -> int:
     check("fallback-returns-random-reddit-name", result == "Professional-Art4070")
     check("fallback-taps-refresh-choice-field-continue", len(success_stack.taps) == 4)
     check("fallback-types-selected-name-on-noop-chip", success_stack.typed == [result])
-    check("fallback-persists-only-after-password-proof", password_dump_index < first_write_index)
+    check("fallback-claims-before-continue", first_write_index < password_dump_index)
     check("fallback-persists-slot-and-account-once", len(writes) == 2)
 
     chip_result, chip_stack, _chip_events, chip_writes = run_keep_case(
@@ -317,8 +322,9 @@ def main() -> int:
     )
     failed_message = str(failed_result) if isinstance(failed_result, PhoneError) else ""
     check(
-        "failed-navigation-is-not-persisted",
-        "not saved" in failed_message.casefold() and failed_writes == [],
+        "failed-navigation-keeps-processing-claim-only",
+        "processing claim was preserved" in failed_message.casefold()
+        and failed_writes == [("set", "a0001", "Professional-Art4070")],
         failed_message,
     )
 

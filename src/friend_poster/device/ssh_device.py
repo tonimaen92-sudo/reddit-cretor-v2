@@ -610,6 +610,11 @@ class Phone:
         self.ssh_remote_port = SSH_REMOTE_PORT
         self.ssh_user = ""
         self.password_used = False
+        # Optional liveness hook.  When set, every completed device round-trip
+        # reports progress to the inactivity watchdog, so a slow-but-working
+        # attempt can never trip the reset while the iPhone keeps answering.
+        # Left unset for every caller except the bulk creation pipeline.
+        self.progress_note: Callable[[], None] | None = None
 
     def connect(self, password: str, also_wda: bool = True) -> None:
         self.usb = diagnose_usb(self.log)
@@ -748,6 +753,12 @@ class Phone:
             f"{_auth_hint(last_auth, remote_port)}"
         )
 
+    def _note_progress(self) -> None:
+        """Report one completed device round-trip to the liveness hook."""
+        note = self.progress_note
+        if note is not None:
+            note()
+
     def exec(self, command: str, timeout: int = 30) -> str:
         if self.ssh is None:
             raise PhoneError("SSH is not connected.")
@@ -757,6 +768,7 @@ class Phone:
         out = stdout.read().decode("utf-8", errors="replace")
         err = stderr.read().decode("utf-8", errors="replace")
         code = stdout.channel.recv_exit_status()
+        self._note_progress()
         if code != 0 and not out:
             raise PhoneError(f"SSH cmd failed ({code}): {command}\n{err.strip()}")
         if err.strip() and code != 0:
@@ -782,6 +794,7 @@ class Phone:
             stdin.close()
         except (socket.timeout, TimeoutError) as exc:
             return 124, f"(timeout {timeout}s: {exc})\n"
+        self._note_progress()
         text = out
         if err.strip():
             text = (out + "\n" + err).strip() + "\n"
@@ -802,6 +815,7 @@ class Phone:
                     self.exec_ok(f"mkdir -p {shlex.quote(folder)}", timeout=10)
                 with sftp.file(path, "wb") as fh:
                     fh.write(data)
+                self._note_progress()
                 return
             finally:
                 sftp.close()
@@ -827,6 +841,7 @@ class Phone:
         if status != 0:
             detail = (out_b + b"\n" + err_b).decode("utf-8", errors="replace").strip()
             raise PhoneError(f"SSH stream write failed ({status}): {detail}")
+        self._note_progress()
 
     def sftp_write(self, path: str, data: str) -> None:
         raw = data.encode("utf-8") if isinstance(data, str) else data
@@ -844,6 +859,7 @@ class Phone:
             try:
                 with sftp.file(path, "rb") as fh:
                     raw = fh.read()
+                self._note_progress()
                 if isinstance(raw, str):
                     return raw.encode("utf-8")
                 return raw
@@ -863,6 +879,7 @@ class Phone:
         status = stdout.channel.recv_exit_status()
         if status != 0:
             raise PhoneError(f"SSH stream read failed ({status}): {err.strip()}")
+        self._note_progress()
         return raw
 
     def exec_ok(self, command: str, timeout: int = 30) -> tuple[int, str]:
@@ -877,6 +894,7 @@ class Phone:
             code = stdout.channel.recv_exit_status()
         except (socket.timeout, TimeoutError) as e:
             return 124, f"(timeout {timeout}s: {e})\n"
+        self._note_progress()
         text = out
         if err.strip():
             text = (out + "\n" + err).strip() + "\n"

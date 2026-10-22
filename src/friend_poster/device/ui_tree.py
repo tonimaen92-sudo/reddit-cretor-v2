@@ -27,6 +27,21 @@ from friend_poster.device.ssh_device import Phone, PhoneError
 
 LogFn = Callable[[str], None]
 
+# Creator enables detailed screen-dump previews so every permitted labeled node
+# from an *already captured* frame is shown, not just the first 12.  It defaults
+# to off so CLI tools and other apps keep their existing output.
+_PREVIEW_DETAIL = False
+
+
+def set_preview_detail(enabled: bool) -> None:
+    """Enable or disable the all-nodes frame preview (Creator detailed mode)."""
+    global _PREVIEW_DETAIL
+    _PREVIEW_DETAIL = bool(enabled)
+
+
+def preview_detail_enabled() -> bool:
+    return _PREVIEW_DETAIL
+
 
 class OperationCancelled(PhoneError):
     """Raised when Creator Stop cancels a pending phone operation."""
@@ -74,6 +89,10 @@ class TapStack:
         self.backend = ""
         self.wda = None
         self.session = None
+        # XXTouch remains the mutation backend, while WDA (when installed) can
+        # simultaneously provide a real XCUITest hierarchy for verification.
+        self.wda_observer = None
+        self.wda_observer_session = None
         self.screen_w = 750
         self.screen_h = 1334
         self._xxt_size_ok = False
@@ -99,6 +118,7 @@ class TapStack:
     def attach(self) -> str:
         self.check_cancelled()
         if self._try_xxtouch():
+            self._try_wda_observer()
             return self.backend
         if self._try_wda():
             return self.backend
@@ -110,6 +130,57 @@ class TapStack:
             "Open XXTouch Elite once on the phone, or install WDA. Did not guess taps."
         )
         return self.backend
+
+    def _try_wda_observer(self) -> bool:
+        """Attach a read-only WDA/XPath observer without replacing XXTouch taps."""
+        self.check_cancelled()
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{WDA_LOCAL_PORT}/status", timeout=3
+            ) as response:
+                body = response.read().decode("utf-8", errors="replace")
+            if not any(token in body.lower() for token in ("sessionid", "value", "ready")):
+                return False
+            client = _wda_client()
+            try:
+                session = client.session()
+            except Exception:
+                session = client
+            self.wda_observer = client
+            self.wda_observer_session = session
+            self.log(
+                f"UI observer: WebDriverAgent hierarchy on 127.0.0.1:{WDA_LOCAL_PORT}; "
+                "XXTouch remains the tap backend."
+            )
+            return True
+        except OperationCancelled:
+            raise
+        except Exception as exc:
+            self.log(
+                "UI observer: WDA hierarchy unavailable "
+                f"({type(exc).__name__}); using bounded XXTouch OCR."
+            )
+            return False
+
+    def structured_dump_xml(self) -> str | None:
+        """Return a real WDA/XCUITest hierarchy when the observer is available."""
+        target = self.wda_observer_session
+        if target is None and self.backend == "wda":
+            target = self.session if self.session is not None else self.wda
+        if target is None:
+            return None
+        for attr in ("source", "dump"):
+            fn = getattr(target, attr, None)
+            if callable(fn):
+                try:
+                    value = fn()
+                    if value:
+                        return value if isinstance(value, str) else str(value)
+                except Exception:
+                    continue
+        return None
 
     def _try_xxtouch(self) -> bool:
         self.check_cancelled()
@@ -460,6 +531,21 @@ end
         self._xxt_size_ok = True
         self.log(f"XXTouch screen.size {self.screen_w}x{self.screen_h}")
         return self.screen_w, self.screen_h
+
+    def refresh_screen_geometry(self) -> tuple[int, int]:
+        """Refresh native touch geometry before a resolution-sensitive tap."""
+
+        self.check_cancelled()
+        if self.backend == "xxtouch":
+            self._xxt_size_ok = False
+            width, height = self._xxt_screen_size()
+        else:
+            width, height = int(self.screen_w), int(self.screen_h)
+        if width < 100 or height < 100:
+            raise PhoneError(
+                f"Device returned invalid screen geometry {width}x{height}; did not tap."
+            )
+        return width, height
 
     def _to_touch(self, x: int, y: int) -> tuple[int, int]:
         self.check_cancelled()
@@ -915,6 +1001,64 @@ fh:close()
             "Install TrollStore WebDriverAgent, AutoTouch, XXTouch, or ZXTouch."
         )
 
+    def semantic_keyboard_present(self) -> bool | None:
+        """Ask XXTouch accessibility whether keyboard keys are visible.
+
+        ``None`` means the semantic API is unavailable, allowing callers to
+        retain their existing OCR fallback. No field value or key text is
+        returned or logged.
+        """
+        self.check_cancelled()
+        hierarchy = self.structured_dump_xml()
+        if hierarchy:
+            try:
+                root = ET.fromstring(hierarchy)
+                visible_keyboard = any(
+                    element.tag.endswith("Keyboard")
+                    and str(element.attrib.get("visible", "true")).lower() != "false"
+                    for element in root.iter()
+                )
+                self.log(
+                    "WDA accessibility keyboard: "
+                    + ("visible" if visible_keyboard else "absent")
+                )
+                return visible_keyboard
+            except ET.ParseError:
+                self.log("WDA accessibility hierarchy was malformed; using OCR fallback")
+        if self.backend != "xxtouch":
+            return None
+        out_path = f"{self.xxt_scripts}/ra_keyboard_state.txt"
+        lua = f'''local outcome = "unsupported"
+local loaded, ui_element = pcall(require, "ui_element")
+if loaded and type(ui_element) == "table" then
+  local queried, items = pcall(function()
+    return ui_element.find_all({{ role = "keyboard_key", visible = true }}, {{
+      max_level = 1,
+      max_elements = 120
+    }})
+  end)
+  if queried and type(items) == "table" then
+    outcome = (#items > 0) and "yes" or "no"
+  end
+end
+local fh = io.open("{out_path}", "w")
+if fh == nil then error("cannot write keyboard state") end
+fh:write(outcome)
+fh:close()
+'''
+        self.phone.exec_ok(f"rm -f '{out_path}'", timeout=8)
+        result = self._run_xxt_lua(
+            "ra_keyboard_state.lua", lua, timeout=15, wait_path=out_path
+        ).strip().casefold()
+        if result == "yes":
+            self.log("XXTouch accessibility keyboard: visible")
+            return True
+        if result == "no":
+            self.log("XXTouch accessibility keyboard: absent")
+            return False
+        self.log("XXTouch accessibility keyboard: unavailable; using OCR fallback")
+        return None
+
     def _tap_wda(self, x: int, y: int) -> None:
         self.check_cancelled()
         s = self.session
@@ -1325,10 +1469,26 @@ def dump_named(
     nodes = parse_nodes(blob)
     clickable = [n for n in nodes if n.labels() and n.on_screen()]
     mode = "" if persist else " (transient; not saved)"
+    detailed = preview and preview_detail_enabled()
+    if detailed:
+        log(f"== frame begin: {stem} ==")
     log(f"{stem}: {len(nodes)} nodes, {len(clickable)} labeled{mode}")
     if preview:
-        for n in clickable[:12]:
+        shown = clickable if detailed else clickable[:12]
+        for n in shown:
             log(f"  - {n.ntype} {n.labels()[:80]!r} [{n.x},{n.y} {n.w}x{n.h}]")
+        if detailed:
+            hidden = len(clickable) - len(shown)
+            if hidden > 0:
+                log(f"  - ... {hidden} more labeled node(s) omitted")
+            log(f"== frame end: {stem} ({len(shown)} of {len(clickable)} labeled) ==")
+    else:
+        # Privacy-sensitive screens keep preview=False; report safe metadata only
+        # so the suppression is explained without exposing any label text.
+        log(
+            f"  - frame preview suppressed (privacy-sensitive); "
+            f"{len(nodes)} nodes, {len(clickable)} labeled"
+        )
     return blob, nodes
 
 

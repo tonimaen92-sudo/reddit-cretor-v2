@@ -1931,7 +1931,10 @@ def creation_pipeline_regressions() -> None:
     )
 
     init_source = inspect.getsource(creator.App.__init__)
-    combined_source = inspect.getsource(creator.App._run_creation_pipeline)
+    combined_source = (
+        inspect.getsource(creator.App._run_creation_pipeline)
+        + inspect.getsource(creator.App._run_creation_pipeline_attempt)
+    )
     check(
         "pipeline-button-added-with-individual-buttons-preserved",
         'text="Start Creation Reddit"' in init_source

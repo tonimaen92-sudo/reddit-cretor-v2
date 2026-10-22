@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -30,6 +31,15 @@ PAD_BASE = 4
 LEGACY_R_MAX = 13
 REDDIT_CLEANUP_STATES = ("pending", "app_stopped", "complete")
 GHOST_CONTAINER_STATES = ("needed", "provisioning", "ready")
+# Durable local-container deletion checkpoint.  ``pending`` is written before
+# any delete gesture (so a crash can resume it) and ``complete`` only after a
+# complete validated inventory proves the exact recorded container is gone.
+CONTAINER_DELETION_STATES = ("pending", "complete")
+# Separate from ``container_deletion`` (the post-account cleanup checkpoint):
+# this record belongs only to a deliberately abandoned, incomplete bulk
+# attempt.  Keeping the two records distinct prevents a failed signup reset
+# from making an account look successfully completed and cleaned up.
+BULK_RESET_CLEANUP_STATES = ("pending", "complete")
 CREATION_FEED_SWIPE_MIN = 1
 HME_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@icloud\.com$", re.I)
 EMAIL_VERIFICATION_PHASES = (
@@ -74,6 +84,41 @@ def realistic_label(seed: str | None = None) -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class CreationProgressClock:
+    """Monotonic inactivity clock for one bulk creation attempt.
+
+    :meth:`note` is called by a verified workflow transition, by a completed
+    stage advance, and by every completed device round-trip of the attempt's
+    own phone (``Phone.progress_note``).  A dump, tap, flick, screenshot or app
+    probe that returns proves the attempt is alive, so a legitimately slow phase
+    may run longer than any single total-duration limit.  A frozen attempt - a
+    device call that never returns, or no device contact at all - stops noting
+    and is therefore still detectable.  Re-observing the same screen through
+    logs, and phone clock changes, never touch it.
+    """
+
+    def __init__(self, time_fn: Callable[[], float] | None = None) -> None:
+        self._time_fn = time_fn or time.monotonic
+        self._lock = threading.Lock()
+        self._stamp = self._time_fn()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._stamp = self._time_fn()
+
+    def note(self) -> None:
+        self.reset()
+
+    def idle_seconds(self) -> float:
+        with self._lock:
+            return max(0.0, self._time_fn() - self._stamp)
+
+
+# Process-wide clock shared by the slot checkpoint writers and the bulk
+# inactivity watchdog.  Tests may replace it with a fake-monotonic instance.
+CREATION_PROGRESS = CreationProgressClock()
 
 
 def _empty_slot(sid: str) -> dict[str, Any]:
@@ -246,6 +291,10 @@ def _row_is_real(row: dict[str, Any], n: int) -> bool:
         and not row.get("email")
         and not row.get("reddit")
         and not row.get("day1")
+        and not slot_bulk_skipped(row)
+        and not slot_creation_terminal_failure(row)
+        and "container_deletion" not in row
+        and "bulk_reset_cleanup" not in row
     ):
         return False
     if n <= LEGACY_R_MAX:
@@ -255,6 +304,13 @@ def _row_is_real(row: dict[str, Any], n: int) -> bool:
         or row.get("email")
         or row.get("reddit")
         or row.get("day1")
+        or slot_bulk_skipped(row)
+        or slot_creation_terminal_failure(row)
+        # A completed automatic container deletion keeps the slot row (and its
+        # number) reserved even after the local container is gone, so a0001 is
+        # never handed out again once it has held a container.
+        or "container_deletion" in row
+        or "bulk_reset_cleanup" in row
     )
 
 
@@ -496,6 +552,7 @@ def mark_ghost_container_needed(
     row["ghost_container_state"] = "needed"
     row.pop("ghost_container_baseline", None)
     row.pop("ghost_container_instance", None)
+    row.pop("crane_container_instance", None)
     row.pop("crane_selection_policy", None)
     save_slots(rows)
     if log:
@@ -556,8 +613,13 @@ def mark_ghost_container_provisioning(
     row["ghost_container_state"] = "provisioning"
     row["ghost_container_baseline"] = clean
     row.pop("ghost_container_instance", None)
+    row.pop("crane_container_instance", None)
     row.pop("crane_selection_policy", None)
     save_slots(rows)
+    # Only the persisted needed -> provisioning transition is progress.  Calling
+    # this again with the same saved baseline returns above without touching the
+    # clock, so a repeated call cannot keep a stalled attempt alive.
+    CREATION_PROGRESS.note()
     if log:
         log(f"Slot {row.get('id')}: Ghost provisioning checkpoint saved.")
     return row
@@ -582,6 +644,7 @@ def mark_ghost_container_ready(
     row.pop("ghost_container_baseline", None)
     row.pop("crane_selection_policy", None)
     save_slots(rows)
+    CREATION_PROGRESS.note()
     if log:
         log(f"Slot {row.get('id')}: newest Ghost container is ready.")
     return row
@@ -612,6 +675,7 @@ def mark_ghost_container_ready_from_crane(
     row.pop("ghost_container_instance", None)
     row["crane_selection_policy"] = "newest_exact"
     save_slots(rows)
+    CREATION_PROGRESS.note()
     if log:
         log(
             f"Slot {row.get('id')}: existing Crane container proven; "
@@ -626,6 +690,313 @@ def _slot_sort_key(row: dict[str, Any]) -> tuple[int, str]:
     if n is not None:
         return (n, "")
     return (10_000_000, sid)
+
+
+def container_deletion(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return one slot's validated local-container deletion checkpoint.
+
+    A malformed checkpoint fails closed as absent so it can never be mistaken
+    for a verified deletion.
+    """
+    value = (row or {}).get("container_deletion")
+    if not isinstance(value, dict):
+        return None
+    state = str(value.get("state") or "").strip().lower()
+    instance_id = str(value.get("instance_id") or "").strip().upper()
+    if state not in CONTAINER_DELETION_STATES or not instance_id:
+        return None
+    return value
+
+
+def container_deletion_state(row: dict[str, Any] | None) -> str:
+    value = container_deletion(row)
+    return str(value.get("state") or "").strip().lower() if value else ""
+
+
+def container_deletion_instance(row: dict[str, Any] | None) -> str:
+    value = container_deletion(row)
+    return str(value.get("instance_id") or "").strip().upper() if value else ""
+
+
+def crane_container_instance(row: dict[str, Any] | None) -> str:
+    """Return the full UUID proven from Crane preferences, never Ghost OCR."""
+    return str((row or {}).get("crane_container_instance") or "").strip().upper()
+
+
+def reconcile_crane_container_identity(
+    sid: str,
+    instance_id: str,
+    log: LogFn | None = None,
+    *,
+    allow_pending_rebind: bool = False,
+) -> dict[str, Any]:
+    """Atomically bind a slot to the full UUID proven by Crane preferences.
+
+    Ghost's displayed identifier is only a short UI prefix and remains in
+    ``ghost_container_instance``.  A pending post-account deletion may be
+    migrated once when a fresh Crane inventory uniquely proves the same exact
+    slot name.  Completed deletion identities are immutable.
+    """
+    instance_id = str(instance_id or "").strip().upper()
+    if not instance_id or instance_id == "DEFAULT":
+        raise ValueError("Missing or unsafe Crane container UUID")
+    rows = load_slots()
+    row = find_slot_row(rows, sid)
+    if row is None:
+        raise ValueError(f"No slot {sid}")
+    stored = str(row.get("id") or sid)
+    existing_full = crane_container_instance(row)
+    deletion_state = container_deletion_state(row)
+    deletion_id = container_deletion_instance(row)
+    if deletion_state == "complete" and deletion_id != instance_id:
+        raise ValueError(
+            f"Slot {stored} completed deletion identity cannot be replaced"
+        )
+    if existing_full and existing_full != instance_id:
+        raise ValueError(
+            f"Slot {stored} Crane UUID is already bound to a different container"
+        )
+    if deletion_state == "pending" and deletion_id != instance_id:
+        if not allow_pending_rebind:
+            raise ValueError(
+                f"Slot {stored} pending deletion identity cannot be replaced"
+            )
+        deletion = dict(row["container_deletion"])
+        deletion["instance_id"] = instance_id
+        row["container_deletion"] = deletion
+    row["crane_container_instance"] = instance_id
+    save_slots(rows)
+    if log:
+        log(f"Slot {stored}: full Crane container identity verified and saved.")
+    return row
+
+
+def slot_container_deleted(row: dict[str, Any] | None) -> bool:
+    """True once the account's local container was verified deleted."""
+    return container_deletion_state(row) == "complete"
+
+
+def slot_container_available(row: dict[str, Any] | None) -> bool:
+    """Whether the slot's local container still exists and may be opened.
+
+    A verified automatic deletion removes the container permanently, so manual
+    and posting workflows must not silently treat the slot's session as usable
+    or silently rebuild the container under the same name.
+    """
+    return not slot_container_deleted(row)
+
+
+def mark_container_deletion_pending(
+    sid: str,
+    instance_id: str,
+    log: LogFn | None = None,
+) -> dict[str, Any]:
+    """Durably record the intent to delete one slot's exact local container.
+
+    The ``(slot id, exact instance id)`` pair is written *before* any delete
+    gesture, so a crash mid-deletion can be resumed by matching the same exact
+    container against a complete inventory instead of re-running signup.  The
+    recorded identity is never allowed to change once written.
+    """
+    instance_id = str(instance_id or "").strip().upper()
+    if not instance_id:
+        raise ValueError("Missing local container instance identifier")
+    rows = load_slots()
+    row = find_slot_row(rows, sid)
+    if row is None:
+        raise ValueError(f"No slot {sid}")
+    if not row.get("reddit"):
+        raise ValueError(f"Slot {sid} has no created Reddit account to clean up")
+    stored = str(row.get("id") or sid)
+    recorded = crane_container_instance(row)
+    if recorded and recorded != instance_id:
+        raise ValueError(
+            f"Slot {stored} recorded container {recorded} cannot be replaced "
+            f"by {instance_id}"
+        )
+    existing = container_deletion(row)
+    if existing is not None and container_deletion_instance(row) != instance_id:
+        raise ValueError(
+            f"Slot {stored} already has a pending deletion for a different container"
+        )
+    if container_deletion_state(row) == "complete":
+        raise ValueError(f"Slot {stored} container is already recorded as deleted")
+    if (
+        container_deletion_state(row) == "pending"
+        and container_deletion_instance(row) == instance_id
+    ):
+        # Idempotent re-issue of the same durable intent: never counted as new
+        # progress, so a retry cannot keep a stalled attempt alive.
+        return row
+    row["container_deletion"] = {
+        "slot_id": stored,
+        "instance_id": instance_id,
+        "state": "pending",
+        "requested_at_utc": _now(),
+    }
+    save_slots(rows)
+    CREATION_PROGRESS.note()
+    if log:
+        log(f"Slot {stored}: local container deletion recorded as pending.")
+    return row
+
+
+def mark_container_deletion_complete(
+    sid: str,
+    log: LogFn | None = None,
+) -> dict[str, Any]:
+    """Commit a verified local-container deletion for one slot.
+
+    The slot row, credentials, iCloud alias, account history and Reddit account
+    are preserved; only the local container is marked removed.  The slot number
+    stays reserved for allocation.
+    """
+    rows = load_slots()
+    row = find_slot_row(rows, sid)
+    if row is None:
+        raise ValueError(f"No slot {sid}")
+    pending = container_deletion(row)
+    if pending is None:
+        raise ValueError(f"Slot {sid} has no pending local container deletion")
+    stored = str(row.get("id") or sid)
+    row["container_deletion"] = {
+        "slot_id": stored,
+        "instance_id": str(pending.get("instance_id") or "").strip().upper(),
+        "state": "complete",
+        "requested_at_utc": pending.get("requested_at_utc"),
+        "completed_at_utc": _now(),
+    }
+    save_slots(rows)
+    CREATION_PROGRESS.note()
+    if log:
+        log(f"Slot {stored}: local container deletion verified complete.")
+    return row
+
+
+def bulk_reset_cleanup(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return a validated cleanup checkpoint for an abandoned bulk attempt.
+
+    This is intentionally independent of :func:`container_deletion`, which is
+    reserved for the normal post-account cleanup of a successfully created
+    Reddit account.  Malformed data never counts as a completed reset.
+    """
+    value = (row or {}).get("bulk_reset_cleanup")
+    if not isinstance(value, dict):
+        return None
+    state = str(value.get("state") or "").strip().lower()
+    instance_id = str(value.get("instance_id") or "").strip().upper()
+    if state not in BULK_RESET_CLEANUP_STATES or not instance_id:
+        return None
+    return value
+
+
+def bulk_reset_cleanup_state(row: dict[str, Any] | None) -> str:
+    value = bulk_reset_cleanup(row)
+    return str(value.get("state") or "").strip().lower() if value else ""
+
+
+def bulk_reset_cleanup_instance(row: dict[str, Any] | None) -> str:
+    value = bulk_reset_cleanup(row)
+    return str(value.get("instance_id") or "").strip().upper() if value else ""
+
+
+def mark_bulk_reset_cleanup_pending(
+    sid: str,
+    instance_id: str,
+    log: LogFn | None = None,
+) -> dict[str, Any]:
+    """Persist an incomplete-attempt cleanup intent before its first delete.
+
+    Once recorded, the exact UUID is immutable.  Reissuing the same pending
+    intent is idempotent and deliberately does not count as workflow progress.
+    """
+    instance_id = str(instance_id or "").strip().upper()
+    if not instance_id:
+        raise ValueError("Missing bulk-reset container instance identifier")
+    rows = load_slots()
+    row = find_slot_row(rows, sid)
+    if row is None:
+        raise ValueError(f"No slot {sid}")
+    stored = str(row.get("id") or sid)
+    if row.get("reddit") is True:
+        raise ValueError(
+            f"Slot {stored} has a created Reddit account; bulk reset is forbidden"
+        )
+    if "container_deletion" in row:
+        raise ValueError(
+            f"Slot {stored} already belongs to post-account container cleanup"
+        )
+    recorded = crane_container_instance(row)
+    if recorded and recorded != instance_id:
+        raise ValueError(
+            f"Slot {stored} recorded container {recorded} cannot be replaced "
+            f"by {instance_id}"
+        )
+    existing_raw = row.get("bulk_reset_cleanup")
+    existing = bulk_reset_cleanup(row)
+    if existing_raw is not None and existing is None:
+        raise ValueError(
+            f"Slot {stored} has a malformed bulk reset cleanup checkpoint"
+        )
+    if existing is not None:
+        existing_id = bulk_reset_cleanup_instance(row)
+        if existing_id != instance_id:
+            raise ValueError(
+                f"Slot {stored} already has bulk reset cleanup for a different "
+                "container"
+            )
+        if bulk_reset_cleanup_state(row) == "complete":
+            raise ValueError(f"Slot {stored} bulk reset cleanup is already complete")
+        return row
+    row["bulk_reset_cleanup"] = {
+        "slot_id": stored,
+        "instance_id": instance_id,
+        "state": "pending",
+        "requested_at_utc": _now(),
+    }
+    save_slots(rows)
+    CREATION_PROGRESS.note()
+    if log:
+        log(f"Slot {stored}: incomplete-attempt cleanup recorded as pending.")
+    return row
+
+
+def mark_bulk_reset_cleanup_complete(
+    sid: str,
+    log: LogFn | None = None,
+) -> dict[str, Any]:
+    """Commit a locally verified deletion for an incomplete bulk attempt."""
+    rows = load_slots()
+    row = find_slot_row(rows, sid)
+    if row is None:
+        raise ValueError(f"No slot {sid}")
+    stored = str(row.get("id") or sid)
+    if row.get("reddit") is True:
+        raise ValueError(
+            f"Slot {stored} has a created Reddit account; bulk reset is forbidden"
+        )
+    raw = row.get("bulk_reset_cleanup")
+    checkpoint = bulk_reset_cleanup(row)
+    if raw is not None and checkpoint is None:
+        raise ValueError(
+            f"Slot {stored} has a malformed bulk reset cleanup checkpoint"
+        )
+    if checkpoint is None:
+        raise ValueError(f"Slot {stored} has no pending bulk reset cleanup")
+    if bulk_reset_cleanup_state(row) == "complete":
+        return row
+    row["bulk_reset_cleanup"] = {
+        "slot_id": stored,
+        "instance_id": bulk_reset_cleanup_instance(row),
+        "state": "complete",
+        "requested_at_utc": checkpoint.get("requested_at_utc"),
+        "completed_at_utc": _now(),
+    }
+    save_slots(rows)
+    CREATION_PROGRESS.note()
+    if log:
+        log(f"Slot {stored}: incomplete-attempt cleanup verified complete.")
+    return row
 
 
 def clear_slot_email(sid: str, log: LogFn | None = None) -> dict[str, Any]:
@@ -660,6 +1031,7 @@ def set_slot_email(
         row["email"] = email
         row["email_label"] = eff_label
         save_slots(rows)
+        CREATION_PROGRESS.note()
         if log:
             log(f"Slot {row.get('id')}: email {email} label={eff_label!r}")
         return row
@@ -669,6 +1041,7 @@ def set_slot_email(
     rows.append(row)
     rows.sort(key=_slot_sort_key)
     save_slots(rows)
+    CREATION_PROGRESS.note()
     if log:
         log(f"Slot {sid_canon}: created with email {email} label={eff_label!r}")
     return row
@@ -722,6 +1095,13 @@ def mark_email_verification(
         raise ValueError(f"No slot {sid_canon}")
     if row.get("reddit"):
         raise ValueError(f"Slot {sid_canon} already has a created Reddit account")
+    previous = row.get("email_verification")
+    unchanged = (
+        isinstance(previous, dict)
+        and previous.get("replacement_index") == replacement_index
+        and str(previous.get("label") or "").strip().lower() == label
+        and str(previous.get("phase") or "").strip().lower() == phase
+    )
     row["email_verification"] = {
         "replacement_index": replacement_index,
         "label": label,
@@ -729,6 +1109,10 @@ def mark_email_verification(
         "updated_at": _now(),
     }
     save_slots(rows)
+    if not unchanged:
+        # Only a new verification phase is real progress; re-polling the same
+        # phase must not reset the bulk inactivity clock.
+        CREATION_PROGRESS.note()
     if log:
         log(
             f"Slot {sid_canon}: email verification {phase} "
@@ -793,6 +1177,7 @@ def replace_slot_email(
     }
     row.pop("creation_terminal_failure", None)
     save_slots(rows)
+    CREATION_PROGRESS.note()
     if log:
         log(
             f"Slot {sid_canon}: replacement Hide My Email activated "
@@ -809,6 +1194,7 @@ def clear_email_verification(sid: str, log: LogFn | None = None) -> dict[str, An
         raise ValueError(f"No slot {sid}")
     row.pop("email_verification", None)
     save_slots(rows)
+    CREATION_PROGRESS.note()
     if log:
         log(f"Slot {row.get('id')}: email verification checkpoint cleared.")
     return row
@@ -840,6 +1226,53 @@ def slot_creation_terminal_failure(row: dict[str, Any] | None) -> bool:
     return isinstance(value, dict) and bool(str(value.get("code") or "").strip())
 
 
+def slot_bulk_skipped(row: dict[str, Any] | None) -> bool:
+    """True when bulk creation preserved this attempt and must never retry it."""
+    value = (row or {}).get("bulk_skip")
+    return isinstance(value, dict) and bool(str(value.get("code") or "").strip())
+
+
+def slot_creation_unavailable(row: dict[str, Any] | None) -> bool:
+    """True when automatic creation/resume must allocate the next id instead.
+
+    Covers the older terminal-creation record and the newer bulk-skip record;
+    neither ever reuses the slot id or its saved email.
+    """
+    return slot_creation_terminal_failure(row) or slot_bulk_skipped(row)
+
+
+def mark_bulk_skipped(
+    sid: str, code: str, reason: str, log: LogFn | None = None
+) -> dict[str, Any]:
+    """Preserve one account-specific failed attempt for manual follow-up.
+
+    Unlike :func:`retire_slot_id` this keeps the Crane container, the iCloud
+    alias, the slot row, credentials and every successful checkpoint.  Unlike
+    :func:`mark_creation_terminal_failure` it also accepts a slot whose Reddit
+    account was already created, so a later-stage failure is recorded beside a
+    preserved successful account instead of replacing it.
+    """
+    rows = load_slots()
+    row = find_slot_row(rows, sid)
+    if row is None:
+        raise ValueError(f"No slot {sid}")
+    stored = str(row.get("id") or sid)
+    row["bulk_skip"] = {
+        "slot_id": stored,
+        "code": str(code or "creation_failed")[:80],
+        "reason": str(reason or "Creation failed.")[:300],
+        "skipped_at_utc": _now(),
+        "created_account": bool(row.get("reddit")),
+    }
+    save_slots(rows)
+    if log:
+        log(
+            f"Slot {stored}: skipped by bulk "
+            f"({row['bulk_skip']['code']}); container, alias and checkpoints preserved."
+        )
+    return row
+
+
 def set_slot_username(sid: str, username: str, log: LogFn | None = None) -> dict[str, Any]:
     username = (username or "").strip()
     if not username:
@@ -848,10 +1281,104 @@ def set_slot_username(sid: str, username: str, log: LogFn | None = None) -> dict
     row = find_slot_row(rows, sid)
     if row is None:
         raise ValueError(f"No slot {sid}")
+    changed = str(row.get("username") or "") != username
     row["username"] = username
     save_slots(rows)
+    if changed:
+        CREATION_PROGRESS.note()
     if log:
         log(f"Slot {row.get('id')}: username {username}")
+    return row
+
+
+_USERNAME_VARIANT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{1,28}$")
+
+
+def username_variant_attempt(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return a validated durable requested-username candidate checkpoint."""
+    raw = (row or {}).get("username_variant_attempt")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {
+        "version", "base", "candidate", "index", "updated_at_utc",
+    }:
+        raise ValueError("Malformed username variant checkpoint")
+    base = str(raw.get("base") or "").strip()
+    candidate = str(raw.get("candidate") or "").strip()
+    index = raw.get("index")
+    if (
+        raw.get("version") != 1
+        or _USERNAME_VARIANT_RE.fullmatch(base) is None
+        or _USERNAME_VARIANT_RE.fullmatch(candidate) is None
+        or type(index) is not int
+        or index < 0
+        or not isinstance(raw.get("updated_at_utc"), str)
+    ):
+        raise ValueError("Malformed username variant checkpoint")
+    return dict(raw)
+
+
+def mark_username_variant_attempt(
+    sid: str,
+    base: str,
+    candidate: str,
+    index: int,
+    log: LogFn | None = None,
+) -> dict[str, Any]:
+    """Persist one candidate before it is typed or interpreted on Reddit."""
+    base = str(base or "").strip()
+    candidate = str(candidate or "").strip()
+    if (
+        _USERNAME_VARIANT_RE.fullmatch(base) is None
+        or _USERNAME_VARIANT_RE.fullmatch(candidate) is None
+        or type(index) is not int
+        or index < 0
+    ):
+        raise ValueError("Invalid username variant checkpoint")
+    rows = load_slots()
+    row = find_slot_row(rows, sid)
+    if row is None:
+        raise ValueError(f"No slot {sid}")
+    existing = username_variant_attempt(row)
+    if existing is not None:
+        existing_base = str(existing.get("base") or "")
+        existing_index = int(existing.get("index") or 0)
+        if existing_base != base and str(existing.get("candidate") or "") != base:
+            raise ValueError("Username variant checkpoint belongs to another base")
+        if existing_base == base and index < existing_index:
+            raise ValueError("Refused username variant checkpoint regression")
+    row["username_variant_attempt"] = {
+        "version": 1,
+        "base": base,
+        "candidate": candidate,
+        "index": index,
+        "updated_at_utc": _now(),
+    }
+    save_slots(rows)
+    CREATION_PROGRESS.note()
+    if log:
+        log(
+            f"Slot {row.get('id')}: username candidate checkpoint "
+            f"{index} saved (value redacted)."
+        )
+    return row
+
+
+def clear_username_variant_attempt(
+    sid: str, log: LogFn | None = None
+) -> dict[str, Any]:
+    """Clear the candidate checkpoint only after the accepted name is saved."""
+    rows = load_slots()
+    row = find_slot_row(rows, sid)
+    if row is None:
+        raise ValueError(f"No slot {sid}")
+    changed = "username_variant_attempt" in row
+    row.pop("username_variant_attempt", None)
+    save_slots(rows)
+    if changed:
+        CREATION_PROGRESS.note()
+    if changed and log:
+        log(f"Slot {row.get('id')}: username candidate checkpoint cleared.")
     return row
 
 
@@ -863,8 +1390,11 @@ def set_slot_password(sid: str, password: str, log: LogFn | None = None) -> dict
     row = find_slot_row(rows, sid)
     if row is None:
         raise ValueError(f"No slot {sid}")
+    changed = str(row.get("password") or "") != password
     row["password"] = password
     save_slots(rows)
+    if changed:
+        CREATION_PROGRESS.note()
     if log:
         log(f"Slot {row.get('id')}: password saved (not printed)")
     return row
@@ -883,8 +1413,11 @@ def set_slot_birth_date(sid: str, birth_date: str) -> dict[str, Any]:
     row = find_slot_row(rows, sid)
     if row is None:
         raise ValueError(f"No slot {sid}")
+    changed = str(row.get("reddit_birth_date") or "") != value
     row["reddit_birth_date"] = value
     save_slots(rows)
+    if changed:
+        CREATION_PROGRESS.note()
     return row
 
 
@@ -924,6 +1457,8 @@ def mark_reddit_created(
     row.pop("day1_at", None)
     row["reddit_at"] = _now()
     save_slots(rows)
+    if not was_created:
+        CREATION_PROGRESS.note()
     email = str(row.get("email") or "")
     username = str(row.get("username") or "")
     pw = str(row.get("password") or "") or None
@@ -995,8 +1530,13 @@ def mark_creation_feed_swipe_completed(
         raise ValueError(
             f"Creation feed swipe count {completed} exceeds target {target}"
         )
+    advanced = completed > current
     row["creation_feed_swipes_completed"] = completed
     save_slots(rows)
+    if advanced:
+        # A verified swipe advance is real progress; re-writing the same count
+        # is a retry and must not reset the bulk inactivity clock.
+        CREATION_PROGRESS.note()
     if log:
         log(f"Slot {row.get('id')}: creation feed swipes {completed}/{target}.")
     return row
@@ -1096,6 +1636,8 @@ def mark_reddit_cleanup(
         )
     row["reddit_cleanup"] = state
     save_slots(rows)
+    if state != current:
+        CREATION_PROGRESS.note()
     if log:
         log(f"Slot {row.get('id')}: Reddit cleanup {state}.")
     return row

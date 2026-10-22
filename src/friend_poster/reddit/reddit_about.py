@@ -11,6 +11,7 @@ import time
 from calendar import monthrange
 from datetime import date
 from friend_poster.core.config import DUMP_DIR
+from friend_poster.core.slots import CREATION_PROGRESS
 from friend_poster.device.ssh_device import Phone, PhoneError, load_secrets
 from friend_poster.device.ui_tree import TapStack, collapsed_text, dump_named, find_label_exact
 
@@ -32,8 +33,13 @@ MONTHS = {
 }
 BIRTHDAY_WHEEL_CENTER_Y = 675
 BIRTHDAY_WHEEL_MAX_DISTANCE = 30
-BIRTHDAY_ADJACENT_ROW_MIN_DISTANCE = 25
-BIRTHDAY_ADJACENT_ROW_MAX_DISTANCE = 80
+
+
+class BirthdayRecoveryExhausted(PhoneError):
+    """Local birthday handlers could not restore a verifiable picker state."""
+
+    ai_recoverable = True
+    failure_code = "birthday_visual_recovery_exhausted"
 BIRTHDAY_SUMMARY_CENTER_Y_MIN = 390
 BIRTHDAY_SUMMARY_CENTER_Y_MAX = 455
 BIRTHDAY_TRANSITION_MAX_DUMPS = 8
@@ -137,12 +143,20 @@ def _birthday_summary_value(nodes):
     return matches[0] if len(matches) == 1 else None
 
 
-def _birthday_from_summary_with_adjacent_day_proof(nodes):
-    """Recover one OCR-missing centered day using bounded independent evidence."""
+def _birthday_from_summary_with_wheel_cross_check(nodes):
+    """Recover one OCR-missing centered day from the bounded summary line.
+
+    The centered wheel row is bold, so OCR drops it when the selected day is a
+    single digit; the day wheel cannot be read directly in that case. The
+    summary line states the selection, and the month and year wheel rows must
+    independently match it. Neighbour rows are deliberately not used as
+    arithmetic evidence: the day wheel cycles 1..31 in every month, so a
+    neighbour value can never be derived from the month length.
+    """
     summary = _birthday_summary_value(nodes)
     if summary is None:
         return None
-    summary_day, summary_month, summary_year = summary
+    summary_month, summary_year = summary[1], summary[2]
 
     month_node = _nearest_wheel_value(
         nodes,
@@ -162,30 +176,6 @@ def _birthday_from_summary_with_adjacent_day_proof(nodes):
         or int(collapsed_text(year_node.labels())) != summary_year
     ):
         return None
-
-    day_rows = _axis_nodes(nodes, "day")
-    above = [item for item in day_rows if item[1].center()[1] < BIRTHDAY_WHEEL_CENTER_Y]
-    below = [item for item in day_rows if item[1].center()[1] > BIRTHDAY_WHEEL_CENTER_Y]
-    if not above or not below:
-        return None
-    above_value, above_node = max(above, key=lambda item: item[1].center()[1])
-    below_value, below_node = min(below, key=lambda item: item[1].center()[1])
-    above_distance = BIRTHDAY_WHEEL_CENTER_Y - above_node.center()[1]
-    below_distance = below_node.center()[1] - BIRTHDAY_WHEEL_CENTER_Y
-    if not (
-        BIRTHDAY_ADJACENT_ROW_MIN_DISTANCE
-        <= above_distance
-        <= BIRTHDAY_ADJACENT_ROW_MAX_DISTANCE
-        and BIRTHDAY_ADJACENT_ROW_MIN_DISTANCE
-        <= below_distance
-        <= BIRTHDAY_ADJACENT_ROW_MAX_DISTANCE
-    ):
-        return None
-    month_days = monthrange(summary_year, summary_month)[1]
-    expected_above = month_days if summary_day == 1 else summary_day - 1
-    expected_below = 1 if summary_day == month_days else summary_day + 1
-    if above_value != expected_above or below_value != expected_below:
-        return None
     return summary
 
 
@@ -193,7 +183,7 @@ def selected_birthday(nodes):
     """Return a strictly proven wheel date, including one bounded OCR fallback."""
     selected = selected_birthday_nodes(nodes)
     if selected is None:
-        return _birthday_from_summary_with_adjacent_day_proof(nodes)
+        return _birthday_from_summary_with_wheel_cross_check(nodes)
     day, month, year = selected
     return (
         int(collapsed_text(day.labels())),
@@ -425,6 +415,7 @@ def _set_birthday_axis(
     day_reversal_pending = False
     day_reversal_used = False
     for move_count in range(BIRTHDAY_AXIS_MAX_MOVES[axis] + 1):
+        CREATION_PROGRESS.note()
         selected = selected_birthday(current_nodes)
         if selected is None:
             raise PhoneError(
@@ -504,13 +495,24 @@ def _set_birthday_axis(
                     f"Birthday {locked_axis} changed while setting {axis}. "
                     "Did not continue."
                 )
+        fresh_value = fresh_selected[axis_index]
         try:
             date(fresh_selected[2], fresh_selected[1], fresh_selected[0])
-        except ValueError as exc:
-            raise PhoneError(
-                "Birthday wheels do not form a real date. Did not continue."
-            ) from exc
-        fresh_value = fresh_selected[axis_index]
+        except ValueError:
+            # Wheels are independent.  While year/month/day are being set in
+            # sequence, a legitimate transition can temporarily show e.g.
+            # 31 February.  The configured target is already a validated
+            # ``date`` and the final exact-date gate below remains mandatory.
+            # Treat only the intermediate combination as transient; never tap
+            # Continue until every axis exactly matches the configured date.
+            if fresh_value == target and axis == "day":
+                raise BirthdayRecoveryExhausted(
+                    "Birthday remained invalid after the local day correction."
+                )
+            log(
+                "Birthday wheels form a transient intermediate date; "
+                "continuing the bounded local axis correction."
+            )
         if fresh_value == current:
             if movement_kind == "reversal":
                 raise PhoneError(
@@ -836,6 +838,7 @@ def _finish_birthday_confirmation(
     """Reach gender, allowing one exact Yes, Confirm tap and no other modal action."""
     last = nodes
     for attempt in range(BIRTHDAY_TRANSITION_MAX_DUMPS + 1):
+        CREATION_PROGRESS.note()
         if gender_screen(last) or interests_screen(last):
             return last
         if birthday_confirmation_screen(last):
@@ -850,7 +853,9 @@ def _finish_birthday_confirmation(
                 f"[{confirm.x},{confirm.y} {confirm.w}x{confirm.h}]"
             )
             stack.tap_xy(*confirm.center())
+            CREATION_PROGRESS.note()
             for confirm_attempt in range(BIRTHDAY_TRANSITION_MAX_DUMPS):
+                CREATION_PROGRESS.note()
                 time.sleep(0.9)
                 _blob, last = dump_named(
                     stack,
@@ -926,6 +931,7 @@ def _finish_gender(stack: TapStack, phone: Phone, nodes) -> None:
         woman = find_label_exact(last, ("Woman",))
         log(f"Woman [{woman.x},{woman.y} {woman.w}x{woman.h}]")
         stack.tap_xy(*woman.center())
+        CREATION_PROGRESS.note()
         time.sleep(0.9)
         _blob, last = dump_named(stack, phone, "911_after_woman", log, shot=True)
         if interests_screen(last):
@@ -957,8 +963,10 @@ def _finish_gender(stack: TapStack, phone: Phone, nodes) -> None:
         )
     log(f"Gender selection -> Continue [{cont.x},{cont.y} {cont.w}x{cont.h}]")
     stack.tap_xy(*cont.center())
+    CREATION_PROGRESS.note()
 
     for attempt in range(BIRTHDAY_TRANSITION_MAX_DUMPS):
+        CREATION_PROGRESS.note()
         time.sleep(0.9)
         _blob, last = dump_named(
             stack,
@@ -1013,12 +1021,38 @@ def tap_woman(
         )
     elif birthday_picker(nodes):
         expected_birth_date = birth_date or configured_reddit_birth_date()
-        nodes = select_configured_birthday(
-            stack,
-            phone,
-            nodes,
-            expected_birth_date,
-        )
+        last_birthday_error = None
+        for birthday_attempt in range(2):
+            try:
+                nodes = select_configured_birthday(
+                    stack,
+                    phone,
+                    nodes,
+                    expected_birth_date,
+                )
+                last_birthday_error = None
+                break
+            except PhoneError as exc:
+                last_birthday_error = exc
+                nodes = stable_birthday_dump(
+                    stack,
+                    phone,
+                    f"910_birthday_local_recovery_{birthday_attempt + 1}",
+                    shot=False,
+                )
+                if not birthday_picker(nodes):
+                    raise BirthdayRecoveryExhausted(
+                        "Birthday local recovery reached an unknown visual state."
+                    ) from exc
+                if birthday_attempt == 0:
+                    log(
+                        "Birthday local handler did not reach the exact date; "
+                        "retrying once from a fresh verified picker dump."
+                    )
+        if last_birthday_error is not None:
+            raise BirthdayRecoveryExhausted(
+                "Birthday local recovery was exhausted on a verified picker."
+            ) from last_birthday_error
         time.sleep(0.8)
         nodes = stable_birthday_dump(
             stack,
@@ -1044,6 +1078,7 @@ def tap_woman(
             )
         log(f"Private birthday confirmed -> Continue [{cont.x},{cont.y} {cont.w}x{cont.h}]")
         stack.tap_xy(*cont.center())
+        CREATION_PROGRESS.note()
         nodes = _finish_birthday_confirmation(
             stack,
             phone,

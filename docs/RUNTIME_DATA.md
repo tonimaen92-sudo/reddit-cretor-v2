@@ -14,6 +14,15 @@ launchers and operational state continue to work.
 | `dumps/` | UI trees and screenshots | ignored |
 | `full-send/` | Live media and scraper assets | selected private areas ignored |
 | `posts/`, `used/` | Posting input/archive state | ignored |
+| `%LOCALAPPDATA%/FriendPoster/recovery_recipes.sqlite3` | Sanitized Anthropic UI-recovery recipes and promotion counters | outside repository |
+
+Optional Creator UI recovery reads `anthropic_api_key`, optional
+`anthropic_workspace_id`, and `anthropic_recovery_model` from the ignored
+`secrets.json` (or `ANTHROPIC_API_KEY`, `ANTHROPIC_WORKSPACE_ID`, and
+`ANTHROPIC_RECOVERY_MODEL` from the environment). The key must be an active
+Claude API key created in Console under **Keys & access**.
+Screenshots, raw prompts, API responses, credentials, and unredacted OCR are
+never written to the recipe database.
 
 Never print or copy credential/runtime contents into issues, commits, test
 fixtures, or documentation. Tests that need stable data belong in

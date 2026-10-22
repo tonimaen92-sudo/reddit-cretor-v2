@@ -75,6 +75,8 @@ class PredictableRandom:
 def run_engine(
     *, target: int, completed: int = 0, frames=None, stop=None,
     progress_fn=None, strict=True, continue_on_unclear=False,
+    recover_from_home=None,
+    allow_created_account_feed_proof=False,
 ):
     stack = Stack()
     logs: list[str] = []
@@ -99,6 +101,8 @@ def run_engine(
             progress_fn=progress_fn,
             require_final_proof=strict,
             continue_on_unclear=continue_on_unclear,
+            recover_from_home=recover_from_home,
+            allow_created_account_feed_proof=allow_created_account_feed_proof,
             dump_fn=dump_fn,
         )
     except (PhoneError, OperationCancelled) as exc:
@@ -185,11 +189,97 @@ def main() -> int:
         "protected Reddit screen" in protected[-1] and len(protected[0].flicks) == 5,
         protected[-1],
     )
+    feed_with_incidental_about_you = feed_nodes("Ordinary Reddit") + [
+        node("About you", 80, 585, w=280),
+    ]
+    incidental_about_you = run_engine(
+        target=5,
+        frames=[feed_with_incidental_about_you],
+        strict=False,
+    )
+    check(
+        "feed-post-about-you-is-not-protected-signup",
+        not incidental_about_you[-1]
+        and len(incidental_about_you[0].flicks) == 5,
+        incidental_about_you[-1],
+    )
+    created_scrolled_feed = [
+        node("About you", 70, 300, w=360),
+        node("Join", 600, 185, w=90),
+        node("First card body has enough unique content", 40, 430, w=560),
+        node("Second card body has different content", 40, 760, w=560),
+        node("Join", 600, 1055, w=90),
+        node("Third independent content anchor", 40, 1110, w=500),
+    ]
+    created_resume = run_engine(
+        target=5,
+        frames=[created_scrolled_feed],
+        strict=False,
+        allow_created_account_feed_proof=True,
+    )
+    check(
+        "created-account-two-card-feed-allows-incidental-about-you",
+        not created_resume[-1] and len(created_resume[0].flicks) == 5,
+        created_resume[-1],
+    )
+    onboarding_with_joins = created_scrolled_feed + [
+        node("Choose your interests", 100, 120, w=440),
+    ]
+    created_resume_blocked = run_engine(
+        target=5,
+        frames=[onboarding_with_joins],
+        strict=False,
+        allow_created_account_feed_proof=True,
+    )
+    check(
+        "created-account-card-proof-still-blocks-prominent-onboarding",
+        "protected Reddit screen" in created_resume_blocked[-1]
+        and len(created_resume_blocked[0].flicks) == 5,
+        created_resume_blocked[-1],
+    )
     home = run_engine(target=30, frames=[springboard_nodes()], strict=False)
     check(
         "springboard-stops-at-checkpoint",
         "iPhone Home appeared" in home[-1] and len(home[0].flicks) == 5,
         home[-1],
+    )
+    reddit_screenshot_search = feed_nodes("Fortnite image") + [
+        node("Q Search", 179, 1272, w=128),
+        node("Outfit", 208, 1220, w=109),
+        node("Back Bling", 345, 1228, w=153),
+        node("Pickaxe", 490, 1231, w=118),
+        node("Glider", 607, 1236, w=96),
+        node("r/FortniteBR 2d", 183, 995, w=203),
+    ]
+    screenshot_search = run_engine(
+        target=5,
+        frames=[reddit_screenshot_search],
+        strict=False,
+    )
+    check(
+        "reddit-post-q-search-near-bottom-is-not-springboard",
+        not screenshot_search[-1] and len(screenshot_search[0].flicks) == 5,
+        screenshot_search[-1],
+    )
+    recovered_at: list[int] = []
+
+    def recover_home(completed: int):
+        recovered_at.append(completed)
+        return feed_nodes("Recovered exact container")
+
+    recovered_home = run_engine(
+        target=10,
+        frames=[springboard_nodes(), feed_nodes("After recovery")],
+        strict=False,
+        recover_from_home=recover_home,
+    )
+    check(
+        "springboard-reopens-saved-container-and-continues",
+        not recovered_home[-1]
+        and len(recovered_home[0].flicks) == 10
+        and recovered_at == [5]
+        and any("exact saved container reopened" in line for line in recovered_home[1]),
+        recovered_home[-1],
     )
     feed_with_slot_like_text = feed_nodes("Ordinary Reddit") + [
         node("a0003", 80, 360, w=120),

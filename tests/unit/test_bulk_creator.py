@@ -132,14 +132,81 @@ class BatchCreatorTests(unittest.TestCase):
         app._refresh_macrodroid_setup = lambda: True
         app._bulk_proxy_scope = lambda: "a" * 64
         app._record_bulk_ip = lambda result, _observations: result["verification_evidence"]["confirmations"][-1]["observed_at_utc"]
-        app._pause_bulk = lambda phase, reason: self.fail(f"unexpected pause: {phase}: {reason}")
+        app._pause_bulk = lambda phase, reason, **_kwargs: self.fail(f"unexpected pause: {phase}: {reason}")
         app.bulk_state = empty_state()
         app.bulk_state.update(
             queue=[{"birth_date": "01.01.2000", "swipes": 10 + i, "delay_seconds": 2.0 + i}
                    for i in range(count)],
             requested=count, remaining=count, stage="ip_pending",
         )
+        # Offline seam for the durable-state reload; test fixtures set bulk_state
+        # directly and expect it to be the source of truth for the decision.
+        app._latest_bulk_state = lambda: dict(app.bulk_state)
         return app
+
+    def test_bind_crane_identity_does_not_compare_ghost_display_id_to_uuid(self):
+        app = self.app(1)
+        messages = []
+        app.log = messages.append
+        row = {
+            "id": "a0236",
+            "ghost": True,
+            "ghost_container_state": "ready",
+            "ghost_container_instance": "SHORT-GHOST-ID",
+            "reddit": False,
+        }
+        full_uuid = "E3A21B7C-6B97-4C8F-91D8-8B2B7D552F10"
+
+        with (
+            mock.patch.object(creator, "get_slot", return_value=row),
+            mock.patch.object(
+                creator,
+                "resolve_crane_container_identity",
+                return_value=("unique", full_uuid),
+            ),
+            mock.patch.object(
+                creator, "reconcile_crane_container_identity"
+            ) as reconcile,
+        ):
+            resolved = creator.App._bind_crane_container_identity(
+                app, mock.Mock(), "a0236"
+            )
+
+        self.assertEqual(resolved, full_uuid)
+        reconcile.assert_called_once_with(
+            "a0236", full_uuid, app.log, allow_pending_rebind=False
+        )
+        self.assertTrue(any("separate" in message for message in messages))
+
+    def test_accepted_username_variant_updates_only_current_queue_name(self):
+        app = self.app(2)
+        app.bulk_state.update(slot_id="a0229", stage="creating")
+        app.bulk_state["queue"][0].update(
+            username="Chosen_Name9", password="FixedPassword1!"
+        )
+        app.bulk_state["queue"][1]["username"] = "NextName"
+        app.bulk_editor_baseline = [dict(row) for row in app.bulk_state["queue"]]
+        app._username_claim_owners = lambda: {}
+        saved = []
+
+        def persist(state):
+            app.bulk_state = dict(state)
+            saved.append(dict(state))
+
+        app._persist_bulk = persist
+        creator.App._commit_bulk_username_variant(
+            app, "a0229", "Chosen_Name9", "Chosen_Name0"
+        )
+
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(app.bulk_state["queue"][0]["username"], "Chosen_Name0")
+        self.assertEqual(
+            app.bulk_state["queue"][0]["password"], "FixedPassword1!"
+        )
+        self.assertEqual(app.bulk_state["queue"][1]["username"], "NextName")
+        self.assertEqual(
+            app.bulk_editor_baseline[0]["username"], "Chosen_Name0"
+        )
 
     def test_startup_resume_flag_calls_existing_retry_method(self):
         calls = []
@@ -306,6 +373,11 @@ class BatchCreatorTests(unittest.TestCase):
         with (
             mock.patch.object(creator, "save_bulk_state", lambda _state: None),
             mock.patch.object(creator, "run_macrodroid_change", ip_change),
+            mock.patch.object(
+                creator,
+                "observe_proxy_without_trigger",
+                return_value={"outcome": "verified"},
+            ),
             mock.patch.object(creator, "set_slot_falcon_proxy_ip", lambda sid, ip, stamp: events.append(("slot_ip", sid, ip))),
             mock.patch.object(creator, "get_slot", lambda sid: {
                 "complete": complete.get(sid, False),
@@ -316,13 +388,12 @@ class BatchCreatorTests(unittest.TestCase):
             creator.App._run_bulk_batch(app)
         self.assertEqual(app.bulk_state["remaining"], 0)
         self.assertEqual(len(app.bulk_state["queue"]), 0)
-        self.assertEqual(events.count("reset"), 2)
+        self.assertEqual(events.count("reset"), 1)
         self.assertEqual(events[0], "reset")
         self.assertEqual(events[1], ("slot_ip", "a0001", "198.51.100.2"))
         self.assertEqual(events[2], ("create", "a0001", 10))
-        self.assertEqual(events[4], "reset")
-        self.assertEqual(events[5], ("slot_ip", "a0002", "198.51.100.3"))
-        self.assertEqual(events[6], ("create", "a0002", 11))
+        self.assertEqual(events[4], ("slot_ip", "a0002", "198.51.100.2"))
+        self.assertEqual(events[5], ("create", "a0002", 11))
         self.assertEqual(len(app.stop.waits), 1)
         self.assertGreater(app.stop.waits[0], 1.5)
         self.assertLessEqual(app.stop.waits[0], 2.0)
@@ -330,18 +401,21 @@ class BatchCreatorTests(unittest.TestCase):
     def test_saved_username_mismatch_prevents_reuse(self):
         app = self.app(1)
         app.bulk_state["queue"][0]["username"] = "RequestedName"
-        app.bulk_state["slot_id"] = "a0001"
-        with mock.patch.object(creator, "get_slot", return_value={"id": "a0001", "username": "DifferentName", "reddit_birth_date": "01.01.2000"}):
-            with self.assertRaisesRegex(creator.BulkError, "different|requests"):
-                app._check_bulk_resume_compatibility(app.bulk_state)
+        with self.assertRaisesRegex(creator.BulkError, "different|requests"):
+            app._assert_bulk_requested_username(
+                "a0001", app.bulk_state["queue"][0],
+                {"id": "a0001", "username": "DifferentName"},
+            )
 
-    def test_pipeline_passes_requested_name_only_for_named_batch(self):
+    def test_pipeline_passes_requested_name_and_password_for_named_batch(self):
         app = self.app(1)
         app.status = mock.Mock()
         slot = {
             "id": "a0001", "reddit_birth_date": "01.01.2000",
             "ghost": True, "ghost_container_state": "ready",
-            "ghost_container_instance": "a0001", "email": "test@icloud.com",
+            "ghost_container_instance": "a0001",
+            "crane_container_instance": "A0001-FULL",
+            "email": "test@icloud.com",
             "username": "", "password": "", "reddit": False,
         }
         calls = []
@@ -350,7 +424,11 @@ class BatchCreatorTests(unittest.TestCase):
 
         def create(*_args, **kwargs):
             calls.append(kwargs)
-            slot.update(username=kwargs.get("requested_username") or "SuggestedName", password="saved-password", reddit=True)
+            slot.update(
+                username=kwargs.get("requested_username") or "SuggestedName",
+                password=kwargs.get("requested_password") or "saved-password",
+                reddit=True,
+            )
 
         with (
             mock.patch.object(creator, "get_slot", return_value=slot),
@@ -361,10 +439,103 @@ class BatchCreatorTests(unittest.TestCase):
         ):
             self.assertTrue(app._run_creation_pipeline(
                 "offline-password", "a0001", date(2000, 1, 1), 10,
-                requested_username="ChosenName", manage_worker=False,
+                requested_username="ChosenName",
+                requested_password="ChosenPass9!",
+                manage_worker=False,
             ))
         self.assertEqual(calls[0]["requested_username"], "ChosenName")
+        self.assertEqual(calls[0]["requested_password"], "ChosenPass9!")
         phone.close.assert_called_once()
+
+    def test_pipeline_accepts_committed_username_variant_without_false_failure(self):
+        app = self.app(1)
+        app.status = mock.Mock()
+        app.bulk_state.update(slot_id="a0001", stage="creating")
+        app.bulk_state["queue"][0].update(
+            username="ChosenName9", password="ChosenPass9!"
+        )
+        app.bulk_editor_baseline = [dict(app.bulk_state["queue"][0])]
+        app._username_claim_owners = lambda: {}
+        app._persist_bulk = lambda state: setattr(app, "bulk_state", dict(state))
+        slot = {
+            "id": "a0001", "reddit_birth_date": "01.01.2000",
+            "ghost": True, "ghost_container_state": "ready",
+            "ghost_container_instance": "a0001",
+            "crane_container_instance": "A0001-FULL",
+            "email": "test@icloud.com",
+            "username": "", "password": "", "reddit": False,
+        }
+        phone = mock.Mock()
+        app._connect = lambda _password: (phone, object())
+
+        def create(*_args, **kwargs):
+            kwargs["username_committer"]("ChosenName9", "ChosenName0")
+            slot.update(
+                username="ChosenName0",
+                password=kwargs["requested_password"],
+                reddit=True,
+            )
+
+        with (
+            mock.patch.object(creator, "get_slot", return_value=slot),
+            mock.patch.object(creator, "ghost_container_state", return_value="ready"),
+            mock.patch.object(creator, "run_create_reddit", side_effect=create),
+            mock.patch.object(
+                creator, "creation_feed_swipe_progress", return_value=(10, 10)
+            ),
+            mock.patch.object(creator, "slot_reddit_ready", return_value=True),
+        ):
+            self.assertTrue(app._run_creation_pipeline(
+                "offline-password", "a0001", date(2000, 1, 1), 10,
+                requested_username="ChosenName9",
+                requested_password="ChosenPass9!",
+                manage_worker=False,
+            ))
+        self.assertEqual(
+            app.bulk_state["queue"][0]["username"], "ChosenName0"
+        )
+        self.assertEqual(
+            app.bulk_state["queue"][0]["password"], "ChosenPass9!"
+        )
+        phone.close.assert_called_once()
+
+    def test_pipeline_reconnect_reloads_committed_username_variant(self):
+        app = self.app(1)
+        app.bulk_state.update(slot_id="a0001", stage="creating")
+        app.bulk_state["queue"][0].update(
+            username="ChosenName9", password="ChosenPass9!"
+        )
+        calls = []
+
+        def attempt(*_args, **kwargs):
+            calls.append(
+                (kwargs["requested_username"], kwargs["requested_password"])
+            )
+            if len(calls) == 1:
+                app.bulk_state["queue"][0]["username"] = "ChosenName0"
+                return creator._PIPELINE_RECOVERY_RETRY
+            return True
+
+        app._run_creation_pipeline_attempt = attempt
+
+        self.assertTrue(
+            app._run_creation_pipeline(
+                "offline-password",
+                "a0001",
+                date(2000, 1, 1),
+                10,
+                requested_username="ChosenName9",
+                requested_password="ChosenPass9!",
+                manage_worker=False,
+            )
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("ChosenName9", "ChosenPass9!"),
+                ("ChosenName0", "ChosenPass9!"),
+            ],
+        )
 
     def test_ten_items_are_ip_first_and_skip_the_final_delay(self):
         app = self.app(10)
@@ -398,6 +569,11 @@ class BatchCreatorTests(unittest.TestCase):
         with (
             mock.patch.object(creator, "save_bulk_state", lambda _state: None),
             mock.patch.object(creator, "run_macrodroid_change", rotate),
+            mock.patch.object(
+                creator,
+                "observe_proxy_without_trigger",
+                return_value={"outcome": "verified"},
+            ),
             mock.patch.object(creator, "set_slot_falcon_proxy_ip", lambda *_args: None),
             mock.patch.object(creator, "get_slot", lambda sid: {"complete": sid in complete}),
             mock.patch.object(creator, "_pipeline_slot_complete", lambda row: bool(row and row.get("complete"))),
@@ -406,16 +582,21 @@ class BatchCreatorTests(unittest.TestCase):
         self.assertEqual(app.bulk_state["stage"], "idle")
         self.assertEqual(app.bulk_state["remaining"], 0)
         self.assertEqual(len(app.stop.waits), 9)
-        for index in range(10):
-            sid = f"a{index + 1:04d}"
-            self.assertEqual(events[index * 2:index * 2 + 2], [("ip", sid), ("create", sid)])
+        self.assertEqual([event for event in events if event[0] == "ip"], [("ip", "a0001")])
+        self.assertEqual(
+            [event for event in events if event[0] == "create"],
+            [("create", f"a{index + 1:04d}") for index in range(10)],
+        )
 
     def test_reopen_can_resume_an_active_saved_stage(self):
         app = self.app(1)
         app.bulk_state.update(stage="may_have_triggered", slot_id="a0001")
         starts = []
         app._start_bulk_worker = lambda: starts.append(True)
-        with mock.patch.object(creator, "save_bulk_state", lambda _state: None):
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(creator, "get_slot", lambda _sid: {"id": "a0001"}),
+        ):
             self.assertTrue(app.retry_bulk_batch(password="offline-password"))
         self.assertEqual(starts, [True])
         self.assertEqual(app.bulk_state["stage"], "may_have_triggered")
@@ -424,17 +605,24 @@ class BatchCreatorTests(unittest.TestCase):
         app = self.app(1)
         app.bulk_state = empty_state()
         starts = []
-        app._check_bulk_resume_compatibility = lambda _state: None
         app._start_bulk_worker = lambda: starts.append(dict(app.bulk_state))
         item = {"birth_date": "01.01.2000", "swipes": 12, "delay_seconds": 2.5}
-        with mock.patch.object(creator, "save_bulk_state", lambda _state: None):
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(creator, "indices_used", lambda: {1}),
+        ):
             started = app.start_bulk_batch([item], 1, "offline-password")
         self.assertTrue(started)
         self.assertEqual(starts[0]["stage"], "ip_pending")
         self.assertEqual(starts[0]["queue"], [item])
         self.assertEqual(starts[0]["remaining"], 1)
+        # Start always targets a fresh slot above every known reservation.
+        self.assertEqual(starts[0]["slot_id"], "a0002")
 
-    def test_start_reconciles_stopped_head_before_three_new_items(self):
+    def test_start_from_stopped_archives_reserves_and_runs_fresh(self):
+        # The reported scenario: a stopped batch points at a slot (a0072) whose
+        # row never survived.  Start Batch must archive that batch, permanently
+        # reserve a0072 without fabricating a row, and run the new rows only.
         app = self.app(1)
         old_head = {"birth_date": "20.04.2005", "swipes": 27, "delay_seconds": 3.0}
         old_tail = {"birth_date": "11.02.2004", "swipes": 22, "delay_seconds": 4.0}
@@ -443,10 +631,11 @@ class BatchCreatorTests(unittest.TestCase):
             requested=2,
             remaining=2,
             stage="stopped",
-            slot_id="a0047",
+            slot_id="a0072",
             baseline_ip="31.217.14.3",
             verified_ip="31.217.18.190",
             verified_at_utc="2026-10-16T18:45:53Z",
+            failures=[{"slot_id": "a0070", "code": "email_invalid"}],
         )
         new_items = [
             {"birth_date": "01.01.2001", "swipes": 10, "delay_seconds": 2.0},
@@ -455,34 +644,57 @@ class BatchCreatorTests(unittest.TestCase):
         ]
         events = []
         app._start_bulk_worker = lambda: events.append(("start", dict(app.bulk_state)))
-        app._show_bulk_queue = lambda state: events.append(("show", list(state["queue"])))
         with (
+            mock.patch.object(creator, "get_slot", lambda _sid: None),
             mock.patch.object(
-                creator, "get_slot",
-                return_value={"id": "a0047", "reddit_birth_date": "20.04.2005"},
+                creator, "retire_slot_id",
+                lambda sid: events.append(("reserve", sid)) or True,
             ),
+            mock.patch.object(creator, "indices_used", lambda: set(range(1, 72))),
             mock.patch.object(
                 creator,
                 "archive_bulk_state",
-                side_effect=lambda state: events.append(("archive", list(state["queue"])))
-                or Path("bulk_creation.pre-reconcile-test.json"),
+                side_effect=lambda state, **_kw: events.append(("archive", list(state["queue"])))
+                or Path("bulk_creation.superseded-test.json"),
+            ),
+            mock.patch.object(
+                creator,
+                "archive_bulk_draft",
+                side_effect=lambda **_kw: events.append(("archive-draft", True))
+                or Path("bulk_draft.superseded-test.json"),
             ),
             mock.patch.object(
                 creator,
                 "save_bulk_state",
-                side_effect=lambda state: events.append(("save", list(state["queue"]))),
+                side_effect=lambda state: events.append(("save", dict(state))),
             ),
         ):
             self.assertTrue(app.start_bulk_batch(new_items, 3, "offline-password"))
 
-        self.assertEqual(app.bulk_state["queue"], [old_head, *new_items])
-        self.assertEqual(app.bulk_state["stage"], "retry_creation")
-        self.assertEqual(app.bulk_state["remaining"], 4)
-        self.assertEqual(app.bulk_state["verified_ip"], "31.217.18.190")
-        self.assertEqual(events[0], ("archive", [old_head, old_tail]))
-        self.assertEqual(events[1], ("save", [old_head, *new_items]))
+        saved = dict(app.bulk_state)
+        # The old queue was never prepended or replayed; only editor rows run.
+        self.assertEqual(saved["queue"], new_items)
+        self.assertEqual(saved["stage"], "ip_pending")
+        self.assertEqual(saved["remaining"], 3)
+        # The vanished id is permanently reserved before the new run activates,
+        # and the fresh run lands above every known reservation (a0073).
+        self.assertEqual(events[0], ("reserve", "a0072"))
+        self.assertEqual(saved["slot_id"], "a0073")
+        self.assertTrue(saved["delete_containers"])
+        # Old per-attempt failure/IP state is cleared with the new run.
+        self.assertEqual(saved["failures"], [])
+        self.assertIsNone(saved["verified_ip"])
+        self.assertIsNone(saved["baseline_ip"])
+        self.assertIsNone(saved["ip_attempt"])
+        # Superseded state and draft were archived and logged before the save.
+        self.assertEqual(events[1], ("archive", [old_head, old_tail]))
+        self.assertEqual(events[2], ("archive-draft", True))
+        self.assertEqual(events[3][0], "save")
+        self.assertEqual(events[4], ("start", events[3][1]))
 
-    def test_reconciliation_preview_cancel_changes_nothing(self):
+    def test_fresh_start_preview_cancel_changes_nothing(self):
+        # Cancelling the "start a new batch" confirmation leaves the saved
+        # batch, its queue and its slot untouched.
         app = self.app(1)
         original = dict(app.bulk_state)
 
@@ -502,17 +714,7 @@ class BatchCreatorTests(unittest.TestCase):
         app.pw = Value("offline-password")
         app.status = Value("")
         app.root = object()
-        app._plan_bulk_start = lambda *_args: (
-            {},
-            {
-                "slot_id": "a0047",
-                "birth_date": "20.04.2005",
-                "swipes": 27,
-                "delay_seconds": 3.0,
-                "old_tail_count": 1,
-            },
-        )
-        app.start_bulk_batch = lambda *_args: self.fail("cancelled preview started")
+        app.start_bulk_batch = lambda *_args, **_kwargs: self.fail("cancelled start ran")
         with mock.patch.object(creator.messagebox, "askokcancel", return_value=False):
             app._on_start_bulk_batch()
         self.assertEqual(app.bulk_state, original)
@@ -559,7 +761,7 @@ class BatchCreatorTests(unittest.TestCase):
             creator.App._run_bulk_batch(app)
         self.assertEqual(calls, [("recheck", False), "creation"])
 
-    def test_creation_pause_uses_exact_pipeline_failure_reason(self):
+    def test_creation_reset_uses_exact_pipeline_failure_reason(self):
         app = self.app(1)
         app.bulk_state.update(
             stage="retry_creation", slot_id="a0047", verified_ip="198.51.100.9",
@@ -568,10 +770,12 @@ class BatchCreatorTests(unittest.TestCase):
         app._bulk_slot_and_entry = lambda state: (
             "a0047", state["queue"][0], date(2005, 4, 20)
         )
-        discards = []
-        app._discard_failed_bulk_slot = (
-            lambda sid, entry, reason, **kwargs:
-            discards.append((sid, entry, reason, kwargs.get("failure_code"))) or False
+        resets = []
+        app._reset_failed_creation = lambda sid, entry, reason, **kwargs: resets.append(
+            (sid, entry, reason, kwargs)
+        ) or False
+        app._pause_bulk = lambda *_a, **_k: self.fail(
+            "ordinary incomplete failure was paused instead of reset"
         )
 
         def rejected(*_args, **_kwargs):
@@ -597,12 +801,14 @@ class BatchCreatorTests(unittest.TestCase):
         ):
             creator.App._run_bulk_batch(app)
 
-        self.assertEqual(len(discards), 1)
-        self.assertEqual(discards[0][0], "a0047")
-        self.assertIn("Sorry, please try again later", discards[0][2])
+        self.assertEqual(len(resets), 1)
+        self.assertEqual(resets[0][0], "a0047")
+        self.assertIn("Sorry, please try again later", resets[0][2])
         self.assertEqual(app.bulk_state["remaining"], 1)
+        self.assertEqual(app.bulk_state["slot_id"], "a0047")
+        self.assertEqual(len(app.bulk_state["queue"]), 1)
 
-    def test_failed_pre_account_slot_waits_five_minutes_deletes_and_is_consumed(self):
+    def test_failed_pre_account_slot_is_preserved_and_skipped_without_delete(self):
         app = self.app(1)
         app.bulk_state.update(
             stage="creating",
@@ -611,20 +817,21 @@ class BatchCreatorTests(unittest.TestCase):
             verified_at_utc="2026-10-16T12:00:00Z",
         )
         app._pause_bulk = lambda *_args, **_kwargs: self.fail("unexpected pause")
-        phone = mock.Mock()
-        stack = object()
-        app._connect = lambda _password: (phone, stack)
         entry = app.bulk_state["queue"][0]
 
         with (
             mock.patch.object(creator, "get_slot", return_value={"reddit": False}),
-            mock.patch.object(creator, "mark_creation_terminal_failure") as terminal,
-            mock.patch.object(creator, "delete_container") as delete,
-            mock.patch.object(creator, "retire_slot_id") as retire,
+            mock.patch.object(creator, "mark_bulk_skipped") as skipped,
+            mock.patch.object(
+                creator, "delete_named_instance", side_effect=AssertionError("deleted")
+            ),
+            mock.patch.object(
+                creator, "retire_slot_id", side_effect=AssertionError("retired")
+            ),
             mock.patch.object(creator, "save_bulk_state", lambda _state: None),
         ):
             self.assertTrue(
-                creator.App._discard_failed_bulk_slot(
+                creator.App._skip_failed_bulk_slot(
                     app,
                     "a0047",
                     entry,
@@ -632,24 +839,21 @@ class BatchCreatorTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(app.stop.waits, [300])
-        terminal.assert_called_once_with(
+        self.assertEqual(app.stop.waits, [])
+        skipped.assert_called_once_with(
             "a0047",
-            creator.AUTO_DISCARD_FAILURE_CODE,
+            creator.BULK_SKIP_FAILURE_CODE,
             "Email field still invalid.",
             app.log,
         )
-        delete.assert_called_once_with(stack, phone, "a0047")
-        retire.assert_called_once_with("a0047")
-        phone.close.assert_called_once_with()
         self.assertEqual(app.bulk_state["remaining"], 0)
         self.assertEqual(app.bulk_state["stage"], "idle")
         self.assertEqual(
             app.bulk_state["failures"][0]["code"],
-            creator.AUTO_DISCARD_FAILURE_CODE,
+            creator.BULK_SKIP_FAILURE_CODE,
         )
 
-    def test_stop_during_failed_slot_grace_period_preserves_container_and_queue(self):
+    def test_stop_preserves_failed_slot_and_queue_without_advancing(self):
         app = self.app(1)
         app.bulk_state.update(stage="creating", slot_id="a0047")
         app.stop.flag = True
@@ -657,35 +861,45 @@ class BatchCreatorTests(unittest.TestCase):
 
         with (
             mock.patch.object(creator, "get_slot", return_value={"reddit": False}),
+            mock.patch.object(creator, "mark_bulk_skipped") as skipped,
             mock.patch.object(
-                creator, "delete_container", side_effect=AssertionError("deleted")
+                creator, "delete_named_instance", side_effect=AssertionError("deleted")
             ),
         ):
             self.assertFalse(
-                creator.App._discard_failed_bulk_slot(
+                creator.App._skip_failed_bulk_slot(
                     app, "a0047", entry, "Email field still invalid."
                 )
             )
 
-        self.assertEqual(app.stop.waits, [300])
+        skipped.assert_not_called()
         self.assertEqual(app.bulk_state["remaining"], 1)
+        self.assertEqual(app.bulk_state["stage"], "creating")
 
-    def test_failed_slot_with_reddit_checkpoint_is_never_deleted(self):
+    def test_created_slot_late_failure_is_preserved_with_its_account_data(self):
         app = self.app(1)
-        app.bulk_state.update(stage="creating", slot_id="a0047")
-        pauses = []
-        app._pause_bulk = lambda phase, reason, **kwargs: pauses.append(
-            (phase, reason, kwargs.get("code"))
+        app.bulk_state.update(
+            stage="creating",
+            slot_id="a0047",
+            verified_ip="198.51.100.47",
+            verified_at_utc="2026-10-16T12:00:00Z",
         )
+        recorded = []
+
+        def record(sid, code, reason, log):
+            recorded.append((sid, code, reason))
+            return {"id": sid, "reddit": True}
 
         with (
             mock.patch.object(creator, "get_slot", return_value={"reddit": True}),
+            mock.patch.object(creator, "mark_bulk_skipped", side_effect=record),
             mock.patch.object(
-                creator, "delete_container", side_effect=AssertionError("deleted")
+                creator, "delete_named_instance", side_effect=AssertionError("deleted")
             ),
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
         ):
-            self.assertFalse(
-                creator.App._discard_failed_bulk_slot(
+            self.assertTrue(
+                creator.App._skip_failed_bulk_slot(
                     app,
                     "a0047",
                     app.bulk_state["queue"][0],
@@ -693,15 +907,15 @@ class BatchCreatorTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(app.stop.waits, [])
-        self.assertEqual(pauses[0][0], "creation")
-        self.assertEqual(app.bulk_state["remaining"], 1)
+        self.assertEqual(recorded[0][0], "a0047")
+        self.assertEqual(app.bulk_state["remaining"], 0)
+        self.assertEqual(
+            app.bulk_state["failures"][0]["code"], creator.BULK_SKIP_FAILURE_CODE
+        )
 
-    def test_unconfirmed_failed_container_delete_pauses_without_consuming_queue(self):
+    def test_unpreservable_failed_slot_pauses_without_consuming_queue(self):
         app = self.app(1)
         app.bulk_state.update(stage="creating", slot_id="a0047")
-        phone = mock.Mock()
-        app._connect = lambda _password: (phone, object())
         pauses = []
         app._pause_bulk = lambda phase, reason, **kwargs: pauses.append(
             (phase, reason, kwargs.get("code"))
@@ -709,16 +923,18 @@ class BatchCreatorTests(unittest.TestCase):
 
         with (
             mock.patch.object(creator, "get_slot", return_value={"reddit": False}),
-            mock.patch.object(creator, "mark_creation_terminal_failure"),
             mock.patch.object(
                 creator,
-                "delete_container",
-                side_effect=creator.PhoneError("target row missing"),
+                "mark_bulk_skipped",
+                side_effect=creator.PhoneError("slots.json is unreadable"),
+            ),
+            mock.patch.object(
+                creator, "delete_named_instance", side_effect=AssertionError("deleted")
             ),
             mock.patch.object(creator, "retire_slot_id") as retire,
         ):
             self.assertFalse(
-                creator.App._discard_failed_bulk_slot(
+                creator.App._skip_failed_bulk_slot(
                     app,
                     "a0047",
                     app.bulk_state["queue"][0],
@@ -727,8 +943,8 @@ class BatchCreatorTests(unittest.TestCase):
             )
 
         retire.assert_not_called()
-        self.assertEqual(pauses[0][2], "container_delete_failed")
-        self.assertIn("target row missing", pauses[0][1])
+        self.assertEqual(pauses[0][2], "bulk_skip_persist_failed")
+        self.assertIn("slots.json is unreadable", pauses[0][1])
         self.assertEqual(app.bulk_state["remaining"], 1)
 
     def test_bridge_exhaustion_pauses_without_attempting_container_delete(self):
@@ -753,7 +969,7 @@ class BatchCreatorTests(unittest.TestCase):
             return False
 
         app._run_creation_pipeline = bridge_failure
-        app._discard_failed_bulk_slot = lambda *_args, **_kwargs: self.fail(
+        app._skip_failed_bulk_slot = lambda *_args, **_kwargs: self.fail(
             "container deletion attempted without a working bridge"
         )
         with (
@@ -774,7 +990,536 @@ class BatchCreatorTests(unittest.TestCase):
         )
         self.assertEqual(app.bulk_state["remaining"], 1)
 
-    def test_exhausted_a0049_is_recorded_and_a0050_gets_next_row_and_fresh_ip(self):
+    def test_ai_budget_exhaustion_pauses_without_reset_delete_or_queue_consume(self):
+        app = self.app(1)
+        app.bulk_state.update(
+            stage="retry_creation",
+            slot_id="a0227",
+            verified_ip="198.51.100.47",
+            verified_at_utc="2026-10-16T12:00:00Z",
+        )
+        app._bulk_slot_and_entry = lambda state: (
+            "a0227", state["queue"][0], date(2005, 4, 20)
+        )
+        original_queue = [dict(row) for row in app.bulk_state["queue"]]
+        pauses = []
+        app._pause_bulk = lambda phase, reason, **kwargs: pauses.append(
+            (phase, reason, kwargs.get("code"))
+        )
+
+        def budget_failure(*_args, **_kwargs):
+            app._last_pipeline_failure_shared = True
+            app._last_pipeline_failure_code = (
+                creator.AI_RECOVERY_BUDGET_EXHAUSTED_CODE
+            )
+            app._last_pipeline_failure_reason = (
+                "AI recovery API call limit reached before a locally verified "
+                "postcondition"
+            )
+            return False
+
+        app._run_pipeline_with_bridge_recovery = budget_failure
+        app._reset_failed_creation = mock.Mock(
+            side_effect=AssertionError("budget exhaustion triggered stall reset")
+        )
+        app._stall_reset = mock.Mock(
+            side_effect=AssertionError("budget exhaustion deleted the attempt")
+        )
+
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(
+                creator,
+                "observe_proxy_without_trigger",
+                return_value=verified_result("198.51.100.47", "198.51.100.47"),
+            ),
+            mock.patch.object(creator, "get_slot", return_value={"reddit": False}),
+            mock.patch.object(creator, "_pipeline_slot_complete", return_value=False),
+            mock.patch.object(
+                creator,
+                "delete_named_instance",
+                side_effect=AssertionError("budget exhaustion deleted a container"),
+            ),
+            mock.patch.object(
+                creator,
+                "consume_stalled",
+                side_effect=AssertionError("budget exhaustion consumed the queue"),
+            ),
+        ):
+            creator.App._run_bulk_batch(app)
+
+        self.assertEqual(
+            pauses,
+            [
+                (
+                    "creation",
+                    app._last_pipeline_failure_reason,
+                    creator.AI_RECOVERY_BUDGET_EXHAUSTED_CODE,
+                )
+            ],
+        )
+        app._reset_failed_creation.assert_not_called()
+        app._stall_reset.assert_not_called()
+        self.assertEqual(app.bulk_state["remaining"], 1)
+        self.assertEqual(app.bulk_state["slot_id"], "a0227")
+        self.assertEqual(app.bulk_state["queue"], original_queue)
+
+    def test_ai_discard_directive_is_pause_only_without_delete_or_queue_consume(self):
+        app = self.app(1)
+        app.bulk_state.update(
+            stage="retry_creation",
+            slot_id="a0227",
+            verified_ip="198.51.100.47",
+            verified_at_utc="2026-10-16T12:00:00Z",
+        )
+        app._bulk_slot_and_entry = lambda state: (
+            "a0227", state["queue"][0], date(2005, 4, 20)
+        )
+        original_queue = [dict(row) for row in app.bulk_state["queue"]]
+        pauses = []
+        app._pause_bulk = lambda phase, reason, **kwargs: pauses.append(
+            (phase, reason, kwargs.get("code"))
+        )
+
+        def refused_directive(*_args, **_kwargs):
+            app._last_pipeline_failure_shared = True
+            app._last_pipeline_failure_code = creator.AI_DISCARD_REFUSED_CODE
+            app._last_pipeline_failure_reason = (
+                "Anthropic requested a destructive attempt reset; controller refused it."
+            )
+            return False
+
+        app._run_pipeline_with_bridge_recovery = refused_directive
+        app._reset_failed_creation = mock.Mock(
+            side_effect=AssertionError("AI directive triggered creation reset")
+        )
+        app._stall_reset = mock.Mock(
+            side_effect=AssertionError("AI directive deleted the attempt")
+        )
+
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(
+                creator,
+                "observe_proxy_without_trigger",
+                return_value=verified_result("198.51.100.47", "198.51.100.47"),
+            ),
+            mock.patch.object(creator, "get_slot", return_value={"reddit": False}),
+            mock.patch.object(creator, "_pipeline_slot_complete", return_value=False),
+            mock.patch.object(
+                creator,
+                "delete_named_instance",
+                side_effect=AssertionError("AI directive deleted a container"),
+            ),
+            mock.patch.object(
+                creator,
+                "consume_stalled",
+                side_effect=AssertionError("AI directive consumed the queue"),
+            ),
+        ):
+            creator.App._run_bulk_batch(app)
+
+        self.assertEqual(
+            pauses,
+            [
+                (
+                    "creation",
+                    app._last_pipeline_failure_reason,
+                    creator.AI_DISCARD_REFUSED_CODE,
+                )
+            ],
+        )
+        app._reset_failed_creation.assert_not_called()
+        app._stall_reset.assert_not_called()
+        self.assertEqual(app.bulk_state["remaining"], 1)
+        self.assertEqual(app.bulk_state["slot_id"], "a0227")
+        self.assertEqual(app.bulk_state["queue"], original_queue)
+
+    def test_pipeline_email_field_invalid_sets_dedicated_failure_code(self):
+        app = self.app(1)
+        app.status = mock.Mock()
+        slot = {
+            "id": "a0047",
+            "email": "fixture.saved_8h@icloud.com",
+            "reddit": False,
+            "ghost": True,
+            "ghost_container_state": "ready",
+            "ghost_container_instance": "instance-proof",
+            "crane_container_instance": "INSTANCE-PROOF-FULL",
+            "reddit_birth_date": "20.04.2005",
+        }
+        phone = mock.Mock()
+        app._connect = lambda _password: (phone, object())
+
+        def fail_reddit(*_args, **_kwargs):
+            raise creator.EmailFieldInvalid(
+                "Email field still invalid after one type and at most one bounded "
+                "single-missing-character retype (need the exact saved @icloud.com "
+                "address in Reddit's email form and no 'Please enter a valid email'). "
+                "Did not tap Continue. See 873_email_still_invalid."
+            )
+
+        with (
+            mock.patch.object(creator, "get_slot", return_value=slot),
+            mock.patch.object(creator, "run_create_reddit", side_effect=fail_reddit),
+        ):
+            success = creator.App._run_creation_pipeline(
+                app,
+                "offline-password",
+                "a0047",
+                date(2005, 4, 20),
+                10,
+                manage_worker=False,
+            )
+
+        self.assertFalse(success)
+        self.assertEqual(
+            app._last_pipeline_failure_code,
+            creator.EmailFieldInvalid.failure_code,
+        )
+        self.assertEqual(app._last_pipeline_failure_code, "reddit_email_field_invalid")
+        self.assertIn("873_email_still_invalid", app._last_pipeline_failure_reason)
+        phone.close.assert_called_once_with()
+
+    def test_pipeline_plain_phone_error_is_local_pause_only(self):
+        app = self.app(1)
+        app.status = mock.Mock()
+        slot = {
+            "id": "a0047",
+            "email": "fixture.saved_8h@icloud.com",
+            "reddit": False,
+            "ghost": True,
+            "ghost_container_state": "ready",
+            "ghost_container_instance": "instance-proof",
+            "crane_container_instance": "INSTANCE-PROOF-FULL",
+            "reddit_birth_date": "20.04.2005",
+        }
+        phone = mock.Mock()
+        app._connect = lambda _password: (phone, object())
+
+        def fail_reddit(*_args, **_kwargs):
+            raise creator.PhoneError("Saved password flow did not finish its code step.")
+
+        with (
+            mock.patch.object(creator, "get_slot", return_value=slot),
+            mock.patch.object(creator, "run_create_reddit", side_effect=fail_reddit),
+        ):
+            success = creator.App._run_creation_pipeline(
+                app,
+                "offline-password",
+                "a0047",
+                date(2005, 4, 20),
+                10,
+                manage_worker=False,
+            )
+
+        self.assertFalse(success)
+        self.assertEqual(
+            app._last_pipeline_failure_code, "deterministic_phone_error"
+        )
+        self.assertTrue(app._last_pipeline_failure_shared)
+        self.assertEqual(
+            app._last_pipeline_failure_reason,
+            "Saved password flow did not finish its code step.",
+        )
+        phone.close.assert_called_once_with()
+
+    def test_email_field_invalid_batch_failure_routes_to_bounded_reset(self):
+        app = self.app(1)
+        app.bulk_state.update(
+            stage="retry_creation",
+            slot_id="a0047",
+            verified_ip="198.51.100.9",
+            verified_at_utc="2026-10-16T12:00:00Z",
+        )
+        app._bulk_slot_and_entry = lambda state: (
+            "a0047",
+            state["queue"][0],
+            date(2005, 4, 20),
+        )
+        resets = []
+        app._reset_failed_creation = lambda sid, entry, reason, **kwargs: resets.append(
+            (sid, entry, reason, kwargs)
+        ) or False
+        app._pause_bulk = lambda *_a, **_k: self.fail(
+            "ordinary incomplete failure was paused instead of reset"
+        )
+
+        def rejected(*_args, **_kwargs):
+            app._last_pipeline_failure_code = "reddit_email_field_invalid"
+            app._last_pipeline_failure_reason = (
+                "Email field still invalid after one type and at most one bounded "
+                "single-missing-character retype. Did not tap Continue. "
+                "See 873_email_still_invalid."
+            )
+            return False
+
+        app._run_creation_pipeline = rejected
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(
+                creator,
+                "run_macrodroid_change",
+                side_effect=AssertionError("reset on creation retry"),
+            ),
+            mock.patch.object(
+                creator,
+                "observe_proxy_without_trigger",
+                return_value=verified_result("198.51.100.9", "198.51.100.9"),
+            ),
+            mock.patch.object(creator, "get_slot", return_value={"reddit": False}),
+            mock.patch.object(creator, "_pipeline_slot_complete", return_value=False),
+        ):
+            creator.App._run_bulk_batch(app)
+
+        self.assertEqual(len(resets), 1)
+        self.assertEqual(resets[0][0], "a0047")
+        self.assertIn("873_email_still_invalid", resets[0][2])
+        self.assertEqual(app._last_pipeline_failure_code, "reddit_email_field_invalid")
+        self.assertEqual(app.bulk_state["remaining"], 1)
+        self.assertEqual(app.bulk_state["slot_id"], "a0047")
+        self.assertEqual(len(app.bulk_state["queue"]), 1)
+
+    def test_plain_phone_error_batch_failure_routes_to_bounded_reset(self):
+        app = self.app(1)
+        app.bulk_state.update(
+            stage="retry_creation",
+            slot_id="a0047",
+            verified_ip="198.51.100.9",
+            verified_at_utc="2026-10-16T12:00:00Z",
+        )
+        app._bulk_slot_and_entry = lambda state: (
+            "a0047",
+            state["queue"][0],
+            date(2005, 4, 20),
+        )
+        resets = []
+        app._reset_failed_creation = lambda sid, entry, reason, **kwargs: resets.append(
+            (sid, entry, reason, kwargs)
+        ) or False
+        app._pause_bulk = lambda *_a, **_k: self.fail(
+            "ordinary incomplete failure was paused instead of reset"
+        )
+
+        def rejected(*_args, **_kwargs):
+            app._last_pipeline_failure_reason = (
+                "Reddit returned 'Sorry, please try again later.' "
+                "Saved password preserved; no automatic resubmit."
+            )
+            return False
+
+        app._run_creation_pipeline = rejected
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(
+                creator,
+                "run_macrodroid_change",
+                side_effect=AssertionError("reset on creation retry"),
+            ),
+            mock.patch.object(
+                creator,
+                "observe_proxy_without_trigger",
+                return_value=verified_result("198.51.100.9", "198.51.100.9"),
+            ),
+            mock.patch.object(creator, "get_slot", return_value={"reddit": False}),
+            mock.patch.object(creator, "_pipeline_slot_complete", return_value=False),
+        ):
+            creator.App._run_bulk_batch(app)
+
+        self.assertEqual(len(resets), 1)
+        self.assertEqual(resets[0][0], "a0047")
+        self.assertIn("Sorry, please try again later", resets[0][2])
+        self.assertEqual(app.bulk_state["remaining"], 1)
+        self.assertEqual(app.bulk_state["slot_id"], "a0047")
+        self.assertEqual(len(app.bulk_state["queue"]), 1)
+
+    def test_email_field_invalid_preserved_and_skipped_with_exact_code(self):
+        app = self.app(2)
+        app.bulk_state.update(
+            stage="creating",
+            slot_id="a0047",
+            verified_ip="198.51.100.47",
+            verified_at_utc="2026-10-16T12:00:00Z",
+        )
+        entry = app.bulk_state["queue"][0]
+        reason = (
+            "Email field still invalid after one type and at most one bounded "
+            "single-missing-character retype. Did not tap Continue. "
+            "See 873_email_still_invalid."
+        )
+
+        with (
+            mock.patch.object(creator, "get_slot", return_value={"reddit": False}),
+            mock.patch.object(creator, "mark_bulk_skipped") as skipped,
+            mock.patch.object(
+                creator, "delete_named_instance", side_effect=AssertionError("deleted")
+            ),
+            mock.patch.object(
+                creator, "retire_slot_id", side_effect=AssertionError("retired")
+            ),
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+        ):
+            self.assertTrue(
+                creator.App._skip_failed_bulk_slot(
+                    app,
+                    "a0047",
+                    entry,
+                    reason,
+                    failure_code="reddit_email_field_invalid",
+                )
+            )
+
+        self.assertEqual(app.stop.waits, [])
+        skipped.assert_called_once_with(
+            "a0047", "reddit_email_field_invalid", reason, app.log
+        )
+        self.assertEqual(app.bulk_state["remaining"], 1)
+        self.assertEqual(app.bulk_state["stage"], "between")
+        self.assertEqual(
+            app.bulk_state["failures"][0]["code"], "reddit_email_field_invalid"
+        )
+        self.assertEqual(app.bulk_state["failures"][0]["slot_id"], "a0047")
+
+    def test_failed_slot_enters_bounded_reset_without_starting_next_item(self):
+        app = self.app(2)
+        app.bulk_state["queue"][0]["birth_date"] = "01.01.2003"
+        app.bulk_state["queue"][1]["birth_date"] = "02.02.2004"
+        app.bulk_state.update(
+            stage="creating",
+            slot_id="a0047",
+            verified_ip="198.51.100.47",
+            verified_at_utc="2026-10-16T12:00:00Z",
+        )
+        phone = mock.Mock()
+        app._connect = lambda _password: (phone, object())
+        previous_row = {
+            "id": "a0047",
+            "reddit": False,
+            "email": "keep-4f@icloud.com",
+            "ghost": True,
+            "ghost_container_state": "ready",
+            "ghost_container_instance": "instance-proof",
+            "crane_container_instance": "INSTANCE-PROOF-FULL",
+        }
+        pipelines = []
+        skipped = []
+        deleted = []
+        retired = []
+        ghosts = []
+        resets = []
+        app._reset_failed_creation = lambda sid, entry, reason, **kwargs: resets.append(
+            (sid, entry, reason, kwargs)
+        ) or False
+        app._pause_bulk = lambda *_a, **_k: self.fail(
+            "ordinary incomplete failure was paused instead of reset"
+        )
+
+        def pipeline(_password, sid, _birth, _swipes, **_kwargs):
+            pipelines.append(sid)
+            if sid == "a0047":
+                app._last_pipeline_failure_code = "reddit_email_field_invalid"
+                app._last_pipeline_failure_reason = (
+                    "Email field still invalid after one type and at most one "
+                    "bounded single-missing-character retype. Did not tap Continue. "
+                    "See 873_email_still_invalid."
+                )
+                return False
+            return True
+
+        app._run_creation_pipeline = pipeline
+
+        def slot_state(sid):
+            if sid == "a0047":
+                return {"reddit": False, "email": "keep-4f@icloud.com"}
+            return {
+                "reddit": True,
+                "username": "",
+                "email": "keep-4f@icloud.com",
+                "complete": True,
+            }
+
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(creator, "get_slot", side_effect=slot_state),
+            mock.patch.object(
+                creator,
+                "_pipeline_slot_complete",
+                side_effect=lambda row: bool(row and row.get("complete")),
+            ),
+            mock.patch.object(creator, "load_slots", lambda: [previous_row]),
+            mock.patch.object(creator, "retired_indices", lambda: set()),
+            mock.patch.object(
+                creator,
+                "ensure_ghost_container_needed",
+                side_effect=lambda sid, _log: ghosts.append(sid),
+            ),
+            mock.patch.object(
+                creator,
+                "mark_bulk_skipped",
+                side_effect=lambda sid, code, _reason, _log: (
+                    skipped.append((sid, code)),
+                    previous_row.setdefault(
+                        "bulk_skip", {"slot_id": sid, "code": code}
+                    ),
+                )[1],
+            ),
+            mock.patch.object(
+                creator,
+                "delete_named_instance",
+                side_effect=lambda _stack, _phone, sid: deleted.append(sid),
+            ),
+            mock.patch.object(
+                creator,
+                "retire_slot_id",
+                side_effect=lambda sid: retired.append(sid),
+            ),
+            mock.patch.object(
+                creator,
+                "observe_proxy_without_trigger",
+                return_value=verified_result("198.51.100.47", "198.51.100.47"),
+            ),
+            mock.patch.object(
+                creator,
+                "run_macrodroid_change",
+                return_value=verified_result("198.51.100.47", "198.51.100.48"),
+            ),
+            mock.patch.object(
+                creator, "set_slot_falcon_proxy_ip", lambda *_args: None
+            ),
+        ):
+            creator.App._run_bulk_batch(app)
+
+        self.assertEqual(pipelines, ["a0047"])
+        self.assertEqual(skipped, [])
+        self.assertEqual(deleted, [])
+        self.assertEqual(retired, [])
+        self.assertEqual(ghosts, ["a0047"])
+        self.assertEqual(len(resets), 1)
+        self.assertEqual(resets[0][0], "a0047")
+        self.assertIn("873_email_still_invalid", resets[0][2])
+        self.assertEqual(app.bulk_state["remaining"], 2)
+        self.assertEqual(app.bulk_state["slot_id"], "a0047")
+        self.assertEqual(len(app.bulk_state["queue"]), 2)
+        self.assertEqual(app.bulk_state["failures"], [])
+
+    def test_terminal_retired_slot_row_is_skipped_and_next_id_allocated(self):
+        row = {
+            "id": "a0047",
+            "reddit": False,
+            "email": "keep-4f@icloud.com",
+            "creation_terminal_failure": {"code": "reddit_email_field_invalid"},
+        }
+        sid, slot, is_new = creator._resolve_creation_pipeline_target([row], {47})
+        self.assertEqual(sid, "a0048")
+        self.assertIsNone(slot)
+        self.assertTrue(is_new)
+
+    def test_retired_row_without_terminal_record_still_raises_the_guard(self):
+        row = {"id": "a0047", "reddit": False}
+        with self.assertRaises(creator.PhoneError):
+            creator._resolve_creation_pipeline_target([row], {47})
+
+    def test_exhausted_a0049_enters_bounded_reset_without_starting_a0050(self):
         app = self.app(2)
         app.bulk_state["queue"][0]["username"] = "QuietMoon49"
         app.bulk_state["queue"][1]["username"] = "QuietMoon50"
@@ -787,6 +1532,13 @@ class BatchCreatorTests(unittest.TestCase):
         completed = set()
         creation_calls = []
         attached_ips = []
+        resets = []
+        app._reset_failed_creation = lambda sid, entry, reason, **kwargs: resets.append(
+            (sid, entry, reason, kwargs)
+        ) or False
+        app._pause_bulk = lambda *_a, **_k: self.fail(
+            "ordinary incomplete failure was paused instead of reset"
+        )
 
         def slot_and_entry(state):
             if not state.get("slot_id"):
@@ -813,17 +1565,9 @@ class BatchCreatorTests(unittest.TestCase):
             [],
         )
 
-        def discard(sid, entry, reason, *, failure_code=""):
-            ready = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            app._persist_bulk(
-                bulk_creation.consume_failed(
-                    dict(app.bulk_state), sid, code=failure_code,
-                    reason=reason, ready_at_utc=ready,
-                )
-            )
-            return True
-
-        app._discard_failed_bulk_slot = discard
+        app._skip_failed_bulk_slot = lambda *_a, **_k: self.fail(
+            "failed item was consumed instead of paused"
+        )
 
         with (
             mock.patch.object(creator, "save_bulk_state", lambda _state: None),
@@ -855,12 +1599,19 @@ class BatchCreatorTests(unittest.TestCase):
 
         self.assertEqual(
             creation_calls,
-            [("a0049", "QuietMoon49"), ("a0050", "QuietMoon50")],
+            [("a0049", "QuietMoon49")],
         )
-        self.assertEqual(attached_ips, [("a0050", "198.51.100.50")])
-        self.assertEqual(app.bulk_state["remaining"], 0)
-        self.assertEqual(app.bulk_state["stage"], "idle")
-        self.assertEqual(app.bulk_state["failures"][0]["slot_id"], "a0049")
+        self.assertEqual(attached_ips, [])
+        self.assertEqual(len(resets), 1)
+        self.assertEqual(resets[0][0], "a0049")
+        self.assertEqual(
+            app._last_pipeline_failure_code,
+            creator.EmailReplacementExhausted.failure_code,
+        )
+        self.assertEqual(app.bulk_state["remaining"], 2)
+        self.assertEqual(app.bulk_state["slot_id"], "a0049")
+        self.assertEqual(len(app.bulk_state["queue"]), 2)
+        self.assertEqual(app.bulk_state["failures"], [])
 
     def test_terminal_newest_slot_is_not_reused(self):
         sid, row, is_new = creator._resolve_creation_pipeline_target(
@@ -873,11 +1624,13 @@ class BatchCreatorTests(unittest.TestCase):
         )
         self.assertEqual((sid, row, is_new), ("a0050", None, True))
 
-    def test_success_label_without_address_evidence_does_not_start_creation(self):
+    def test_success_label_without_address_evidence_routes_to_bounded_ip_retry(self):
         app = self.app(1)
         app._bulk_slot_and_entry = lambda state: ("a0001", state["queue"][0], date(2000, 1, 1))
-        pauses = []
-        app._pause_bulk = lambda phase, reason: pauses.append((phase, reason))
+        retries = []
+        app._retry_ip_after_failure = lambda reason, **kwargs: retries.append(
+            (reason, kwargs.get("code"))
+        ) or False
         def ip_change(_webhook, _proxy, **kwargs):
             kwargs["before_trigger"](trigger_checkpoint("198.51.100.1"))
             return {"outcome": "verified", "old_ip": "198.51.100.1", "new_ip": "198.51.100.2"}
@@ -887,21 +1640,25 @@ class BatchCreatorTests(unittest.TestCase):
             mock.patch.object(creator, "set_slot_falcon_proxy_ip", side_effect=AssertionError("IP attached without evidence")),
         ):
             creator.App._run_bulk_batch(app)
-        self.assertEqual(pauses[0][0], "ip")
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(retries[0][1], "unexpected_local_failure")
         self.assertEqual(len(app.bulk_state["queue"]), 1)
 
-    def test_missing_baseline_retry_pauses_without_reset_or_creation(self):
+    def test_missing_baseline_routes_to_bounded_retry_without_creation(self):
         app = self.app(1)
         app.bulk_state.update(stage="retry_ip", slot_id="a0001", baseline_ip=None)
         app._bulk_slot_and_entry = lambda state: ("a0001", state["queue"][0], date(2000, 1, 1))
-        pauses = []
-        app._pause_bulk = lambda phase, reason: pauses.append((phase, reason))
+        retries = []
+        app._retry_ip_after_failure = lambda reason, **kwargs: retries.append(
+            (reason, kwargs.get("code"))
+        ) or False
         with (
             mock.patch.object(creator, "run_macrodroid_change", side_effect=AssertionError("duplicate reset")),
             mock.patch.object(creator, "observe_proxy_without_trigger", side_effect=AssertionError("no comparison IP")),
         ):
             creator.App._run_bulk_batch(app)
-        self.assertEqual(pauses[0][0], "ip")
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(retries[0][1], "ip_verification_failed")
         self.assertEqual(len(app.bulk_state["queue"]), 1)
 
     def test_completed_slot_reconciles_queue_without_reset(self):
@@ -922,35 +1679,70 @@ class BatchCreatorTests(unittest.TestCase):
         self.assertEqual(app.bulk_state["remaining"], 0)
         self.assertEqual(app.bulk_state["queue"], [])
 
-    def test_start_preflight_rejects_incompatible_unfinished_slot(self):
-        app = self.app(1)
-        with (
-            mock.patch.object(creator, "load_slots", return_value=[{"name": "a0001", "reddit_birth_date": "02.02.2000"}]),
-            mock.patch.object(creator, "retired_indices", return_value=set()),
-            mock.patch.object(creator, "_resolve_creation_pipeline_target", return_value=("a0001", {"reddit_birth_date": "02.02.2000"}, False)),
-        ):
-            with self.assertRaisesRegex(creator.BulkError, "birth date"):
-                app._check_bulk_resume_compatibility(app.bulk_state)
-
-    def test_failed_same_ip_retry_pauses_without_creation_or_reset(self):
+    def test_a0227_provisioning_resume_ip_failure_retries_ip_without_delete(self):
         app = self.app(1)
         app.bulk_state.update(
-            stage="retry_creation", slot_id="a0001", verified_ip="198.51.100.9",
+            stage="retry_creation", slot_id="a0227", verified_ip="198.51.100.9",
             verified_at_utc="2026-10-16T12:00:00Z",
         )
-        app._bulk_slot_and_entry = lambda state: ("a0001", state["queue"][0], date(2000, 1, 1))
-        pauses = []
-        app._pause_bulk = lambda phase, reason: pauses.append((phase, reason))
+        app._bulk_slot_and_entry = lambda state: (
+            "a0227", state["queue"][0], date(2000, 1, 1)
+        )
+        slot = {
+            "id": "a0227",
+            "ghost": True,
+            "ghost_container_state": "provisioning",
+            "ghost_container_baseline": [],
+            "reddit": False,
+        }
+        original_slot = dict(slot)
+        original_queue = [dict(item) for item in app.bulk_state["queue"]]
+        logs = []
+        app.log = logs.append
+        app._set_diag = lambda *_args: None
+        app._reset_failed_creation = mock.Mock(
+            side_effect=AssertionError("IP recheck failure reset the a0227 attempt")
+        )
+        app._stall_reset = mock.Mock(
+            side_effect=AssertionError("IP recheck failure deleted a0227")
+        )
+        real_retry = app._retry_ip_after_failure
+
+        def retry_same_slot(reason, **kwargs):
+            result = real_retry(reason, **kwargs)
+            app.stop.set()
+            return result
+
+        app._retry_ip_after_failure = retry_same_slot
         with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
             mock.patch.object(creator, "run_macrodroid_change", side_effect=AssertionError("duplicate reset")),
             mock.patch.object(creator, "observe_proxy_without_trigger", return_value={"outcome": "verification_failed", "ip": ""}),
-            mock.patch.object(creator, "get_slot", lambda _sid: {"complete": False}),
+            mock.patch.object(creator, "get_slot", return_value=slot),
             mock.patch.object(creator, "_pipeline_slot_complete", return_value=False),
             mock.patch.object(creator, "set_slot_falcon_proxy_ip", side_effect=AssertionError("unverified IP assigned")),
+            mock.patch.object(
+                creator,
+                "delete_named_instance",
+                side_effect=AssertionError("IP recheck failure tapped Delete"),
+            ),
+            mock.patch.object(
+                creator,
+                "consume_stalled",
+                side_effect=AssertionError("IP recheck failure consumed the queue"),
+            ),
         ):
             creator.App._run_bulk_batch(app)
-        self.assertEqual(pauses[0][0], "creation")
-        self.assertEqual(len(app.bulk_state["queue"]), 1)
+
+        app._reset_failed_creation.assert_not_called()
+        app._stall_reset.assert_not_called()
+        self.assertEqual(app.bulk_state["stage"], "ip_pending")
+        self.assertEqual(app.bulk_state["slot_id"], "a0227")
+        self.assertIsNone(app.bulk_state["verified_ip"])
+        self.assertEqual(app.bulk_state["queue"], original_queue)
+        self.assertEqual(slot, original_slot)
+        self.assertEqual(app.stop.waits, [])
+        self.assertTrue(any("immediately" in line for line in logs))
 
     def test_stop_persists_stopped_stage_and_retains_queue(self):
         app = self.app(1)
@@ -972,7 +1764,10 @@ class BatchCreatorTests(unittest.TestCase):
         )
         starts = []
         app._start_bulk_worker = lambda: starts.append(dict(app.bulk_state))
-        with mock.patch.object(creator, "save_bulk_state", lambda _state: None):
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(creator, "get_slot", lambda _sid: {"id": "a0001"}),
+        ):
             self.assertTrue(app.retry_bulk_batch(password="offline-password"))
         self.assertEqual(len(starts), 1)
         self.assertEqual(app.bulk_state["stage"], "retry_ip")
@@ -1073,7 +1868,7 @@ class BatchCreatorTests(unittest.TestCase):
         self.assertEqual(app.bulk_state, before)
         self.assertIsNone(app.worker)
 
-    def test_expired_restart_and_changed_scope_pause_without_requests(self):
+    def test_expired_restart_and_changed_scope_route_to_retry_without_requests(self):
         for reason in ("expired", "scope"):
             with self.subTest(reason=reason):
                 app = self.app(3)
@@ -1085,14 +1880,17 @@ class BatchCreatorTests(unittest.TestCase):
                 else:
                     app._bulk_proxy_scope = lambda: "b" * 64
                 app._bulk_slot_and_entry = lambda state: ("a0046", state["queue"][0], date(2000, 1, 1))
-                pauses = []
-                app._pause_bulk = lambda phase, message: pauses.append((phase, message))
+                retries = []
+                app._retry_ip_after_failure = lambda message, **kwargs: retries.append(
+                    (message, kwargs.get("code"))
+                ) or False
                 with (
                     mock.patch.object(creator, "run_macrodroid_change", side_effect=AssertionError("reset")),
                     mock.patch.object(creator, "observe_proxy_without_trigger", side_effect=AssertionError("read")),
                 ):
                     app._run_bulk_batch()
-                self.assertEqual(pauses[0][0], "ip")
+                self.assertEqual(len(retries), 1)
+                self.assertEqual(retries[0][1], "unexpected_local_failure")
                 self.assertEqual((app.bulk_state["remaining"], len(app.bulk_state["queue"])), (3, 3))
 
     def test_late_checkpoint_cannot_restart_stopped_batch(self):

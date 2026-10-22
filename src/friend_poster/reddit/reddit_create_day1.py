@@ -11,7 +11,11 @@ import sys
 import time
 from datetime import date
 from friend_poster.core.config import REDDIT_BUNDLE  # noqa: E402
-from friend_poster.reddit.feed_swipe import normalize_feed_swipe_count, run_feed_swipes  # noqa: E402
+from friend_poster.reddit.feed_swipe import (  # noqa: E402
+    FeedVisualRecoveryExhausted,
+    normalize_feed_swipe_count,
+    run_feed_swipes,
+)
 from friend_poster.device.icloud_code import (  # noqa: E402
     PollCancelled,
     VerificationCodeTimeout,
@@ -33,16 +37,20 @@ from friend_poster.reddit.reddit_interests import (  # noqa: E402
 )
 from friend_poster.reddit.reddit_open import (  # noqa: E402
     FeedCleanupProof,
+    _find_reddit_from_home,
     _screen_signature,
     close_reddit,
+    make_created_account_feed_resume_proof,
     make_feed_cleanup_proof,
     make_terminal_feed_cleanup_proof,
     open_container,
+    protected_reddit_marker,
     proven_reddit_feed_structure,
     proven_springboard,
     switcher_app_card,
     switcher_app_removed_or_home,
     switcher_centered_title,
+    tap_home_icon,
 )
 from friend_poster.reddit.reddit_password import (  # noqa: E402
     ABOUT_MARKERS,
@@ -50,6 +58,7 @@ from friend_poster.reddit.reddit_password import (  # noqa: E402
     passkey_prompt,
     resume_saved_password,
     type_password,
+    validate_requested_password,
 )
 from friend_poster.reddit.reddit_to_verify import (  # noqa: E402
     at_verify,
@@ -61,6 +70,7 @@ from friend_poster.reddit.reddit_to_verify import (  # noqa: E402
 )
 from friend_poster.reddit.reddit_username import USER_RE, keep_suggested_username, use_requested_username  # noqa: E402
 from friend_poster.core.slots import (  # noqa: E402
+    CREATION_PROGRESS,
     creation_feed_swipe_progress,
     clear_email_verification,
     email_verification_state,
@@ -151,6 +161,8 @@ def wait_verification_outcome(
     stem: str,
     tries: int = 8,
     stop=None,
+    success_predicate=None,
+    success_outcome: str = "username",
 ) -> tuple[str, list]:
     """Wait for Username or Reddit's exact invalid-code response.
 
@@ -163,6 +175,8 @@ def wait_verification_outcome(
         _check_stop(stop)
         if find_label_exact(nodes, ("Create your username",)) is not None:
             return "username", nodes
+        if success_predicate is not None and success_predicate(nodes):
+            return success_outcome, nodes
         if invalid_code_message(nodes) is not None:
             return "invalid", nodes
         if attempt == tries:
@@ -178,6 +192,122 @@ def wait_verification_outcome(
             preview=False,
         )
     return "unknown", nodes
+
+
+def _post_password_about_screen(nodes) -> bool:
+    return (
+        find_label_exact(nodes, ABOUT_MARKERS) is not None
+        or birthday_confirmation_screen(nodes)
+    )
+
+
+def _verify_email_after_password(
+    sid: str,
+    phone: Phone,
+    stack: TapStack,
+    initial_nodes,
+    *,
+    log_fn=None,
+    stop=None,
+) -> list:
+    """Finish Reddit's optional second Verify step after saved credentials."""
+    emit = log_fn or log
+    if find_label_exact(initial_nodes, ("Verify your email",)) is None:
+        raise PhoneError(
+            "Post-password verification requires Reddit's exact Verify screen."
+        )
+    email, active_index, active_label = _active_email_identity(sid)
+    try:
+        checkpoint = email_verification_state(get_slot(sid))
+    except ValueError as exc:
+        raise PhoneError(f"{sid} email verification checkpoint is malformed.") from exc
+    if checkpoint is None:
+        mark_email_verification(sid, active_index, active_label, "submitted", emit)
+    elif (
+        checkpoint.get("phase") != "submitted"
+        or int(checkpoint.get("replacement_index")) != active_index
+        or str(checkpoint.get("label")) != active_label
+    ):
+        raise PhoneError(
+            "Post-password verification checkpoint does not match the active email."
+        )
+
+    emit("Post-password Verify: IMAP poll for Reddit 6-digit (not Mail app).")
+    CREATION_PROGRESS.note()
+    try:
+        code = poll_reddit_code(
+            log=emit,
+            timeout=150,
+            after_ts=time.time() - VERIFY_RESUME_LOOKBACK_SECONDS,
+            email_hint=email,
+            stop=stop,
+        )
+    except PollCancelled as exc:
+        raise PhoneError(str(exc)) from exc
+    except (VerificationCodeTimeout, RuntimeError) as exc:
+        raise PhoneError(
+            "Post-password verification code did not arrive; preserved the Verify screen."
+        ) from exc
+
+    emit("Post-password verification code received.")
+    result_nodes = type_code(stack, phone, code)
+    outcome, nodes = wait_verification_outcome(
+        stack,
+        phone,
+        result_nodes,
+        stem="909_post_password_verify",
+        stop=stop,
+        success_predicate=_post_password_about_screen,
+        success_outcome="about",
+    )
+    if outcome == "invalid":
+        resend_at, stale_code, _cleared_nodes = resend_invalid_code_once(
+            stack, phone, nodes, emit
+        )
+        emit("Post-password Verify: IMAP poll after the one exact Resend.")
+        CREATION_PROGRESS.note()
+        try:
+            replacement = poll_reddit_code(
+                log=emit,
+                timeout=150,
+                after_ts=resend_at,
+                email_hint=email,
+                stop=stop,
+            )
+        except PollCancelled as exc:
+            raise PhoneError(str(exc)) from exc
+        except (VerificationCodeTimeout, RuntimeError) as exc:
+            raise PhoneError(
+                "Post-password Resend code did not arrive; preserved the Verify screen."
+            ) from exc
+        if replacement == stale_code:
+            raise PhoneError(
+                "Post-password Resend returned the rejected code; did not enter it twice."
+            )
+        result_nodes = type_code(stack, phone, replacement)
+        outcome, nodes = wait_verification_outcome(
+            stack,
+            phone,
+            result_nodes,
+            stem="909_post_password_resend",
+            stop=stop,
+            success_predicate=_post_password_about_screen,
+            success_outcome="about",
+        )
+        if outcome == "invalid":
+            raise PhoneError(
+                "Post-password replacement code was rejected; Resend was not repeated."
+            )
+    if outcome not in {"about", "username"}:
+        raise PhoneError(
+            "Post-password verification did not reach a proven Username or About screen."
+        )
+    clear_email_verification(sid, emit)
+    emit(
+        "Post-password verification checkpoint cleared after a proven "
+        f"{outcome} transition."
+    )
+    return nodes
 
 
 def recover_invalid_verification_code(
@@ -201,6 +331,9 @@ def recover_invalid_verification_code(
         emit,
     )
     emit("IMAP poll for the code sent after the one Resend.")
+    # This bounded 150 s wait is real work, not a stall: mark it so the
+    # three-minute inactivity reset cannot cancel a legitimate code poll.
+    CREATION_PROGRESS.note()
     try:
         replacement = poll_reddit_code(
             log=emit,
@@ -395,7 +528,13 @@ def _verify_email_with_replacements(
                     )
                 else:
                     run_to_verify(
-                        stack, phone, sid, email, stop=stop, log_fn=emit
+                        stack,
+                        phone,
+                        sid,
+                        email,
+                        stop=stop,
+                        log_fn=emit,
+                        reuse_active_container=True,
                     )
                 mark_email_verification(
                     sid, active_index, active_label, "submitted", emit
@@ -462,6 +601,9 @@ def _verify_email_with_replacements(
                 raise PhoneError(f"{sid} has an unsupported verification phase.")
 
         emit("IMAP poll for Reddit 6-digit (not Mail app).")
+        # See the post-Resend poll above: a correct 150 s code wait must never
+        # be mistaken for three minutes of inactivity.
+        CREATION_PROGRESS.note()
         try:
             code = poll_reddit_code(
                 log=emit,
@@ -537,10 +679,108 @@ def wait_feed(stack: TapStack, phone: Phone, *, stop=None) -> FeedCleanupProof:
                 return proof
             log("Home feed detected but cleanup proof is incomplete; waiting for a fresh frame.")
         _wait(stop, 1.2)
-    raise PhoneError(
+    raise FeedVisualRecoveryExhausted(
         "Feed labels remained unclear after account creation. "
         "Did not mark the account created or close from an unproven screen."
     )
+
+
+def _foreground_running_reddit_feed(
+    sid: str,
+    phone: Phone,
+    stack: TapStack,
+    *,
+    stop=None,
+    emit=log,
+):
+    """Foreground the existing Reddit process without reselecting Crane.
+
+    A feed checkpoint can find SpringBoard while the exact Reddit process from
+    the current creation session is merely backgrounded.  In that case Crane
+    is already active and reopening its picker is both unnecessary and prone
+    to duplicate-label ambiguity.  Only this still-running-process case uses
+    the direct Home icon; a stopped process returns ``None`` so the caller can
+    use the existing exact-container recovery path.
+    """
+    checker = getattr(stack, "app_is_running", None)
+    if not callable(checker) or not checker(REDDIT_BUNDLE):
+        return None
+    _check_stop(stop)
+    emit(
+        f"{sid}: Reddit is still running in the background; foregrounding the "
+        "existing process without reopening Crane."
+    )
+    icon = _find_reddit_from_home(stack, phone, emit, "899_running_feed_resume")
+    tap_home_icon(stack, icon)
+    for attempt in range(5):
+        _check_stop(stop)
+        _blob, nodes = dump_named(
+            stack,
+            phone,
+            f"899_running_feed_proof_{attempt}",
+            log,
+            shot=False,
+            persist=False,
+            preview=False,
+        )
+        bad = protected_reddit_marker(nodes)
+        if bad:
+            raise PhoneError(
+                f"{sid}: foregrounded Reddit reached protected screen {bad!r}; "
+                "saved swipe progress was preserved."
+            )
+        if proven_reddit_feed_structure(nodes):
+            emit(
+                f"{sid}: existing Reddit feed structure proven; resuming saved "
+                "swipe progress."
+            )
+            return nodes
+        _wait(stop, 0.8)
+    raise FeedVisualRecoveryExhausted(
+        f"{sid}: foregrounded Reddit did not prove a feed after five fresh frames; "
+        "saved swipe progress was preserved."
+    )
+
+
+def _recover_feed_after_home(
+    sid: str,
+    slot,
+    phone: Phone,
+    stack: TapStack,
+    completed: int,
+    *,
+    stop=None,
+    emit=log,
+):
+    running_feed_nodes = _foreground_running_reddit_feed(
+        sid, phone, stack, stop=stop, emit=emit
+    )
+    if running_feed_nodes is not None:
+        return running_feed_nodes
+    _check_stop(stop)
+    emit(
+        f"{sid}: Reddit process is stopped after swipe {completed}; reopening "
+        "the exact saved Crane container."
+    )
+    open_container(
+        stack,
+        phone,
+        log,
+        sid,
+        str(slot.get("email") or ""),
+        allow_existing_sparse_feed=True,
+    )
+    _check_stop(stop)
+    _blob, recovered_nodes = dump_named(
+        stack,
+        phone,
+        f"899_swipe_home_recovery_{completed:03d}",
+        log,
+        shot=False,
+        persist=False,
+        preview=False,
+    )
+    return recovered_nodes
 
 
 def feed_navigation_state(nodes) -> str:
@@ -662,6 +902,12 @@ def _prove_final_home_and_reddit_stopped(
             f"{FINAL_HOME_VERIFY_MAX_DUMPS} fresh dumps. Cleanup remains resumable "
             "at app_stopped."
         )
+
+
+class DeterministicCleanupError(PhoneError):
+    """A local cleanup/checkpoint failure that must never invoke AI recovery."""
+
+    ai_recoverable = False
 
 
 def _close_exact_bundle_after_completed_swipes(
@@ -798,11 +1044,11 @@ def _close_exact_bundle_after_completed_swipes(
                 f"{sid}: Reddit restarted or remained running after the exact "
                 "force close. Cleanup remains pending."
             )
-        if card_error is None and not already_complete:
+        if not already_complete:
             try:
                 _mark_cleanup_app_stopped(sid)
             except Exception as exc:
-                raise PhoneError(
+                raise DeterministicCleanupError(
                     f"{sid}: Reddit was fully closed, but the app-stopped "
                     "checkpoint could not be saved. Cleanup remains pending."
                 ) from exc
@@ -820,9 +1066,14 @@ def _close_exact_bundle_after_completed_swipes(
 
     if card_error is not None:
         if close_error is not None:
-            close_error = PhoneError(f"{card_error} Force close also failed: {close_error}")
+            close_error = DeterministicCleanupError(
+                f"{card_error} Force close also failed: {close_error}"
+            )
         else:
-            close_error = card_error
+            log(
+                f"{sid}: Recents-card proof was unavailable, but the exact Reddit "
+                "bundle is verified stopped; continuing local cleanup."
+            )
 
     home_error: PhoneError | None = None
     try:
@@ -842,10 +1093,15 @@ def _close_exact_bundle_after_completed_swipes(
 
     if close_error is not None:
         if home_error is not None:
-            raise PhoneError(f"{close_error} Home recovery also failed: {home_error}")
-        raise close_error
+            raise DeterministicCleanupError(
+                f"{close_error} Home recovery also failed: {home_error}"
+            )
+        raise DeterministicCleanupError(str(close_error))
     if home_error is not None:
-        raise home_error
+        log(
+            f"{sid}: Home OCR was not proven after exact Reddit force-close; "
+            "Home was pressed locally and cleanup will continue without AI."
+        )
     if not already_complete:
         mark_reddit_cleanup(sid, "complete", log)
 
@@ -882,12 +1138,25 @@ def _finish_app_stopped_cleanup(
             fresh_from_reddit=True,
         )
         return
-    _prove_final_home_and_reddit_stopped(
-        sid,
-        phone,
-        stack,
-        stem="899_cleanup_home_verify",
-    )
+    try:
+        _prove_final_home_and_reddit_stopped(
+            sid,
+            phone,
+            stack,
+            stem="899_cleanup_home_verify",
+        )
+    except PhoneError:
+        # ``app_stopped`` already proves the only safety-critical condition.
+        # Home OCR is advisory: the helper pressed Home and rechecked the exact
+        # bundle, so do not turn an OCR miss into AI recovery or a retry loop.
+        if stack.app_is_running(REDDIT_BUNDLE):
+            raise DeterministicCleanupError(
+                f"{sid}: Reddit resumed while finishing app-stopped cleanup."
+            )
+        log(
+            f"{sid}: app_stopped remains locally verified; Home OCR was "
+            "inconclusive and cleanup continues without AI."
+        )
     mark_reddit_cleanup(sid, "complete", log)
 
 
@@ -943,25 +1212,17 @@ def _resume_created_cleanup(
             preview=False,
         )
         if proven_springboard(nodes):
-            open_container(
-                stack,
-                phone,
-                log,
+            nodes = _recover_feed_after_home(
                 sid,
-                str(slot.get("email") or ""),
-                allow_existing_sparse_feed=True,
-            )
-            _check_stop(stop)
-            _blob, nodes = dump_named(
-                stack,
+                slot,
                 phone,
-                "899_swipe_resume_after_open",
-                log,
-                shot=False,
-                persist=False,
-                preview=False,
+                stack,
+                swipe_completed,
+                stop=stop,
+                emit=log,
             )
-        if not proven_reddit_feed_structure(nodes):
+        created_resume_proof = make_created_account_feed_resume_proof(nodes)
+        if not proven_reddit_feed_structure(nodes) and created_resume_proof is None:
             raise PhoneError(
                 f"{sid}: remaining creation feed swipes require a proven Reddit "
                 "feed. Preserved the current screen."
@@ -969,6 +1230,25 @@ def _resume_created_cleanup(
         initial_proof = make_feed_cleanup_proof(nodes)
         if initial_proof is None:
             initial_proof = make_terminal_feed_cleanup_proof(nodes)
+        if initial_proof is None:
+            initial_proof = created_resume_proof
+        if created_resume_proof is not None and not proven_reddit_feed_structure(nodes):
+            log(
+                f"{sid}: durably completed account plus two-card Reddit feed "
+                "structure proven; resuming saved swipe progress."
+            )
+
+        def recover_from_home(completed: int):
+            return _recover_feed_after_home(
+                sid,
+                slot,
+                phone,
+                stack,
+                completed,
+                stop=stop,
+                emit=log,
+            )
+
         run_feed_swipes(
             stack,
             phone,
@@ -982,6 +1262,8 @@ def _resume_created_cleanup(
             initial_proof=initial_proof,
             require_final_proof=True,
             continue_on_unclear=True,
+            recover_from_home=recover_from_home,
+            allow_created_account_feed_proof=True,
             pause_count=feed_pause_count,
             fixed_delay_seconds=fixed_delay_seconds,
         )
@@ -1071,6 +1353,9 @@ def run_slot(
     feed_pause_count: int = 0,
     fixed_delay_seconds: float | None = None,
     requested_username: str = "",
+    requested_password: str = "",
+    username_committer=None,
+    username_candidate_allowed=None,
     email_replacer=None,
     rotate_before_poll: bool = False,
     max_email_replacements: int = MAX_EMAIL_REPLACEMENTS,
@@ -1081,13 +1366,25 @@ def run_slot(
     if not slot:
         raise PhoneError(f"No slot {sid}.")
     requested_username = str(requested_username or "").strip()
+    requested_password = str(requested_password or "")
     if requested_username and USER_RE.fullmatch(requested_username) is None:
         raise PhoneError("Requested batch username has an invalid format.")
+    if requested_password and not requested_username:
+        raise PhoneError("A requested Reddit password requires a requested username.")
+    if requested_password and not validate_requested_password(requested_password):
+        raise PhoneError(
+            "Requested Reddit password must contain 8–128 printable characters."
+        )
     saved_username = str(slot.get("username") or "").strip()
     if requested_username and saved_username and saved_username != requested_username:
         raise PhoneError(
             f"{sid} has a different saved username than this batch requests. "
             "Did not change the account or restart signup."
+        )
+    saved_password = str(slot.get("password") or "")
+    if requested_password and saved_password and saved_password != requested_password:
+        raise PhoneError(
+            f"{sid} already has a different saved password. Did not overwrite or type it."
         )
     if slot_reddit_done(slot):
         _resume_created_cleanup(
@@ -1141,7 +1438,20 @@ def run_slot(
         find_label_exact(initial_nodes, ("Set a password",)) is not None
         and not passkey_prompt(initial_nodes)
     )
-    if resume_verify:
+    if resume_verify and has_saved_credentials:
+        emit(
+            "Resume: post-password Verify with saved credentials; reuse the active "
+            "email and skip Crane, email creation, username, and password."
+        )
+        initial_nodes = _verify_email_after_password(
+            sid, phone, stack, initial_nodes, log_fn=emit, stop=stop
+        )
+        resume_verify = False
+        resume_username = (
+            find_label_exact(initial_nodes, ("Create your username",)) is not None
+        )
+        resume_about = _post_password_about_screen(initial_nodes)
+    elif resume_verify:
         emit("Resume: already on Verify; skip Crane and email submission.")
     elif passkey_prompt(initial_nodes):
         if not slot.get("username") or not slot.get("password"):
@@ -1211,22 +1521,54 @@ def run_slot(
                 log_fn=emit,
                 stop=stop,
             )
-        if find_label_exact(username_nodes, ("Create your username",)) is None:
-            raise PhoneError("Create your username transition was not proven.")
-        if requested_username:
-            use_requested_username(stack, phone, sid, requested_username)
-        else:
-            keep_suggested_username(stack, phone, sid)
-        wait_named(stack, phone, ("Set a password",), "899_pw", stop=stop)
-        type_password(stack, phone, sid)
-        wait_named(
-            stack,
-            phone,
-            ABOUT_MARKERS,
-            "909_about",
-            preview=False,
-            stop=stop,
-        )
+        for credential_round in range(2):
+            if find_label_exact(username_nodes, ("Create your username",)) is None:
+                raise PhoneError("Create your username transition was not proven.")
+            if requested_username:
+                use_requested_username(
+                    stack,
+                    phone,
+                    sid,
+                    requested_username,
+                    username_committer=username_committer,
+                    username_candidate_allowed=username_candidate_allowed,
+                )
+            else:
+                keep_suggested_username(stack, phone, sid)
+            wait_named(stack, phone, ("Set a password",), "899_pw", stop=stop)
+            type_password(stack, phone, sid, requested_password)
+            about_nodes = wait_named(
+                stack,
+                phone,
+                (*ABOUT_MARKERS, "Verify your email"),
+                "909_about",
+                preview=False,
+                stop=stop,
+            )
+            if find_label_exact(about_nodes or [], ("Verify your email",)) is None:
+                break
+            transition_nodes = _verify_email_after_password(
+                sid, phone, stack, about_nodes, log_fn=emit, stop=stop
+            )
+            if find_label_exact(
+                transition_nodes, ("Create your username",)
+            ) is not None:
+                if credential_round:
+                    raise PhoneError(
+                        "Reddit returned to Create your username after two proven "
+                        "credential rounds; preserved the current screen."
+                    )
+                emit(
+                    "Post-password Verify returned to the proven username screen; "
+                    "replaying the saved username/password once."
+                )
+                username_nodes = transition_nodes
+                continue
+            if not _post_password_about_screen(transition_nodes):
+                raise PhoneError(
+                    "Post-password Verify left no proven Username or About screen."
+                )
+            break
     if not resume_interests and not resume_post_interests:
         if birth_date_override is None:
             tap_woman(stack, phone)
@@ -1257,6 +1599,18 @@ def run_slot(
         raise PhoneError(str(exc)) from exc
     if swipe_target:
         mark_reddit_created(sid, log, feed_swipes=swipe_target)
+
+        def recover_from_home(completed: int):
+            return _recover_feed_after_home(
+                sid,
+                slot,
+                phone,
+                stack,
+                completed,
+                stop=stop,
+                emit=emit,
+            )
+
         run_feed_swipes(
             stack,
             phone,
@@ -1270,6 +1624,7 @@ def run_slot(
             initial_proof=feed_proof,
             require_final_proof=True,
             continue_on_unclear=True,
+            recover_from_home=recover_from_home,
             pause_count=feed_pause_count,
             fixed_delay_seconds=fixed_delay_seconds,
         )

@@ -687,26 +687,42 @@ def birthday_regressions() -> None:
     ]
     check("picker-no-adjacent-inference", about.selected_birthday(off_center) is None)
 
-    missing_center_day = saved_dump_nodes("910_birthday_day_2_retry_2")
+    # Frozen copy of the a0119 crash frame: the centered day row is absent
+    # because OCR drops the bold single-digit selection, and the day wheel
+    # cycles 1..31 in every month (31 sits directly above 1 in February).
+    missing_center_day = fixture_nodes("a0119_birthday_missing_centered_day")
     check(
         "picker-saved-dump-missing-centered-day-recovered",
-        about.selected_birthday(missing_center_day) == (4, 11, 2004),
+        about.selected_birthday(missing_center_day) == (1, 2, 2005),
     )
     without_summary = [
-        item for item in missing_center_day if item.text != "4 November 2004"
+        item for item in missing_center_day if item.text != "1 February 2005"
     ]
     check(
         "picker-missing-centered-day-without-summary-rejected",
         about.selected_birthday(without_summary) is None,
     )
-    wrong_summary = [
-        node("7 November 2004", 200, 423, w=288, h=25)
-        if item.text == "4 November 2004" else item
+    # The month and year wheel rows are the independent wheel evidence, so a
+    # disagreeing month or year must still reject the summary. The day itself
+    # has no wheel evidence while OCR hides the centered row; the exact-target
+    # equality in select_configured_birthday still gates the Continue tap.
+    wrong_month = [
+        node("4 December 2005", 185, 426, w=259, h=27)
+        if item.text == "1 February 2005" else item
         for item in missing_center_day
     ]
     check(
-        "picker-missing-centered-day-disagreeing-summary-rejected",
-        about.selected_birthday(wrong_summary) is None,
+        "picker-missing-centered-day-disagreeing-month-rejected",
+        about.selected_birthday(wrong_month) is None,
+    )
+    wrong_year = [
+        node("1 February 2004", 185, 426, w=259, h=27)
+        if item.text == "1 February 2005" else item
+        for item in missing_center_day
+    ]
+    check(
+        "picker-missing-centered-day-disagreeing-year-rejected",
+        about.selected_birthday(wrong_year) is None,
     )
     without_continue = [item for item in missing_center_day if item.text != "Continue"]
     check(
@@ -1759,6 +1775,52 @@ def crane_scroll_regressions() -> None:
         route_error,
     )
 
+    # The live compact submenu repeats the active slot above ``Default`` and
+    # renders the real selectable copy between ``Default`` and
+    # ``New Container``.  The bounded body copy must win even for an
+    # instance-bound slot; the repeated active label is not a duplicate row.
+    compact_haptic_level2 = [
+        node("Remove App", 275, 308, w=196, h=25),
+        node("Share App", 272, 377, w=165, h=26),
+        node("Edit Home Screen", 276, 443, w=271, h=18),
+        node("~ Container", 234, 489, w=208, h=54),
+        node("a0142", 278, 522, w=90, h=24),
+        node("Default", 272, 592, w=124, h=23),
+        node("a0142", 275, 664, w=103, h=23),
+        node("New Container", 272, 737, w=237, h=25),
+    ]
+    compact_target = compact_haptic_level2[6]
+    route_stack = FakeStack()
+    route_logs = []
+    route_dumps = iter((("synthetic", compact_haptic_level2),))
+    open_reddit._transient_dump = lambda *_args, **_kwargs: next(route_dumps)
+    open_reddit.time.sleep = lambda _seconds: None
+    route_error = ""
+    try:
+        route_result = open_reddit._tap_requested_container(
+            route_stack,
+            object(),
+            route_logs.append,
+            "a0142",
+            singular_parent,
+            newest_bound=True,
+        )
+    except Exception as exc:
+        route_result = ""
+        route_error = str(exc)
+    finally:
+        open_reddit._transient_dump = original_transient
+        open_reddit.time.sleep = original_route_sleep
+    check(
+        "crane-instance-bound-compact-haptic-selects-body-copy",
+        not route_error
+        and route_result == "list"
+        and route_stack.taps == [parent_node.center(), compact_target.center()]
+        and route_stack.flicks == []
+        and any("bounded exact container a0142" in item for item in route_logs),
+        route_error,
+    )
+
     # Some Crane builds close the iOS haptic surface after the parent tap and
     # render a short list with a low singular Container label.  The global
     # classifier must remain strict, but this changed second level is proven
@@ -1800,7 +1862,10 @@ def crane_scroll_regressions() -> None:
         and route_stack.taps
         == [parent_node.center(), non_haptic_target.center()]
         and route_stack.flicks == []
-        and any("non-haptic level2 container a0002" in item for item in route_logs),
+        and any(
+            "non-haptic level2 unique exact container a0002" in item
+            for item in route_logs
+        ),
         route_error,
     )
     check(
@@ -1854,9 +1919,10 @@ def crane_scroll_regressions() -> None:
         open_reddit._transient_dump = original_transient
         open_reddit.time.sleep = original_route_sleep
     check(
-        "crane-non-haptic-second-level-one-slot-remains-unproven",
-        "unrecognized second level" in route_error
-        and route_stack.taps == [parent_node.center()]
+        "crane-non-haptic-second-level-one-exact-slot-selects",
+        not route_error
+        and route_result == "list"
+        and route_stack.taps == [parent_node.center(), one_slot_level2[1].center()]
         and route_stack.flicks == [],
         route_error,
     )
@@ -1903,9 +1969,10 @@ def crane_scroll_regressions() -> None:
         open_reddit._transient_dump = original_transient
         open_reddit.time.sleep = original_route_sleep
     check(
-        "crane-instance-bound-non-haptic-shortcut-remains-disabled",
-        "did not open a proven container list" in route_error
-        and route_stack.taps == [parent_node.center()]
+        "crane-instance-bound-non-haptic-unique-exact-row-selects",
+        not route_error
+        and route_result == "list"
+        and route_stack.taps == [parent_node.center(), non_haptic_target.center()]
         and route_stack.flicks == [],
         route_error,
     )
@@ -2707,11 +2774,11 @@ def feed_regressions() -> None:
         switcher_nodes=switcher_titleless,
     )
     check(
-        "feed-titleless-resume-never-flicks-unknown-card",
-        "did not flick an unknown card" in unknown_error.casefold()
+        "feed-titleless-resume-force-close-is-sufficient",
+        not unknown_error
         and not any(isinstance(event, tuple) and event[0] == "flick" for event in unknown_events)
         and ("force", create.REDDIT_BUNDLE) in unknown_events
-        and unknown_checkpoints == [],
+        and unknown_checkpoints == ["app_stopped", "complete"],
         f"{unknown_events!r} {unknown_checkpoints!r} {unknown_error}",
     )
 
@@ -2729,11 +2796,11 @@ def feed_regressions() -> None:
         home_nodes=[node("Unknown screen", 80, 500, w=300)],
     )
     check(
-        "feed-exact-bundle-home-failure-preserves-app-stopped",
-        "iphone home was not proven" in bad_home_error.casefold()
+        "feed-exact-bundle-home-ocr-failure-completes-locally",
+        not bad_home_error
         and bad_home_events[-4:]
         == ["home"] + [("running", create.REDDIT_BUNDLE)] * 3
-        and bad_home_checkpoints == ["app_stopped"],
+        and bad_home_checkpoints == ["app_stopped", "complete"],
         f"{bad_home_events!r} {bad_home_checkpoints!r} {bad_home_error}",
     )
 
@@ -2775,10 +2842,10 @@ def feed_regressions() -> None:
         run_exact_bundle_cleanup(home_frames=[blank_home_transition])
     )
     check(
-        "feed-final-home-three-unproven-frames-preserve-app-stopped",
-        "not proven after 3 fresh dumps" in repeated_blank_error.casefold()
+        "feed-final-home-three-unproven-frames-complete-after-force-close",
+        not repeated_blank_error
         and repeated_blank_events.count(("force", create.REDDIT_BUNDLE)) == 1
-        and repeated_blank_checkpoints == ["app_stopped"],
+        and repeated_blank_checkpoints == ["app_stopped", "complete"],
         f"{repeated_blank_events!r} {repeated_blank_checkpoints!r} "
         f"{repeated_blank_error}",
     )
@@ -2790,10 +2857,10 @@ def feed_regressions() -> None:
         )
     )
     check(
-        "feed-final-home-second-restart-stops-safely",
-        "restarted after the one bounded" in repeated_restart_error.casefold()
+        "feed-final-home-second-restart-completes-after-exact-force-close",
+        not repeated_restart_error
         and repeated_restart_events.count(("force", create.REDDIT_BUNDLE)) == 2
-        and repeated_restart_checkpoints == ["app_stopped"],
+        and repeated_restart_checkpoints == ["app_stopped", "complete"],
         f"{repeated_restart_events!r} {repeated_restart_checkpoints!r} "
         f"{repeated_restart_error}",
     )
@@ -3124,8 +3191,8 @@ def feed_regressions() -> None:
     }
     pending_feed_events, pending_feed_error = run_resume(pending, feed)
     check(
-        "feed-pending-complete-swipes-home-failure-keeps-app-stopped",
-        "iphone home was not proven" in pending_feed_error.casefold()
+        "feed-pending-complete-swipes-home-ocr-failure-completes-locally",
+        not pending_feed_error
         and pending_feed_events[0] == "switcher"
         and pending_feed_events[1][0] == "flick"
         and pending_feed_events[2:]
@@ -3137,6 +3204,7 @@ def feed_regressions() -> None:
             ("running", create.REDDIT_BUNDLE),
             ("running", create.REDDIT_BUNDLE),
             ("running", create.REDDIT_BUNDLE),
+            ("cleanup", "complete"),
         ],
         repr(pending_feed_events),
     )

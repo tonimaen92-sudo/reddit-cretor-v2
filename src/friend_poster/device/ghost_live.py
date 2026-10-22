@@ -16,6 +16,7 @@ import time
 from typing import Callable
 from friend_poster.core.config import GHOST_BUNDLE  # noqa: E402
 from friend_poster.core.slots import (  # noqa: E402
+    CREATION_PROGRESS,
     canonicalize_name,
     ensure_ghost_container_needed,
     get_slot,
@@ -32,6 +33,7 @@ from friend_poster.core.slots import (  # noqa: E402
 )
 from friend_poster.device.ssh_device import Phone, PhoneError  # noqa: E402
 from friend_poster.device.ui_tree import (  # noqa: E402
+    OperationCancelled,
     TapStack,
     collapsed_text,
     dump_named,
@@ -42,6 +44,88 @@ from friend_poster.device.ui_tree import (  # noqa: E402
 os.environ["SKIP_SHOT"] = "1"
 
 LogFn = Callable[[str], None]
+
+ICLOUD_SHEET_TITLE = "Sign in to iCloud"
+APPLE_ID_VERIFICATION_TITLE = "Apple ID Verification"
+
+
+class ICloudModalBlockingError(PhoneError):
+    """An iCloud re-auth modal is overlaying the screen and blocks Ghost.
+
+    Raised instead of a misleading navigation failure (for example "Reddit
+    not found") when the "Sign in to iCloud" sheet is on screen.  The
+    pipeline routes this to a shared pause so the batch does not burn every
+    slot against a modal that will block each of them.
+    """
+
+    failure_code = "icloud_modal_blocking"
+
+
+class ContainerProvisioningReconcileError(PhoneError):
+    """A newly-created Ghost container could not be proven unambiguously.
+
+    This is a pause-only failure.  The durable ``provisioning`` checkpoint and
+    its immutable pre-create UUID baseline are intentionally left intact so a
+    later Retry / Resume can reconcile the same container without another
+    Create or any model-assisted UI recovery.
+    """
+
+    failure_code = "container_provisioning_reconcile_failed"
+
+
+def icloud_modal_present(nodes) -> bool:
+    """True when a verified iCloud re-authentication modal overlays Ghost."""
+    if find_label_exact(nodes, (ICLOUD_SHEET_TITLE,)) is not None:
+        return True
+    return apple_id_verification_modal(nodes) is not None
+
+
+def apple_id_verification_modal(nodes):
+    """Return the safe dismiss button for the exact observed system modal.
+
+    The title alone is insufficient: require the instruction and both actions,
+    with their expected vertical ordering, so an unrelated Settings button can
+    never be tapped as modal recovery.
+    """
+    title = find_label_exact(nodes, (APPLE_ID_VERIFICATION_TITLE,))
+    instruction = find_label_exact(nodes, ("Enter the password for",))
+    not_now = find_label_exact(nodes, ("Not Now",))
+    settings = find_label_exact(nodes, ("Settings",))
+    if None in (title, instruction, not_now, settings):
+        return None
+    tx, ty = title.center()
+    ix, iy = instruction.center()
+    nx, ny = not_now.center()
+    sx, sy = settings.center()
+    if not (500 <= ty <= 720 and ty < iy < ny and abs(ny - sy) <= 45):
+        return None
+    if not (nx < tx < sx and 100 <= nx <= 350 and 400 <= sx <= 650):
+        return None
+    return not_now
+
+
+def dismiss_apple_id_verification_modal(
+    stack: TapStack, phone: Phone, lg: LogFn, nodes
+):
+    """Dismiss one exact Apple-ID overlay and freshly verify it is gone."""
+    not_now = apple_id_verification_modal(nodes)
+    if not_now is None:
+        raise ICloudModalBlockingError(
+            "An iCloud authentication sheet is blocking Ghost, but it did not "
+            "match the verified Apple ID Verification layout; batch paused."
+        )
+    lg("Apple ID Verification blocks Ghost; tapping verified Not Now once.")
+    stack.tap_xy(*not_now.center())
+    time.sleep(0.8)
+    _blob, fresh = dump_named(
+        stack, phone, "621_after_apple_id_not_now", lg, persist=False, preview=False
+    )
+    if icloud_modal_present(fresh):
+        raise ICloudModalBlockingError(
+            "Apple ID Verification remained after one verified Not Now tap; "
+            "batch paused without consuming the queue item."
+        )
+    return fresh
 R_NAME = re.compile(r"^r(\d+)$", re.I)
 INSTANCE_TEXT = re.compile(
     r"^([A-Z0-9]{7,8})(?:-|\s+)[A-Z0-9]{3,}(?:-[A-Z0-9]{3,}){2,}",
@@ -180,8 +264,6 @@ def is_crane_settings(nodes) -> bool:
 def on_containers_list(nodes) -> bool:
     if is_crane_settings(nodes):
         return False
-    if find_label_exact(nodes, ("New Container",)) is not None:
-        return True
     c = find_label_exact(nodes, ("Containers",))
     # Ghost title is y~63. Crane's CONTAINERS section header is y~163.
     return bool(c is not None and c.y < 120)
@@ -618,6 +700,78 @@ def all_container_instances(nodes) -> list[tuple[str, str, object]]:
     return out
 
 
+_GHOST_CONTAINER_CHROME_LABELS = {
+    "containers",
+    "default",
+    "new container",
+    "edit",
+    "done",
+    "x",
+}
+
+
+def _all_user_container_instances(nodes) -> list[tuple[str, str, object]]:
+    """Return every visible non-Default Ghost row with a strict UUID subtitle.
+
+    Unlike :func:`all_container_instances`, this proof parser deliberately
+    includes arbitrary container names.  It is used only by the destructive
+    no-recorded-UUID fallback, where overlooking an old manually named
+    container could make a different slot look like the sole user container.
+    UUID recognition and name/UUID geometry remain just as strict: the UUID
+    must be structurally valid and immediately below its row.
+    """
+    if not on_containers_list(nodes):
+        return []
+    row_nodes = _user_container_row_nodes(nodes)
+
+    uuid_nodes = []
+    for node in nodes:
+        if node.ntype == "ocr-line" or not node.on_screen() or not node.visible:
+            continue
+        instance_id = _instance_id(node.labels())
+        if instance_id is not None:
+            uuid_nodes.append((node, instance_id))
+
+    out: list[tuple[str, str, object]] = []
+    for named in row_nodes:
+        paired = _paired_instance_below(named, uuid_nodes, row_nodes)
+        if paired is None:
+            continue
+        _uuid_node, instance_id = paired
+        out.append((collapsed_text(named.labels()).strip(), instance_id, named))
+    out.sort(key=lambda item: item[2].y)
+    return out
+
+
+def _user_container_row_nodes(nodes) -> list:
+    """Return all visible non-Default row candidates, including unknown names."""
+    if not on_containers_list(nodes):
+        return []
+    title = find_label_exact(nodes, ("Containers",))
+    footer = find_label_exact(nodes, ("New Container",))
+    title_y = title.center()[1] if title is not None else 120
+    footer_y = footer.center()[1] if footer is not None else 1270
+    rows = []
+    for node in nodes:
+        if (
+            node.ntype == "ocr-line"
+            or not node.on_screen()
+            or not node.visible
+            or node.x < 130
+        ):
+            continue
+        text = collapsed_text(node.labels()).strip()
+        if not text or text.casefold() in _GHOST_CONTAINER_CHROME_LABELS:
+            continue
+        center_y = node.center()[1]
+        if center_y <= title_y + 35 or center_y >= footer_y - 20:
+            continue
+        if _instance_id(node.labels()) is not None:
+            continue
+        rows.append(node)
+    return rows
+
+
 def _exact_named_nodes(nodes, name: str) -> list:
     wanted = {collapsed_text(value) for value in name_keys(name)}
     allow_migrated_one = name_to_index(name) == 1 and on_containers_list(nodes)
@@ -721,6 +875,107 @@ def _collect_all_instances(nodes, seen: dict[str, set[str]]) -> bool:
     return not missing
 
 
+def _collect_all_user_container_instances(
+    nodes,
+    seen: dict[str, set[str]],
+    observed_uuid_ids: set[str],
+    paired_uuid_ids: set[str],
+) -> bool:
+    """Collect every non-Default row for the no-UUID destructive proof.
+
+    Arbitrary names are retained verbatim in ``seen`` so the sole-container
+    resolver can count or reject them.  An interior row without a strict UUID
+    is malformed and fails immediately.  UUIDs are tracked separately across
+    the entire boundary-proven traversal so a subtitle whose name is never
+    readable cannot silently disappear from the final inventory.
+    """
+    rows = _user_container_row_nodes(nodes)
+    paired = _all_user_container_instances(nodes)
+    paired_node_ids = {id(node) for _name, _instance, node in paired}
+    missing = [node for node in rows if id(node) not in paired_node_ids]
+    footer = find_label_exact(nodes, ("New Container",))
+
+    def edge_clipped(node) -> bool:
+        return (
+            node.y < 150
+            or node.y > 1100
+            or (footer is not None and node.y + node.h + 70 >= footer.y - 10)
+        )
+
+    if any(not edge_clipped(node) for node in missing):
+        raise PhoneError(
+            "Ghost no-UUID inventory found an unrecognized or malformed user "
+            "container row without a strict paired UUID; refused destructive "
+            "reconciliation."
+        )
+
+    for node in nodes:
+        if node.ntype == "ocr-line" or not node.on_screen() or not node.visible:
+            continue
+        instance_id = _instance_id(node.labels())
+        if instance_id is not None:
+            observed_uuid_ids.add(instance_id)
+    for raw_name, instance_id, _node in paired:
+        seen.setdefault(raw_name, set()).add(instance_id)
+        paired_uuid_ids.add(instance_id)
+    return not missing
+
+
+def _user_container_scan_signature(nodes) -> tuple:
+    """Viewport signature that includes arbitrary and malformed row labels."""
+    rows = tuple(
+        sorted(
+            collapsed_text(node.labels()).strip().casefold()
+            for node in _user_container_row_nodes(nodes)
+        )
+    )
+    uuids = tuple(
+        sorted(
+            instance_id
+            for node in nodes
+            if node.ntype != "ocr-line"
+            and node.on_screen()
+            and node.visible
+            and (instance_id := _instance_id(node.labels())) is not None
+        )
+    )
+    return rows, uuids, bool(find_label_exact(nodes, ("New Container",)))
+
+
+def _scan_progress_ids(nodes) -> set[str]:
+    """Validated container identities proven by one confirmed Containers frame.
+
+    Only a slot-name row paired with its UUID-shaped subtitle counts, exactly as
+    allocation does.  Raw OCR text, status-bar labels, coordinates and
+    unpaired/clipped rows are never identity and so are never progress.
+    """
+    if not on_containers_list(nodes):
+        return set()
+    return {
+        str(instance_id or "").strip().upper()
+        for _name, instance_id, _row in all_container_instances(nodes)
+        if str(instance_id or "").strip()
+    }
+
+
+def _note_scan_progress(nodes, reported: set[str]) -> None:
+    """Count each newly traversed validated container identity once per direction.
+
+    A long list legitimately needs many frames to walk; every identity newly
+    proven by a fresh, confirmed Containers frame is real traversal progress,
+    including for a target-name scan whose target does not exist yet.  The
+    caller keeps one ``reported`` set per scan direction, so re-seeing rows on
+    the way back down can count after the upward pass while a repeated or
+    alternating already-seen frame never resets the inactivity clock.
+    """
+    current = _scan_progress_ids(nodes)
+    fresh = current - reported
+    if not fresh:
+        return
+    reported.update(fresh)
+    CREATION_PROGRESS.note()
+
+
 def scan_all_container_instances(
     stack: TapStack,
     phone: Phone,
@@ -733,19 +988,44 @@ def scan_all_container_instances(
         raise PhoneError("Complete Ghost scan requires the proven Containers list.")
     seen: dict[str, set[str]] = {}
     _collect_all_instances(nodes, seen)
-    previous = _container_scan_signature(nodes)
+    upward_progress: set[str] = set()
+    _note_scan_progress(nodes, upward_progress)
+
+    # The caller passed a fresh top-of-list frame.  Count it as the first
+    # boundary sample: if a single up-flick leaves the signature unchanged,
+    # the list is already at the top and we can avoid a redundant flick.
+    initial_sig = _container_scan_signature(nodes)
+    initial_nodes = nodes
+    previous = initial_sig
     unchanged = 0
-    # A 100-slot batch can require roughly twenty full upward flicks before
-    # the first top frame.  Keep enough room for the two additional unchanged
-    # frames that prove the boundary instead of failing exactly as the top is
-    # reached on a long list.
     for index in range(32):
         stack.check_cancelled()
+        if index == 0:
+            list_flick(stack, toward_bottom=False, big=True)
+            _blob, nodes_after = dump_named(stack, phone, f"{stem}_top_{index}", lg)
+            if not on_containers_list(nodes_after):
+                raise PhoneError("Ghost Containers list disappeared during complete scan.")
+            sig_after = _container_scan_signature(nodes_after)
+            if sig_after == initial_sig:
+                nodes = initial_nodes
+                previous = initial_sig
+                unchanged = 2
+                break
+            nodes = nodes_after
+            _collect_all_instances(nodes, seen)
+            _note_scan_progress(nodes, upward_progress)
+            signature = sig_after
+            unchanged = 0 if signature != previous else 1
+            previous = signature
+            if unchanged >= 2:
+                break
+            continue
         list_flick(stack, toward_bottom=False, big=True)
         _blob, nodes = dump_named(stack, phone, f"{stem}_top_{index}", lg)
         if not on_containers_list(nodes):
             raise PhoneError("Ghost Containers list disappeared during complete scan.")
         _collect_all_instances(nodes, seen)
+        _note_scan_progress(nodes, upward_progress)
         signature = _container_scan_signature(nodes)
         unchanged = unchanged + 1 if signature == previous else 0
         previous = signature
@@ -757,6 +1037,8 @@ def scan_all_container_instances(
     # New Container is a fixed footer and can remain visible while the list is
     # still at the top.  Prove the bottom from two unchanged downward-flick
     # results instead of treating that footer as a boundary marker.
+    downward_progress: set[str] = set()
+    _note_scan_progress(nodes, downward_progress)
     previous = _container_scan_signature(nodes)
     unchanged = 0
     for index in range(32):
@@ -766,6 +1048,7 @@ def scan_all_container_instances(
         if not on_containers_list(nodes):
             raise PhoneError("Ghost Containers list disappeared during complete scan.")
         frame_complete = _collect_all_instances(nodes, seen)
+        _note_scan_progress(nodes, downward_progress)
         signature = _container_scan_signature(nodes)
         unchanged = unchanged + 1 if signature == previous else 0
         previous = signature
@@ -781,6 +1064,107 @@ def scan_all_container_instances(
             )
             return seen, nodes
     raise PhoneError("Complete Ghost scan could not prove a stable bottom boundary.")
+
+
+def scan_all_user_container_instances(
+    stack: TapStack,
+    phone: Phone,
+    lg: LogFn,
+    nodes,
+    stem: str = "741_all_user_container_scan",
+) -> tuple[dict[str, set[str]], list]:
+    """Prove every non-Default Ghost container, including arbitrary names.
+
+    This stricter inventory exists for the destructive no-recorded-UUID
+    fallback only.  The normal allocation scan intentionally remains limited
+    to canonical slot names.  Here, any arbitrary paired name is retained,
+    while malformed rows and UUID subtitles that never acquire a strict row
+    pairing fail closed.
+    """
+    if not on_containers_list(nodes):
+        raise PhoneError(
+            "No-UUID Ghost inventory requires the proven Containers list."
+        )
+    seen: dict[str, set[str]] = {}
+    observed_uuid_ids: set[str] = set()
+    paired_uuid_ids: set[str] = set()
+    _collect_all_user_container_instances(
+        nodes, seen, observed_uuid_ids, paired_uuid_ids
+    )
+
+    initial_signature = _user_container_scan_signature(nodes)
+    initial_nodes = nodes
+    previous = initial_signature
+    unchanged = 0
+    for index in range(32):
+        stack.check_cancelled()
+        list_flick(stack, toward_bottom=False, big=True)
+        _blob, fresh = dump_named(stack, phone, f"{stem}_top_{index}", lg)
+        if not on_containers_list(fresh):
+            raise PhoneError(
+                "Ghost Containers list disappeared during no-UUID inventory proof."
+            )
+        signature = _user_container_scan_signature(fresh)
+        if index == 0 and signature == initial_signature:
+            # Preserve the original frame as the proven top.  It may contain a
+            # less-clipped row than the equivalent post-flick OCR frame.
+            nodes = initial_nodes
+            unchanged = 2
+            break
+        nodes = fresh
+        _collect_all_user_container_instances(
+            nodes, seen, observed_uuid_ids, paired_uuid_ids
+        )
+        unchanged = unchanged + 1 if signature == previous else 0
+        previous = signature
+        if unchanged >= 2:
+            break
+    else:
+        raise PhoneError(
+            "No-UUID Ghost inventory could not prove the top boundary."
+        )
+
+    previous = _user_container_scan_signature(nodes)
+    unchanged = 0
+    frame_complete = True
+    for index in range(32):
+        stack.check_cancelled()
+        list_flick(stack, toward_bottom=True, big=True)
+        _blob, nodes = dump_named(stack, phone, f"{stem}_bottom_{index}", lg)
+        if not on_containers_list(nodes):
+            raise PhoneError(
+                "Ghost Containers list disappeared during no-UUID inventory proof."
+            )
+        frame_complete = _collect_all_user_container_instances(
+            nodes, seen, observed_uuid_ids, paired_uuid_ids
+        )
+        signature = _user_container_scan_signature(nodes)
+        unchanged = unchanged + 1 if signature == previous else 0
+        previous = signature
+        if unchanged >= 2:
+            break
+    else:
+        raise PhoneError(
+            "No-UUID Ghost inventory could not prove the bottom boundary."
+        )
+
+    if not frame_complete:
+        raise PhoneError(
+            "No-UUID Ghost inventory reached the bottom with an unpaired user "
+            "container row; refused destructive reconciliation."
+        )
+    never_paired = observed_uuid_ids - paired_uuid_ids
+    if never_paired:
+        raise PhoneError(
+            "No-UUID Ghost inventory saw UUID subtitle(s) whose user-container "
+            "names could not be proven; refused destructive reconciliation."
+        )
+    lg(
+        "Complete no-UUID Ghost proof found "
+        f"{sum(len(values) for values in seen.values())} non-Default "
+        "container instance(s), including arbitrary names."
+    )
+    return seen, nodes
 
 
 def scan_named_container_instances(
@@ -800,6 +1184,8 @@ def scan_named_container_instances(
         raise PhoneError("Ghost instance scan requires the proven Containers list.")
     seen: set[str] = set()
     _collect_named_instances(nodes, name, seen)
+    upward_progress: set[str] = set()
+    _note_scan_progress(nodes, upward_progress)
 
     previous = _container_scan_signature(nodes)
     unchanged = 0
@@ -812,6 +1198,7 @@ def scan_named_container_instances(
         if not on_containers_list(nodes):
             raise PhoneError("Ghost Containers list disappeared during instance scan.")
         _collect_named_instances(nodes, name, seen)
+        _note_scan_progress(nodes, upward_progress)
         signature = _container_scan_signature(nodes)
         unchanged = unchanged + 1 if signature == previous else 0
         previous = signature
@@ -823,6 +1210,8 @@ def scan_named_container_instances(
     # The fixed New Container footer is visible in top frames too.  Always
     # drive the scroll to a stable bottom before concluding that a name is
     # absent or counting its exact UUID rows.
+    downward_progress: set[str] = set()
+    _note_scan_progress(nodes, downward_progress)
     previous = _container_scan_signature(nodes)
     unchanged = 0
     for index in range(32):
@@ -833,6 +1222,7 @@ def scan_named_container_instances(
         if not on_containers_list(nodes):
             raise PhoneError("Ghost Containers list disappeared during instance scan.")
         frame_complete = _collect_named_instances(nodes, name, seen)
+        _note_scan_progress(nodes, downward_progress)
         signature = _container_scan_signature(nodes)
         unchanged = unchanged + 1 if signature == previous else 0
         previous = signature
@@ -849,6 +1239,70 @@ def scan_named_container_instances(
     raise PhoneError("Ghost instance scan could not prove a stable bottom boundary.")
 
 
+def scan_named_container_instances_down(
+    stack: TapStack,
+    phone: Phone,
+    lg: LogFn,
+    nodes,
+    name: str,
+    stem: str = "624_instance_scan_down",
+) -> tuple[set[str], list]:
+    """Bounded *downward-only* Ghost scan for one exact slot name.
+
+    Ghost appends the newest container at the bottom, so a caller that has
+    already proven the list top (the fresh-create fast path) or only needs the
+    newest row (post-create capture) never has to reverse toward the top.  Every
+    gesture moves toward the bottom until two unchanged frames prove the
+    boundary.  The caller keeps the complete ``scan_named_container_instances``
+    as the fallback whenever this bounded pass cannot prove a complete result.
+    """
+    if not on_containers_list(nodes):
+        raise PhoneError("Ghost instance scan requires the proven Containers list.")
+    seen: set[str] = set()
+    _collect_named_instances(nodes, name, seen)
+    downward_progress: set[str] = set()
+    _note_scan_progress(nodes, downward_progress)
+    previous = _container_scan_signature(nodes)
+    unchanged = 0
+    for index in range(32):
+        stack.check_cancelled()
+        list_flick(stack, toward_bottom=True, big=True)
+        time.sleep(0.45)
+        _blob, nodes = dump_named(stack, phone, f"{stem}_bottom_{index}", lg)
+        if not on_containers_list(nodes):
+            raise PhoneError("Ghost Containers list disappeared during instance scan.")
+        frame_complete = _collect_named_instances(nodes, name, seen)
+        _note_scan_progress(nodes, downward_progress)
+        signature = _container_scan_signature(nodes)
+        unchanged = unchanged + 1 if signature == previous else 0
+        previous = signature
+        if unchanged >= 2:
+            if not frame_complete:
+                raise PhoneError(
+                    f"Ghost reached the list bottom without a complete {name} UUID row."
+                )
+            lg(
+                f"Bounded downward Ghost scan for {name}: "
+                f"{len(seen)} existing exact row(s)."
+            )
+            return seen, nodes
+    raise PhoneError("Ghost instance scan could not prove a stable bottom boundary.")
+
+
+def _containers_list_at_top(nodes) -> bool:
+    """Cheap proof that the visible Containers list starts at its first row.
+
+    ``Default`` is Ghost's built-in first row, so seeing it (at the top of the
+    list body) means no real slot row is scrolled above the viewport and a
+    downward-only pass covers the whole list.  Anything else keeps the complete
+    scan in charge.
+    """
+    if not on_containers_list(nodes):
+        return False
+    default = find_label_exact(nodes, ("Default",))
+    return default is not None and default.y < 300
+
+
 def _instance_node(nodes, name: str, instance_id: str):
     wanted = str(instance_id or "").strip().upper()
     matches = [node for found, node in container_instances(nodes, name) if found == wanted]
@@ -863,11 +1317,445 @@ def reconciled_new_instance(
     current = {str(value or "").strip().upper() for value in current_ids}
     new_ids = current - baseline
     if len(new_ids) != 1:
-        raise PhoneError(
+        raise ContainerProvisioningReconcileError(
             f"Ghost create for {name} produced {len(new_ids)} uniquely reconciled "
             "new instances; expected exactly one. Did not select a duplicate."
         )
     return next(iter(new_ids))
+
+
+def resolve_recorded_instance(instances, recorded: str) -> tuple[str, str]:
+    """Resolve a recorded (possibly truncated) UUID prefix against one name.
+
+    The saved identity is a UUID *prefix* (the first group), so it is only
+    trusted after being matched against a complete, validated inventory:
+
+    ``("exact", value)``     the recorded token equals exactly one instance
+    ``("prefix", value)``    the recorded token is a unique strict prefix
+    ``("absent", "")``       the recorded token matches no instance
+    ``("ambiguous", "")``    the recorded token matches more than one instance
+
+    An ambiguous prefix is never treated as an exact UUID.
+    """
+    want = str(recorded or "").strip().upper()
+    values = {
+        str(value or "").strip().upper()
+        for value in (instances or set())
+        if str(value or "").strip()
+    }
+    if not want:
+        return "absent", ""
+    if want in values:
+        return "exact", want
+    prefixed = sorted(value for value in values if value.startswith(want))
+    if len(prefixed) == 1:
+        return "prefix", prefixed[0]
+    if len(prefixed) > 1:
+        return "ambiguous", ""
+    return "absent", ""
+
+
+def enter_container_edit(stack: TapStack, phone: Phone, lg: LogFn, nodes):
+    """Put the Ghost Containers list into the proven iOS Edit (red-minus) mode."""
+    done = find_label_exact(nodes, ("Done",))
+    if done is not None and done.y < 130:
+        return nodes
+    edit = find_label_exact(nodes, ("Edit",))
+    if edit is None or edit.y >= 130:
+        raise PhoneError("Ghost Containers list has no Edit button. See dump.")
+    stack.tap_xy(*edit.center())
+    time.sleep(0.9)
+    _blob, nodes = dump_named(stack, phone, "744_ghost_edit", lg)
+    if find_label_exact(nodes, ("Edit", "Done")) is None:
+        raise PhoneError("Ghost Edit mode did not open. See 744_ghost_edit.")
+    return nodes
+
+
+def _locate_instance_row(
+    stack: TapStack,
+    phone: Phone,
+    lg: LogFn,
+    nodes,
+    name: str,
+    instance_id: str,
+    stem: str = "743_delete_locate",
+):
+    """Reacquire one exact (name, UUID) row anywhere in the list, bounded."""
+    node = _instance_node(nodes, name, instance_id)
+    if node is not None:
+        return nodes, node
+    for toward_bottom in (False, True):
+        last: tuple[str, ...] | None = None
+        stuck = 0
+        for attempt in range(24):
+            stack.check_cancelled()
+            list_flick(stack, toward_bottom=toward_bottom, big=True)
+            time.sleep(0.4)
+            _blob, nodes = dump_named(
+                stack,
+                phone,
+                f"{stem}_{'down' if toward_bottom else 'up'}_{attempt}",
+                lg,
+            )
+            if not on_containers_list(nodes):
+                raise PhoneError(
+                    "Ghost Containers list disappeared while locating a delete row."
+                )
+            node = _instance_node(nodes, name, instance_id)
+            if node is not None:
+                return nodes, node
+            ids = viewport_ids(nodes)
+            stuck = stuck + 1 if ids == last else 0
+            last = ids
+            if stuck >= 2:
+                break
+    raise PhoneError(
+        f"Could not relocate the exact {name} UUID {instance_id} row for deletion."
+    )
+
+
+def _delete_row_in_edit(
+    stack: TapStack,
+    phone: Phone,
+    lg: LogFn,
+    nodes,
+    name: str,
+    instance_id: str,
+):
+    """Tap the red minus and Delete for one exact (name, UUID) Ghost row."""
+    stack.check_cancelled()
+    nodes = enter_container_edit(stack, phone, lg, nodes)
+    nodes, row = _locate_instance_row(stack, phone, lg, nodes, name, instance_id)
+    if row.y < 140:
+        raise PhoneError(f"Refusing to delete the {name} title-bar row.")
+    mx = max(36, min(row.x - 24, 70))
+    my = row.center()[1]
+    lg(f"TAP red minus to delete {name} at ({mx},{my}) y={row.y}")
+    stack.tap_xy(mx, my)
+    time.sleep(0.7)
+    _blob, nodes = dump_named(stack, phone, "745_ghost_minus", lg)
+    delete = None
+    for candidate in nodes:
+        if candidate.ntype == "ocr-line" or not candidate.on_screen():
+            continue
+        if collapsed_text(candidate.labels()).lower() != "delete":
+            continue
+        if abs(candidate.center()[1] - my) < 50:
+            delete = candidate
+            break
+    if delete is None:
+        delete = find_label_exact(nodes, ("Delete",))
+    if delete is None or abs(delete.center()[1] - my) > 70:
+        raise PhoneError(
+            f"Red Delete button is not on the {name} row. See 745_ghost_minus."
+        )
+    lg(f"TAP red Delete on the {name} row")
+    stack.tap_xy(*delete.center())
+    time.sleep(1.2)
+    _blob, nodes = dump_named(stack, phone, "746_ghost_after_delete", lg)
+    alert = find_label_exact(nodes, ("Delete", "Remove", "Yes"))
+    cancel = find_label_exact(nodes, ("Cancel",))
+    if (
+        alert is not None
+        and cancel is not None
+        and collapsed_text(alert.labels()).lower() != "cancel"
+    ):
+        lg("Alert -> confirm Delete")
+        stack.tap_xy(*alert.center())
+        time.sleep(1.2)
+        _blob, nodes = dump_named(stack, phone, "747_ghost_after_alert", lg)
+    return nodes
+
+
+def delete_named_instance(
+    stack: TapStack,
+    phone: Phone,
+    lg: LogFn,
+    name: str,
+    instance_id: str,
+    stop=None,
+) -> str:
+    """Delete one exact Ghost container and verify it against a full inventory.
+
+    Returns ``"deleted"`` when this call removed the recorded container, or
+    ``"absent"`` when a complete, validated inventory already proves the
+    recorded identity is gone (safe for finishing a pending deletion).  A
+    duplicate name or an ambiguous UUID prefix fails closed without deleting.
+    The disappearance of a row from one viewport is never accepted as proof.
+
+    The current screen is intentionally ignored: this always closes Ghost,
+    reopens the Containers list and proves a complete inventory first, so it is
+    safe to call from a pipeline or a deletion-only resume.
+    """
+    name = canonicalize_name(name)
+    recorded = str(instance_id or "").strip().upper()
+    if not is_slot_name(name):
+        raise PhoneError(f"Bad container name {name!r}")
+    if not recorded:
+        raise PhoneError(f"Refusing to delete {name} without a recorded container UUID.")
+
+    close_ghost_organic(stack, phone, lg)
+    stack.check_cancelled()
+    open_reddit_containers(stack, phone, lg, stop=stop)
+    _blob, nodes = dump_named(stack, phone, f"742_delete_scan_{name}", lg)
+    stop_if_reset(nodes)
+    inventory, nodes = scan_all_container_instances(
+        stack, phone, lg, nodes, stem=f"742_delete_inventory_{name}"
+    )
+    status, matched = resolve_recorded_instance(inventory.get(name) or set(), recorded)
+    if status == "absent":
+        lg(
+            f"DELETE {name}: recorded {recorded} is already absent from a complete "
+            "validated inventory."
+        )
+        return "absent"
+    if status == "ambiguous":
+        raise PhoneError(
+            f"Recorded UUID {recorded} for {name} matches multiple containers; "
+            "refused to delete an ambiguous prefix."
+        )
+    lg(f"DELETE {name}: complete inventory uniquely identifies {matched}; deleting.")
+    nodes = _delete_row_in_edit(stack, phone, lg, nodes, name, matched)
+
+    # A fresh, complete inventory — not one viewport — must prove the exact
+    # container is gone before the deletion may be recorded as complete.
+    close_ghost_organic(stack, phone, lg)
+    stack.check_cancelled()
+    open_reddit_containers(stack, phone, lg, stop=stop)
+    _blob, nodes = dump_named(stack, phone, f"748_delete_verify_{name}", lg)
+    if not on_containers_list(nodes):
+        raise PhoneError("Ghost Containers list is unavailable for deletion verification.")
+    after, _nodes = scan_all_container_instances(
+        stack, phone, lg, nodes, stem=f"748_delete_verify_scan_{name}"
+    )
+    after_ids = {
+        str(value or "").strip().upper() for value in (after.get(name) or set())
+    }
+    if matched in after_ids:
+        raise PhoneError(
+            f"Ghost container {name} UUID {matched} is still present in a complete "
+            "inventory after deletion; deletion was not confirmed."
+        )
+    lg(f"DELETE {name}: {matched} verified absent from a complete inventory.")
+    return "deleted"
+
+
+def _sole_user_container(inventory) -> tuple[str, str] | None:
+    """Return one unambiguous Ghost user-container identity, or fail closed.
+
+    ``scan_all_user_container_instances`` is the authority for this input.  It
+    includes arbitrary non-Default names so they count against sole ownership.
+    Keep the validation here as well so callers cannot accidentally turn a
+    partial or hand-built inventory into a destructive action.
+    """
+    if not isinstance(inventory, dict):
+        raise PhoneError(
+            "Ghost sole-container deletion requires a complete validated inventory."
+        )
+
+    instances: list[tuple[str, str]] = []
+    for raw_name, raw_ids in inventory.items():
+        displayed_name = str(raw_name or "").strip()
+        if displayed_name.casefold() == "default":
+            continue
+        if not displayed_name or not isinstance(raw_ids, (set, frozenset)):
+            raise PhoneError(
+                "Ghost inventory contains a malformed user-container row; "
+                "refused sole-container deletion."
+            )
+        for raw_id in raw_ids:
+            instance_id = str(raw_id or "").strip().upper()
+            if re.fullmatch(r"[A-Z0-9]{7,8}", instance_id) is None:
+                raise PhoneError(
+                    f"Ghost inventory has no full UUID identity for "
+                    f"{displayed_name}; "
+                    "refused sole-container deletion."
+                )
+            instances.append((displayed_name, instance_id))
+
+    if not instances:
+        return None
+    if len(instances) != 1:
+        raise PhoneError(
+            "Ghost inventory contains "
+            f"{len(instances)} user-container instances; expected exactly one and "
+            "did not delete any container."
+        )
+    displayed_name, instance_id = instances[0]
+    lowered = displayed_name.lower()
+    if not is_slot_name(lowered) or canonicalize_name(lowered) != lowered:
+        raise PhoneError(
+            f"Ghost's sole non-Default container has unrecognized name "
+            f"{displayed_name!r}; refused to bind or delete it."
+        )
+    return canonicalize_name(lowered), instance_id
+
+
+def resolve_sole_user_container(
+    stack: TapStack,
+    phone: Phone,
+    lg: LogFn,
+    stop=None,
+    *,
+    expected_name: str | None = None,
+) -> tuple[str, str]:
+    """Resolve exactly one user container from a complete Ghost inventory.
+
+    This is the non-destructive precursor for legacy cleanup checkpoints that
+    have no saved UUID.  It performs a fresh boundary-proven inventory, refuses
+    zero/multiple/malformed rows, optionally binds the sole row to the expected
+    slot name, and returns its full identity without entering Edit mode.
+    """
+    expected = (
+        canonicalize_name(expected_name)
+        if str(expected_name or "").strip()
+        else ""
+    )
+    if expected and not is_slot_name(expected):
+        raise PhoneError(f"Bad expected container name {expected_name!r}.")
+
+    close_ghost_organic(stack, phone, lg)
+    ghost_opened = False
+    try:
+        stack.check_cancelled()
+        if stop is not None and stop.is_set():
+            raise PhoneError("Stopped.")
+        ghost_opened = True
+        open_reddit_containers(stack, phone, lg, stop=stop)
+        _blob, nodes = dump_named(stack, phone, "741_resolve_sole_scan", lg)
+        stop_if_reset(nodes)
+        inventory, _nodes = scan_all_user_container_instances(
+            stack, phone, lg, nodes, stem="741_resolve_sole_inventory"
+        )
+        identity = _sole_user_container(inventory)
+        if identity is None:
+            raise PhoneError(
+                "Ghost inventory contains no user container; without a recorded "
+                "UUID, exact deletion ownership cannot be proven."
+            )
+        name, instance_id = identity
+        if expected and name != expected:
+            raise PhoneError(
+                f"Ghost's sole user container is {name}, not expected {expected}; "
+                "refused to bind or delete it."
+            )
+        lg(
+            f"RESOLVE SOLE: complete inventory uniquely binds {name} to UUID "
+            f"{instance_id}; no destructive action was taken."
+        )
+        return name, instance_id
+    finally:
+        if ghost_opened:
+            if sys.exc_info()[0] is None:
+                close_ghost_organic(stack, phone, lg)
+            else:
+                try:
+                    close_ghost_organic(stack, phone, lg)
+                except Exception as close_exc:
+                    lg(
+                        "RESOLVE SOLE: organic Ghost cleanup after failure also "
+                        f"failed ({type(close_exc).__name__})."
+                    )
+
+
+def delete_sole_user_container(
+    stack: TapStack,
+    phone: Phone,
+    lg: LogFn,
+    stop=None,
+) -> str:
+    """Delete Ghost's sole user container and prove the exact UUID disappeared.
+
+    This recovery-only operation never trusts the current viewport or a saved
+    slot name.  It starts from Home, opens Ghost's Reddit Containers list and
+    performs a complete validated inventory.  Zero user instances is the only
+    state that returns ``"absent"``.  Exactly one canonical ``(name, UUID)``
+    pair may be deleted; multiple or malformed identities fail closed without
+    a destructive tap.  A second close/open and complete inventory must then
+    prove both that exact pair is gone and that the user-container list remains
+    empty before ``"deleted"`` is returned.
+    """
+
+    def check_stopped() -> None:
+        stack.check_cancelled()
+        if stop is not None and stop.is_set():
+            raise PhoneError("Stopped.")
+
+    # Ignore any inherited Ghost screen/scroll state.  The full scan below is
+    # the only authority for deciding whether a destructive gesture is safe.
+    close_ghost_organic(stack, phone, lg)
+    ghost_opened = False
+    try:
+        check_stopped()
+        ghost_opened = True
+        open_reddit_containers(stack, phone, lg, stop=stop)
+        _blob, nodes = dump_named(stack, phone, "742_delete_sole_scan", lg)
+        stop_if_reset(nodes)
+        before, nodes = scan_all_user_container_instances(
+            stack, phone, lg, nodes, stem="742_delete_sole_inventory"
+        )
+        identity = _sole_user_container(before)
+        if identity is None:
+            lg(
+                "DELETE SOLE: complete validated Ghost inventory proves that "
+                "no user container remains."
+            )
+            return "absent"
+
+        name, instance_id = identity
+        check_stopped()
+        lg(
+            "DELETE SOLE: complete inventory uniquely identifies "
+            f"{name} UUID {instance_id}; deleting that exact row."
+        )
+        _delete_row_in_edit(stack, phone, lg, nodes, name, instance_id)
+
+        # Discard every post-tap viewport assumption.  Reopen Ghost and prove
+        # the full list again before reporting a destructive action as done.
+        close_ghost_organic(stack, phone, lg)
+        ghost_opened = False
+        check_stopped()
+        ghost_opened = True
+        open_reddit_containers(stack, phone, lg, stop=stop)
+        _blob, nodes = dump_named(stack, phone, "748_delete_sole_verify", lg)
+        stop_if_reset(nodes)
+        after, _nodes = scan_all_user_container_instances(
+            stack, phone, lg, nodes, stem="748_delete_sole_verify_inventory"
+        )
+        remaining = _sole_user_container(after)
+        if remaining == identity:
+            raise PhoneError(
+                f"Ghost container {name} UUID {instance_id} is still present in "
+                "the complete inventory after deletion; deletion was not confirmed."
+            )
+        if remaining is not None:
+            other_name, other_id = remaining
+            raise PhoneError(
+                f"Ghost container {name} UUID {instance_id} disappeared, but "
+                f"unexpected user container {other_name} UUID {other_id} remains; "
+                "sole-container cleanup was not confirmed."
+            )
+        lg(
+            f"DELETE SOLE: {name} UUID {instance_id} verified absent and the "
+            "complete user-container inventory is empty."
+        )
+        return "deleted"
+    finally:
+        if ghost_opened:
+            if sys.exc_info()[0] is None:
+                # A successful/absent outcome is not complete until Ghost is
+                # organically closed; surface a close failure to the caller.
+                close_ghost_organic(stack, phone, lg)
+            else:
+                # Preserve the primary safety failure if best-effort cleanup
+                # also has trouble with the live UI.
+                try:
+                    close_ghost_organic(stack, phone, lg)
+                except Exception as close_exc:
+                    lg(
+                        "DELETE SOLE: organic Ghost cleanup after failure also "
+                        f"failed ({type(close_exc).__name__})."
+                    )
 
 
 def _fresh_safe_instance_node(
@@ -910,6 +1798,55 @@ def _fresh_safe_instance_node(
     if named.y < 150 or named.y + named.h > 1100:
         raise PhoneError(f"Exact {name} UUID row remains clipped or edge-unsafe.")
     return fresh, named
+
+
+def _reacquire_recorded_instance_frame(
+    stack: TapStack,
+    phone: Phone,
+    lg: LogFn,
+    nodes,
+    name: str,
+    instance_id: str,
+):
+    """Return a fresh Containers frame containing one exact recorded row.
+
+    :func:`scan_all_container_instances` deliberately finishes at the stable
+    list bottom.  A previously recorded container can therefore be present in
+    the validated inventory without remaining in the final viewport.  Walk
+    back toward the proven top, accepting only the exact name/UUID pair that
+    was resolved from that inventory.  No same-name or coordinate-only row is
+    ever accepted.
+    """
+    wanted = str(instance_id or "").strip().upper()
+    if _instance_node(nodes, name, wanted) is not None:
+        return nodes
+
+    previous = _container_scan_signature(nodes)
+    unchanged = 0
+    for index in range(32):
+        stack.check_cancelled()
+        list_flick(stack, toward_bottom=False, big=True)
+        _blob, fresh = dump_named(
+            stack, phone, f"641_recorded_reacquire_{index}", lg
+        )
+        if not on_containers_list(fresh):
+            raise PhoneError(
+                "Ghost Containers list disappeared while reacquiring the "
+                "recorded container."
+            )
+        if _instance_node(fresh, name, wanted) is not None:
+            return fresh
+        signature = _container_scan_signature(fresh)
+        unchanged = unchanged + 1 if signature == previous else 0
+        previous = signature
+        nodes = fresh
+        if unchanged >= 2:
+            break
+
+    raise PhoneError(
+        f"Ghost complete inventory contained {name} UUID {wanted}, but its exact "
+        "row could not be freshly reacquired; did not select another row."
+    )
 
 
 def _proven_reddit_settings(nodes, name: str) -> bool:
@@ -998,6 +1935,87 @@ def _select_named_node(
         )
 
 
+def select_recorded_container(
+    stack: TapStack,
+    phone: Phone,
+    lg: LogFn,
+    name: str,
+    instance_id: str,
+    stop=None,
+) -> str:
+    """Select and locally verify one saved Ghost container identity.
+
+    The saved identity can be the short UUID prefix persisted by older runs.
+    It is trusted only after a complete, validated Ghost inventory resolves it
+    to one exact instance.  Selection then reacquires that exact name/UUID row
+    and relies on :func:`_select_named_node` to prove the resulting Reddit
+    settings page names the requested active container.  Ghost is exited
+    organically on success and after every post-open failure.
+    """
+    name = canonicalize_name(name)
+    recorded = str(instance_id or "").strip().upper()
+    if not is_slot_name(name):
+        raise PhoneError(f"Bad container name {name!r}")
+    if not recorded:
+        raise PhoneError(
+            f"Refusing to select {name} without a recorded container UUID."
+        )
+
+    # Start from a known Home state exactly like the UUID-bound deletion SOP.
+    close_ghost_organic(stack, phone, lg)
+    ghost_opened = False
+    try:
+        stack.check_cancelled()
+        if stop is not None and stop.is_set():
+            raise PhoneError("Stopped.")
+        ghost_opened = True
+        open_reddit_containers(stack, phone, lg, stop=stop)
+        _blob, nodes = dump_named(stack, phone, f"640_select_scan_{name}", lg)
+        stop_if_reset(nodes)
+        inventory, nodes = scan_all_container_instances(
+            stack, phone, lg, nodes, stem=f"640_select_inventory_{name}"
+        )
+        status, matched = resolve_recorded_instance(
+            inventory.get(name) or set(), recorded
+        )
+        if status == "absent":
+            raise PhoneError(
+                f"Recorded UUID {recorded} for {name} is absent from the complete "
+                "validated Ghost inventory; did not select another container."
+            )
+        if status == "ambiguous":
+            raise PhoneError(
+                f"Recorded UUID {recorded} for {name} matches multiple containers; "
+                "refused to select an ambiguous prefix."
+            )
+
+        stack.check_cancelled()
+        if stop is not None and stop.is_set():
+            raise PhoneError("Stopped.")
+        nodes = _reacquire_recorded_instance_frame(
+            stack, phone, lg, nodes, name, matched
+        )
+        lg(
+            f"SELECT {name}: complete inventory uniquely resolved recorded "
+            f"identity to {matched}; selecting that exact row."
+        )
+        _select_named_node(stack, phone, lg, nodes, name, matched)
+        lg(f"SELECT {name}: exact active container {matched} locally verified.")
+    except Exception:
+        if ghost_opened:
+            try:
+                close_ghost_organic(stack, phone, lg)
+            except Exception as close_exc:
+                lg(
+                    f"SELECT {name}: organic Ghost cleanup after failure also "
+                    f"failed ({type(close_exc).__name__})."
+                )
+        raise
+
+    close_ghost_organic(stack, phone, lg)
+    return matched
+
+
 def select_named(stack: TapStack, phone: Phone, lg: LogFn, nodes, name: str) -> None:
     current, nodes = scan_named_container_instances(
         stack, phone, lg, nodes, name, stem="641_existing_scan"
@@ -1080,11 +2098,23 @@ def create_named(
     name: str,
     *,
     baseline_ids: set[str] | None = None,
+    stop=None,
 ) -> str:
     if baseline_ids is None:
         raise PhoneError(
             f"Refusing to create {name} without a complete pre-create UUID baseline."
         )
+    # Each finite, verified container-preparation milestone counts at most once
+    # per create.  Issuing a tap or text command alone is never progress; only a
+    # freshly dumped screen that proves the step does.
+    milestones: set[str] = set()
+
+    def mark_milestone(label: str) -> None:
+        if label in milestones:
+            return
+        milestones.add(label)
+        CREATION_PROGRESS.note()
+
     nc = must(nodes, ("New Container",))
     nx, ny = nc.center()
     stack.tap_xy(nx, min(ny - 50, 1200))
@@ -1095,6 +2125,7 @@ def create_named(
     field = find_label(nodes, ("Enter the name",))
     if field is None:
         raise PhoneError("Name field not on screen.")
+    mark_milestone("naming_dialog")
     stack.tap_row(field)
     time.sleep(0.3)
     stack.type_text_block(name)
@@ -1109,26 +2140,178 @@ def create_named(
         blob, nodes = dump_named(stack, phone, "626_named_retry", lg)
     if find_label_exact(nodes, name_keys(name)) is None:
         raise PhoneError("Typed name did not appear in the field.")
-    stack.tap_xy(*must(nodes, ("Create",)).center())
-    time.sleep(0.9)
-    current, nodes = scan_named_container_instances(
-        stack,
-        phone,
-        lg,
-        nodes=dump_named(stack, phone, "627_after_create", lg)[1],
-        name=name,
-        stem="627_reconcile",
-    )
-    instance_id = reconciled_new_instance(current, baseline_ids, name)
-    _select_named_node(stack, phone, lg, nodes, name, instance_id)
+    mark_milestone("name_confirmed")
+    try:
+        stack.tap_xy(*must(nodes, ("Create",)).center())
+        time.sleep(0.9)
+        # Ghost normally leaves the newly-created row visible.  Inspect that
+        # fresh frame first and select the sole new UUID immediately; do not
+        # issue boundary-proof flicks when the exact row is already on screen.
+        after_create = dump_named(stack, phone, "627_after_create", lg)[1]
+    except OperationCancelled:
+        raise
+    except PhoneError as exc:
+        if stop is not None and stop.is_set():
+            raise OperationCancelled("Stopped.") from exc
+        raise ContainerProvisioningReconcileError(
+            f"Ghost Create was issued for {name}, but its result could not be "
+            f"locally inspected: {exc}. Preserved provisioning state."
+        ) from exc
+    if not on_containers_list(after_create):
+        # Ghost 1.5 can return to SpringBoard after a successful Create.  That
+        # frame says nothing about whether the new instance exists, so never
+        # scroll it and never hand it to generic/AI recovery.  Re-enter Ghost
+        # through the verified local router, capture a fresh Containers frame,
+        # and compare a complete exact-name inventory with the immutable
+        # baseline that was persisted before the single Create tap.
+        lg(
+            f"{name}: post-create frame is not proven Containers; "
+            "deterministically reopening Ghost for exact UUID reconciliation."
+        )
+        try:
+            stack.check_cancelled()
+            open_reddit_containers(stack, phone, lg, stop=stop)
+            stack.check_cancelled()
+            _blob, reopened = dump_named(
+                stack, phone, "627_reconcile_reopened", lg
+            )
+            stop_if_reset(reopened)
+            if not on_containers_list(reopened):
+                raise ContainerProvisioningReconcileError(
+                    f"Ghost reopened after creating {name}, but a fresh frame did "
+                    "not prove the Containers list. Preserved provisioning state."
+                )
+            current, reconciled_nodes = scan_named_container_instances(
+                stack,
+                phone,
+                lg,
+                reopened,
+                name,
+                stem="627_reconcile_reopened_scan",
+            )
+            instance_id = reconciled_new_instance(current, baseline_ids, name)
+            if _instance_node(reconciled_nodes, name, instance_id) is None:
+                raise ContainerProvisioningReconcileError(
+                    f"Ghost reconciled UUID {instance_id} for {name} after reopen, "
+                    "but its exact row is not visible in the verified final frame. "
+                    "Preserved provisioning state without selecting or guessing."
+                )
+            mark_milestone("instance_reconciled")
+            _select_named_node(
+                stack, phone, lg, reconciled_nodes, name, instance_id
+            )
+            return instance_id
+        except (OperationCancelled, ICloudModalBlockingError):
+            raise
+        except ContainerProvisioningReconcileError:
+            raise
+        except PhoneError as exc:
+            if stop is not None and stop.is_set():
+                raise OperationCancelled("Stopped.") from exc
+            raise ContainerProvisioningReconcileError(
+                f"Could not deterministically reopen and reconcile the newly-created "
+                f"Ghost container {name}: {exc}. Preserved provisioning state."
+            ) from exc
+
+    visible_ids = {
+        str(value or "").strip().upper()
+        for value, _node in container_instances(after_create, name)
+        if str(value or "").strip()
+    }
+    visible_new = visible_ids - {
+        str(value or "").strip().upper()
+        for value in baseline_ids
+        if str(value or "").strip()
+    }
+    if len(visible_new) > 1:
+        raise ContainerProvisioningReconcileError(
+            f"Ghost create for {name} showed multiple new UUID rows in the first "
+            "post-create frame; did not scroll or select an ambiguous container."
+        )
+    if len(visible_new) == 1:
+        instance_id = next(iter(visible_new))
+        if _instance_node(after_create, name, instance_id) is None:
+            raise ContainerProvisioningReconcileError(
+                f"Ghost create for {name} exposed UUID {instance_id} without one "
+                "verified matching row; did not scroll or guess."
+            )
+        lg(f"{name}: new UUID row already visible -> selecting immediately without a scroll.")
+        mark_milestone("instance_reconciled")
+        try:
+            _select_named_node(stack, phone, lg, after_create, name, instance_id)
+        except OperationCancelled:
+            raise
+        except PhoneError as exc:
+            raise ContainerProvisioningReconcileError(
+                f"Ghost could not locally verify selection of newly-created {name} "
+                f"UUID {instance_id}: {exc}. Preserved provisioning state."
+            ) from exc
+        return instance_id
+    try:
+        current, nodes = scan_named_container_instances_down(
+            stack, phone, lg, after_create, name, stem="627_reconcile"
+        )
+        instance_id = reconciled_new_instance(current, baseline_ids, name)
+    except OperationCancelled:
+        raise
+    except PhoneError as exc:
+        lg(
+            f"{name}: bounded post-create capture inconclusive ({exc}); "
+            "re-running the complete named scan."
+        )
+        try:
+            _blob, nodes = dump_named(stack, phone, "627_reconcile_restart", lg)
+            current, nodes = scan_named_container_instances(
+                stack, phone, lg, nodes, name, stem="627_reconcile_full"
+            )
+            instance_id = reconciled_new_instance(current, baseline_ids, name)
+        except OperationCancelled:
+            raise
+        except ContainerProvisioningReconcileError:
+            raise
+        except PhoneError as full_exc:
+            raise ContainerProvisioningReconcileError(
+                f"Complete post-create reconciliation failed for {name}: "
+                f"{full_exc}. Preserved provisioning state."
+            ) from full_exc
+    if _instance_node(nodes, name, instance_id) is None:
+        raise ContainerProvisioningReconcileError(
+            f"Ghost reconciled UUID {instance_id} for {name}, but its exact row is "
+            "not visible in the verified final frame; did not select or guess."
+        )
+    mark_milestone("instance_reconciled")
+    try:
+        _select_named_node(stack, phone, lg, nodes, name, instance_id)
+    except OperationCancelled:
+        raise
+    except PhoneError as exc:
+        raise ContainerProvisioningReconcileError(
+            f"Ghost could not locally verify selection of newly-created {name} "
+            f"UUID {instance_id}: {exc}. Preserved provisioning state."
+        ) from exc
     return instance_id
 
 
-def open_reddit_containers(stack: TapStack, phone: Phone, lg: LogFn, stop=None) -> None:
+def open_reddit_containers(
+    stack: TapStack,
+    phone: Phone,
+    lg: LogFn,
+    stop=None,
+    *,
+    _modal_recovery_used: bool = False,
+) -> None:
     """Route any known Ghost entry screen to Reddit's Containers list."""
     _, nodes = dump_named(
         stack, phone, "621_now", lg, persist=False, preview=False
     )
+    if apple_id_verification_modal(nodes) is not None and not _modal_recovery_used:
+        nodes = dismiss_apple_id_verification_modal(stack, phone, lg, nodes)
+        _modal_recovery_used = True
+    elif icloud_modal_present(nodes):
+        raise ICloudModalBlockingError(
+            "An iCloud authentication sheet is overlaying the screen and blocks "
+            "Ghost navigation; batch paused without consuming the queue item."
+        )
     state, nodes = route_ghost_screen(stack, phone, lg, nodes, stop=stop)
     if state == "containers":
         lg("Already on Ghost Containers list.")
@@ -1162,6 +2345,20 @@ def open_reddit_containers(stack: TapStack, phone: Phone, lg: LogFn, stop=None) 
             blob, nodes = dump_named(stack, phone, "622_search_reddit", lg)
             reddit = find_label_exact(nodes, ("Reddit",))
     if reddit is None:
+        if icloud_modal_present(nodes):
+            if apple_id_verification_modal(nodes) is not None and not _modal_recovery_used:
+                dismiss_apple_id_verification_modal(stack, phone, lg, nodes)
+                return open_reddit_containers(
+                    stack,
+                    phone,
+                    lg,
+                    stop=stop,
+                    _modal_recovery_used=True,
+                )
+            raise ICloudModalBlockingError(
+                "An iCloud authentication sheet is overlaying Ghost and blocked "
+                "Reddit navigation; batch paused without consuming the queue item."
+            )
         raise PhoneError("Reddit not found in Ghost Application List, User Apps, or search.")
     repair_stale_crane_reddit_active(phone, lg)
     stack.tap_row(reddit)
@@ -1223,7 +2420,7 @@ def apply_one_container(
         nodes = ensure_new_container(stack, phone, lg, nodes)
         lg(f"Creating Ghost container {name}")
         instance_id = create_named(
-            stack, phone, lg, nodes, name, baseline_ids=baseline_ids
+            stack, phone, lg, nodes, name, baseline_ids=baseline_ids, stop=stop
         )
     else:
         lg(f"{name} already on list -> tap it, Formulate identifiers, Advanced")
@@ -1267,17 +2464,37 @@ def configure_existing_slot_container(
     """
     stack.check_cancelled()
     if stop and stop.is_set():
-        raise PhoneError("Stopped.")
-    _select_named_node(stack, phone, lg, nodes, name, instance_id)
-    lg("ENABLE left alone (do not toggle).")
-    stack.check_cancelled()
-    formulate_named(stack, phone, lg, name)
-    stack.check_cancelled()
-    advanced_named(stack, phone, lg)
-    stack.check_cancelled()
-    upsert_ghost(name, lg)
-    stack.check_cancelled()
-    mark_ghost_container_ready(name, instance_id, lg)
+        raise OperationCancelled("Stopped.")
+    try:
+        _select_named_node(stack, phone, lg, nodes, name, instance_id)
+        lg("ENABLE left alone (do not toggle).")
+        stack.check_cancelled()
+        formulate_named(stack, phone, lg, name)
+        stack.check_cancelled()
+        advanced_named(stack, phone, lg)
+        stack.check_cancelled()
+    except (OperationCancelled, ICloudModalBlockingError):
+        raise
+    except ContainerProvisioningReconcileError:
+        raise
+    except PhoneError as exc:
+        raise ContainerProvisioningReconcileError(
+            f"Could not deterministically configure exact existing {name} UUID "
+            f"{instance_id}: {exc}. Preserved the container and slot without "
+            "using Anthropic."
+        ) from exc
+    try:
+        upsert_ghost(name, lg)
+        stack.check_cancelled()
+        mark_ghost_container_ready(name, instance_id, lg)
+    except OperationCancelled:
+        raise
+    except Exception as exc:
+        raise ContainerProvisioningReconcileError(
+            f"Could not persist verified Ghost container {name} UUID "
+            f"{instance_id}: {exc}. Preserved the container and slot without "
+            "using Anthropic."
+        ) from exc
     close_ghost_organic(stack, phone, lg)
     return instance_id
 
@@ -1288,6 +2505,9 @@ def provision_slot_container(
     lg: LogFn,
     name: str,
     stop=None,
+    *,
+    inventory: dict[str, set[str]] | None = None,
+    nodes=None,
 ) -> str:
     """Create or reconcile exactly one pending Ghost instance for a slot.
 
@@ -1295,83 +2515,229 @@ def provision_slot_container(
     Create.  ``provisioning`` reuses that immutable baseline after an
     interrupted run: zero new instances resumes Create, one resumes its exact
     UUID row, and any ambiguity stops without selecting an older duplicate.
+
+    A Create is allowed only after a fresh, boundary-proven *complete* Ghost
+    inventory proves that the exact name is absent.  The caller may pass that
+    inventory and its proven bottom ``nodes`` frame while it is still
+    unmutated.  Otherwise this function closes/reopens Ghost and obtains a new
+    complete inventory itself; a cheaper exact-name-only scan is deliberately
+    insufficient for creation.
     """
     name = canonicalize_name(name)
     row = get_slot(name)
     if row is None:
-        raise PhoneError(f"No slot {name}.")
+        raise ContainerProvisioningReconcileError(
+            f"No durable slot row exists for Ghost provisioning of {name}; "
+            "did not create a container or use Anthropic."
+        )
     state = ghost_container_state(row)
     if state == "ready":
         return str(row.get("ghost_container_instance") or "")
     if state not in ("needed", "provisioning"):
-        raise PhoneError(f"Unsupported Ghost provisioning state {state!r} for {name}.")
+        raise ContainerProvisioningReconcileError(
+            f"Unsupported durable Ghost provisioning state {state!r} for {name}; "
+            "did not create a container or use Anthropic."
+        )
     if stop and stop.is_set():
-        raise PhoneError("Stopped.")
+        raise OperationCancelled("Stopped.")
 
     lg(f"{name}: reconcile newest Ghost container before Reddit creation.")
-    close_ghost_organic(stack, phone, lg)
-    open_reddit_containers(stack, phone, lg, stop=stop)
-    _blob, nodes = dump_named(stack, phone, f"624_provision_{name}", lg)
-    stop_if_reset(nodes)
-    current_ids, nodes = scan_named_container_instances(
-        stack, phone, lg, nodes, name, stem=f"624_provision_scan_{name}"
-    )
+    if inventory is None:
+        try:
+            close_ghost_organic(stack, phone, lg)
+            open_reddit_containers(stack, phone, lg, stop=stop)
+            _blob, nodes = dump_named(stack, phone, f"624_provision_{name}", lg)
+            stop_if_reset(nodes)
+            inventory, nodes = scan_all_container_instances(
+                stack, phone, lg, nodes, stem=f"624_provision_scan_{name}"
+            )
+        except (OperationCancelled, ICloudModalBlockingError):
+            raise
+        except ContainerProvisioningReconcileError:
+            raise
+        except PhoneError as exc:
+            raise ContainerProvisioningReconcileError(
+                f"Could not obtain a fresh boundary-proven complete Ghost "
+                f"inventory before provisioning {name}: {exc}. Did not create "
+                "a container or use Anthropic."
+            ) from exc
+        current_ids = {
+            str(value or "").strip().upper()
+            for value in (inventory.get(name) or set())
+            if str(value or "").strip()
+        }
+    else:
+        if nodes is None:
+            raise ContainerProvisioningReconcileError(
+                f"Reusing a complete inventory for {name} requires its proven "
+                "list frame; did not create a container or use Anthropic."
+            )
+        current_ids = {
+            str(value or "").strip().upper()
+            for value in (inventory.get(name) or set())
+            if str(value or "").strip()
+        }
+        lg(
+            f"{name}: reusing the complete allocation inventory "
+            f"({len(current_ids)} existing exact row(s)); skipped a second full scan."
+        )
 
     if state == "needed":
+        if current_ids:
+            raise ContainerProvisioningReconcileError(
+                f"Fresh complete Ghost inventory already contains {len(current_ids)} "
+                f"exact {name} instance(s); refused to Create over an existing "
+                "container. Preserved the slot without using Anthropic."
+            )
         baseline_ids = set(current_ids)
         stack.check_cancelled()
         try:
             mark_ghost_container_provisioning(name, baseline_ids, lg)
-        except ValueError as exc:
-            raise PhoneError(str(exc)) from exc
+        except Exception as exc:
+            raise ContainerProvisioningReconcileError(
+                f"Could not persist the pre-Create Ghost inventory proof for "
+                f"{name}: {exc}. Did not create a container or use Anthropic."
+            ) from exc
         new_ids: set[str] = set()
     else:
+        raw_baseline = row.get("ghost_container_baseline", [])
+        if not isinstance(raw_baseline, (list, tuple, set, frozenset)):
+            raise ContainerProvisioningReconcileError(
+                f"Durable Ghost provisioning baseline for {name} is malformed; "
+                "did not create a container or use Anthropic."
+            )
         baseline_ids = {
             str(value or "").strip().upper()
-            for value in row.get("ghost_container_baseline", [])
+            for value in raw_baseline
             if str(value or "").strip()
         }
         new_ids = current_ids - baseline_ids
         if len(new_ids) > 1:
-            raise PhoneError(
+            raise ContainerProvisioningReconcileError(
                 f"{name} provisioning found multiple new Ghost instances; "
-                "did not choose an ambiguous duplicate."
+                "did not choose an ambiguous duplicate or use Anthropic."
             )
 
     if new_ids:
         instance_id = next(iter(new_ids))
         named = _instance_node(nodes, name, instance_id)
         if named is None:
-            raise PhoneError(
+            raise ContainerProvisioningReconcileError(
                 f"Newest {name} Ghost instance is not visible at the proven list bottom; "
-                "did not select an older duplicate."
+                "did not select an older duplicate or use Anthropic."
             )
         lg(f"{name}: resume the one reconciled newest Ghost instance.")
-        _select_named_node(stack, phone, lg, nodes, name, instance_id)
+        try:
+            _select_named_node(stack, phone, lg, nodes, name, instance_id)
+        except OperationCancelled:
+            raise
+        except PhoneError as exc:
+            raise ContainerProvisioningReconcileError(
+                f"Could not locally verify exact resumed {name} UUID {instance_id}: "
+                f"{exc}. Preserved provisioning state without using Anthropic."
+            ) from exc
     else:
-        nodes = ensure_new_container(stack, phone, lg, nodes)
-        lg(f"Creating one new Ghost container {name} despite older duplicates")
-        instance_id = create_named(
-            stack,
-            phone,
-            lg,
-            nodes,
-            name,
-            baseline_ids=baseline_ids,
-        )
+        if current_ids:
+            raise ContainerProvisioningReconcileError(
+                f"Fresh complete Ghost inventory contains exact {name} rows but "
+                "none is a uniquely reconciled new instance; refused another "
+                "Create and preserved provisioning state without using Anthropic."
+            )
+        try:
+            nodes = ensure_new_container(stack, phone, lg, nodes)
+            lg(
+                f"{name}: fresh complete inventory proves exact name absent; "
+                "issuing the single permitted Create."
+            )
+            instance_id = create_named(
+                stack,
+                phone,
+                lg,
+                nodes,
+                name,
+                baseline_ids=baseline_ids,
+                stop=stop,
+            )
+        except (OperationCancelled, ICloudModalBlockingError):
+            raise
+        except ContainerProvisioningReconcileError:
+            raise
+        except PhoneError as exc:
+            raise ContainerProvisioningReconcileError(
+                f"Could not safely complete the single local Create attempt for "
+                f"{name}: {exc}. Preserved provisioning state without using "
+                "Anthropic."
+            ) from exc
 
     lg("ENABLE left alone (do not toggle).")
     stack.check_cancelled()
-    formulate_named(stack, phone, lg, name)
-    stack.check_cancelled()
-    advanced_named(stack, phone, lg)
-    stack.check_cancelled()
+    try:
+        formulate_named(stack, phone, lg, name)
+        stack.check_cancelled()
+        advanced_named(stack, phone, lg)
+        stack.check_cancelled()
+    except (OperationCancelled, ICloudModalBlockingError):
+        raise
+    except ContainerProvisioningReconcileError:
+        raise
+    except PhoneError as exc:
+        raise ContainerProvisioningReconcileError(
+            f"Could not deterministically finish Ghost configuration for exact "
+            f"{name} UUID {instance_id}: {exc}. Preserved provisioning state "
+            "without using Anthropic."
+        ) from exc
     try:
         mark_ghost_container_ready(name, instance_id, lg)
-    except ValueError as exc:
-        raise PhoneError(str(exc)) from exc
+    except Exception as exc:
+        raise ContainerProvisioningReconcileError(
+            f"Could not persist verified Ghost container {name} UUID "
+            f"{instance_id}: {exc}. Preserved provisioning state without using "
+            "Anthropic."
+        ) from exc
     close_ghost_organic(stack, phone, lg)
     return instance_id
+
+
+def invalidate_ghost_container_cache(stack: TapStack, lg: LogFn) -> str:
+    """Stop the exact Ghost process before trusting its container inventory.
+
+    Crane Settings can delete a container while Ghost remains alive in the
+    background.  On the live device Ghost then continued to render its cached
+    deleted row even though Crane's preferences had already proved that UUID
+    absent.  ``TapStack.clear_app_memory`` is bundle-bound and verifies that
+    the exact process stopped, so a subsequent Ghost open must reload Crane's
+    current inventory instead of carrying that stale view into Create.
+
+    This is deliberately local and deterministic.  A failed or unavailable
+    cache clear is a hard provisioning failure; it is never delegated to AI.
+    """
+    stack.check_cancelled()
+    clear = getattr(stack, "clear_app_memory", None)
+    if not callable(clear):
+        raise ContainerProvisioningReconcileError(
+            "Ghost inventory refresh requires verified exact-bundle process control; "
+            "preserved the provisioning checkpoint without using Anthropic."
+        )
+    try:
+        outcome = str(clear(GHOST_BUNDLE) or "").strip().lower()
+    except OperationCancelled:
+        raise
+    except Exception as exc:
+        raise ContainerProvisioningReconcileError(
+            "Ghost's exact process cache could not be invalidated before reading "
+            "the container inventory; preserved the provisioning checkpoint "
+            "without using Anthropic."
+        ) from exc
+    if outcome not in {"already-stopped", "graceful-quit", "force-close"}:
+        raise ContainerProvisioningReconcileError(
+            f"Ghost inventory refresh returned unverified outcome {outcome!r}; "
+            "preserved the provisioning checkpoint without using Anthropic."
+        )
+    lg(
+        "GHOST_CACHE_INVALIDATED=" + outcome
+        + "; next container inventory will be loaded by a fresh Ghost process."
+    )
+    return outcome
 
 
 def apply_reddit_containers(
@@ -1389,15 +2755,37 @@ def apply_reddit_containers(
     reused: list[str] = []
     count = max(1, min(int(count), 10))
 
-    lg("Close leftover Ghost, then scan the complete Reddit container list.")
-    close_ghost_organic(stack, phone, lg)
-    stack.check_cancelled()
-    open_reddit_containers(stack, phone, lg, stop=stop)
-    _blob, nodes = dump_named(stack, phone, "624_all_containers", lg)
-    stop_if_reset(nodes)
-    inventory, _nodes = scan_all_container_instances(
-        stack, phone, lg, nodes, stem="624_allocation_scan"
+    # A preceding cleanup deletes through Crane Settings, not through Ghost.
+    # Invalidate Ghost's process cache before the mandatory complete inventory
+    # read.  This also makes Retry / Resume of a provisioning slot
+    # safe when Stop left Crane's red Delete action exposed: only Ghost's exact
+    # bundle is stopped here, then normal routing leaves Crane via Home without
+    # tapping the exposed action.
+    invalidate_ghost_container_cache(stack, lg)
+
+    lg(
+        "Close leftover Ghost, then prove a fresh complete Reddit container "
+        "inventory before any Create."
     )
+    try:
+        close_ghost_organic(stack, phone, lg)
+        stack.check_cancelled()
+        open_reddit_containers(stack, phone, lg, stop=stop)
+        _blob, nodes = dump_named(stack, phone, "624_all_containers", lg)
+        stop_if_reset(nodes)
+        inventory, _nodes = scan_all_container_instances(
+            stack, phone, lg, nodes, stem="624_allocation_scan"
+        )
+    except (OperationCancelled, ICloudModalBlockingError):
+        raise
+    except ContainerProvisioningReconcileError:
+        raise
+    except PhoneError as exc:
+        raise ContainerProvisioningReconcileError(
+            "Could not obtain a fresh boundary-proven complete Ghost inventory "
+            f"before container allocation: {exc}. Did not create a container or "
+            "use Anthropic."
+        ) from exc
     device_names = set(inventory)
 
     if names:
@@ -1408,21 +2796,37 @@ def apply_reddit_containers(
         extra: set[object] = set(slot_ids_used()) | device_names
         todo = allocate_new_names(count, extra)
 
+    # The complete allocation scan above is a valid, fresh inventory: it visited
+    # every row and ended at the proven bottom, and nothing has mutated the list
+    # yet.  The first unmutated target may reuse it instead of closing/reopening
+    # Ghost and running a second complete inventory scan.  As soon as one target
+    # mutates the list the inventory is invalidated and a new complete scan is
+    # required before another Create.
+    reuse_inventory = inventory is not None
+
     for name in todo:
         stack.check_cancelled()
         if not is_slot_name(name):
-            raise PhoneError(f"Bad container name {name!r}")
+            raise ContainerProvisioningReconcileError(
+                f"Bad deterministic container name {name!r}; did not create a "
+                "container or use Anthropic."
+            )
         if name in device_names:
+            reuse_inventory = False
             current_ids = set(inventory.get(name) or set())
             if len(current_ids) != 1:
-                raise PhoneError(
+                raise ContainerProvisioningReconcileError(
                     f"Existing {name} has {len(current_ids)} UUID instances; "
-                    "refused to guess between duplicate containers."
+                    "refused to guess between duplicate containers or use Anthropic."
                 )
             try:
                 row = ensure_ghost_container_needed(name, lg)
-            except ValueError as exc:
-                raise PhoneError(str(exc)) from exc
+            except Exception as exc:
+                raise ContainerProvisioningReconcileError(
+                    f"Could not persist/reconcile the durable slot for existing "
+                    f"{name}: {exc}. Preserved the container and queue without "
+                    "using Anthropic."
+                ) from exc
             saved_instance = str(
                 row.get("ghost_container_instance") or ""
             ).strip().upper()
@@ -1442,8 +2846,9 @@ def apply_reddit_containers(
                 phone, stack, lg, _nodes, name, only_instance, stop=stop
             )
             if instance_id != only_instance:
-                raise PhoneError(
-                    f"Existing {name} UUID changed during configuration; stopped."
+                raise ContainerProvisioningReconcileError(
+                    f"Existing {name} UUID changed during configuration; preserved "
+                    "the container and slot without using Anthropic."
                 )
             inventory[name] = {instance_id}
             reused.append(name)
@@ -1457,18 +2862,28 @@ def apply_reddit_containers(
         stack.check_cancelled()
         try:
             row = ensure_ghost_container_needed(name, lg)
-        except ValueError as exc:
-            raise PhoneError(str(exc)) from exc
+        except Exception as exc:
+            raise ContainerProvisioningReconcileError(
+                f"Could not persist/reconcile the durable slot before provisioning "
+                f"{name}: {exc}. Did not create a container or use Anthropic."
+            ) from exc
         state = ghost_container_state(row)
         if state == "ready":
-            raise PhoneError(
+            raise ContainerProvisioningReconcileError(
                 f"Slot {name} is marked Ghost-ready but was absent from the complete "
-                "phone scan; stopped without creating a duplicate."
+                "phone scan; stopped without creating a duplicate or using Anthropic."
             )
         stack.check_cancelled()
         instance_id = provision_slot_container(
-            phone, stack, lg, name, stop=stop
+            phone,
+            stack,
+            lg,
+            name,
+            stop=stop,
+            inventory=inventory if reuse_inventory else None,
+            nodes=_nodes if reuse_inventory else None,
         )
+        reuse_inventory = False
         inventory.setdefault(name, set()).add(instance_id)
         device_names.add(name)
         created.append(name)
