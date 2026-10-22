@@ -1094,7 +1094,7 @@ class UIRecoveryAgentTests(unittest.TestCase):
                 observation.screen_class == "reddit",
                 "Reddit is not yet locally proven in the foreground",
             ),
-            attempt_budget=recovery.RecoveryAttemptBudget(max_calls=6),
+            attempt_budget=recovery.RecoveryAttemptBudget(),
         )
         with patch.object(
             recovery,
@@ -1106,6 +1106,8 @@ class UIRecoveryAgentTests(unittest.TestCase):
             )
 
         self.assertEqual(len(calls), 3)
+        self.assertEqual(agent.attempt_budget.max_calls, 3)
+        self.assertEqual(agent.attempt_budget.used_calls, 3)
         self.assertEqual(session.directive, "")
         self.assertEqual(agent.current.screen_class, "reddit")
         self.assertTrue(
@@ -1187,7 +1189,7 @@ class UIRecoveryAgentTests(unittest.TestCase):
             )
 
         chain = recovery.RecoveryChain()
-        budget = recovery.RecoveryAttemptBudget(max_calls=2)
+        budget = recovery.RecoveryAttemptBudget()
         agent = recovery.UIRecoveryAgent(
             FakeStack([SCREEN_CONTINUE]),
             object(),
@@ -1208,9 +1210,16 @@ class UIRecoveryAgentTests(unittest.TestCase):
             ):
                 agent.recover(PhoneError("stuck"))
 
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(chain.api_calls, 2)
-        self.assertEqual(budget.used_calls, 2)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(chain.api_calls, 3)
+        self.assertEqual(budget.used_calls, 3)
+        self.assertEqual(budget.remaining_calls, 0)
+        self.assertTrue(
+            all(
+                any(f"{index}/3" in line for line in self.logs)
+                for index in (1, 2, 3)
+            )
+        )
         self.assertTrue(any("before another paid request" in line for line in self.logs))
 
     def test_attempt_budget_is_shared_across_agents_and_recovery_phases(self):

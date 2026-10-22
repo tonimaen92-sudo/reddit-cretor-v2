@@ -44,7 +44,7 @@ from friend_poster.device.ui_tree import Node, OperationCancelled, parse_nodes
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MODEL = "claude-sonnet-5-5"
 SCHEMA_VERSION = 3
-MAX_API_CALLS_PER_RECOVERY_CHAIN = 1
+MAX_API_CALLS_PER_RECOVERY_CHAIN = 3
 _MODEL_IMAGE_MAX_SIZE = (750, 1334)
 _MODEL_IMAGE_MAX_BYTES = 700_000
 
@@ -1779,7 +1779,7 @@ class UIRecoveryAgent:
     def _post_stop_aware(self, headers: dict[str, str], body: dict[str, Any]) -> Any:
         self._check_stop()
         try:
-            self.attempt_budget.reserve()
+            request_number = self.attempt_budget.reserve()
         except RecoveryBudgetExhausted:
             self.status("AI recovery stopped — API call limit reached")
             self.log(
@@ -1788,6 +1788,14 @@ class UIRecoveryAgent:
                 "without a locally verified postcondition."
             )
             raise
+        self.status(
+            "AI recovery — Anthropic request "
+            f"{request_number}/{self.attempt_budget.max_calls}"
+        )
+        self.log(
+            "AI RECOVERY paid request budget: "
+            f"{request_number}/{self.attempt_budget.max_calls}."
+        )
         result: dict[str, Any] = {}
         finished = threading.Event()
 
