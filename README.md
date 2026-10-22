@@ -7,6 +7,17 @@ a standard `src/` package layout while every historical batch file and
 
 ## Start here
 
+For a new Windows PC, download or clone the repository and double-click:
+
+```bat
+INSTALL.bat
+```
+
+It installs Python 3.11 when needed, creates `.venv`, installs all Python
+dependencies, prepares safe local runtime files, and verifies the installation.
+See [Windows installation](docs/INSTALL_WINDOWS.md) for the remaining private
+credentials and iPhone preparation that cannot be distributed through GitHub.
+
 Use the existing launchers exactly as before:
 
 ```bat
