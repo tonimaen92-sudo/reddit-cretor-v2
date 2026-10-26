@@ -1,10 +1,10 @@
 # UTF-8
-"""Terminal 873 email-field failure: dedicated code, no tap, bounded retype.
+"""Terminal 873 email-field failure: dedicated code, no submit, bounded retype.
 
 The terminal condition is the exact production shape logged as
 ``873_email_still_invalid``: Reddit's signup welcomes the user, the email field
 does not hold the exact saved @icloud.com address, one initial type already
-happened, and at most one proven single-missing-character retype is allowed.
+happened, and at most one force-clear/retype is allowed.
 Reaching it must raise ``reddit_email_field_invalid`` without any Continue tap.
 """
 
@@ -34,12 +34,18 @@ MISSING_ONE = [
     ocr("fixture_rands.6h@icloud.com", 292, 455, 478, 30),
     ocr("done", 653, 1168, 81, 23),
 ]
-# Two saved letters lost: never enough to authorize the one allowed retype.
+# Two saved letters lost: the bounded force-clear/retype must still recover it.
 MISSING_TWO = [
     *MISSING_ONE[:-2],
     ocr("fixture_rands.6@icloud.com", 292, 455, 470, 30),
     MISSING_ONE[-1],
 ]
+EXACT = [
+    *MISSING_ONE[:-2],
+    ocr(EXPECTED, 292, 455, 478, 30),
+    MISSING_ONE[-1],
+]
+EXACT_KEYBOARD_HIDDEN = EXACT[:-1]
 
 
 class FakeStack:
@@ -47,6 +53,7 @@ class FakeStack:
         self.taps: list[tuple[int, int]] = []
         self.backspaces: list[int] = []
         self.typed: list[str] = []
+        self.human_delays: list[int] = []
 
     def tap_xy(self, x: int, y: int) -> None:
         self.taps.append((x, y))
@@ -56,6 +63,10 @@ class FakeStack:
 
     def type_text(self, text: str) -> None:
         self.typed.append(text)
+
+    def type_human(self, text: str, ms: int = 95) -> None:
+        self.typed.append(text)
+        self.human_delays.append(ms)
 
 
 class EmailFieldInvalidCodeTests(unittest.TestCase):
@@ -100,16 +111,74 @@ class EmailFieldInvalidCodeTests(unittest.TestCase):
         self.assertEqual(stack.backspaces, [])
         self.assertEqual(stack.typed, [])  # no second retype
         self.assertEqual(typed, [2])  # the allowed retype was already used
-        self.assertEqual(dumps, [TERMINAL_MARKER])
+        self.assertEqual(dumps, ["873_email_terminal_recheck", TERMINAL_MARKER])
 
-    def test_two_missing_characters_never_authorize_a_retype(self):
-        stack, typed, dumps, exc = self.terminal_step(MISSING_TWO, [1])
-        self.assertEqual(exc.failure_code, "reddit_email_field_invalid")
+    def test_terminal_recheck_accepts_late_exact_value_without_another_action(self):
+        stack = FakeStack()
+        typed = [2]
+        dumps: list[str] = []
+
+        def fresh_dump(_stack, _phone, stem, _log, **_kwargs):
+            dumps.append(stem)
+            return None, EXACT
+
+        with (
+            mock.patch.object(validator, "log", lambda *_args, **_kwargs: None),
+            mock.patch.object(validator, "_wait", lambda *_args, **_kwargs: None),
+            mock.patch.object(validator, "dump_named", side_effect=fresh_dump),
+        ):
+            result = validator.step(
+                stack,
+                object(),
+                MISSING_ONE,
+                EXPECTED,
+                [True],
+                "a0061",
+                typed,
+                [1],
+                [0],
+                [0],
+                email_done_taps=[0],
+            )
+
+        self.assertEqual(result, "WAIT")
+        self.assertEqual(dumps, ["873_email_terminal_recheck"])
+        self.assertEqual(typed, [2])
         self.assertEqual(stack.taps, [])
         self.assertEqual(stack.backspaces, [])
         self.assertEqual(stack.typed, [])
-        self.assertEqual(typed, [1])
-        self.assertEqual(dumps, [TERMINAL_MARKER])
+
+    def test_multiple_missing_characters_force_clear_and_retype_once(self):
+        stack = FakeStack()
+        typed = [1]
+        with (
+            mock.patch.object(validator, "log", lambda *_args, **_kwargs: None),
+            mock.patch.object(validator, "_wait", lambda *_args, **_kwargs: None),
+            mock.patch.object(
+                validator,
+                "dump_named",
+                side_effect=AssertionError("no terminal dump on the retype path"),
+            ),
+        ):
+            result = validator.step(
+                stack,
+                object(),
+                MISSING_TWO,
+                EXPECTED,
+                [True],
+                "a0061",
+                typed,
+                [1],
+                [0],
+                [0],
+                email_done_taps=[0],
+            )
+        self.assertEqual(result, "RETYPED")
+        self.assertEqual(typed, [2])
+        self.assertEqual(stack.taps, [(620, 431)])
+        self.assertEqual(stack.backspaces, [60, 20])
+        self.assertEqual(stack.typed, [EXPECTED])
+        self.assertEqual(stack.human_delays, [160])
 
     def test_proven_single_missing_character_still_retypes_exactly_once(self):
         stack = FakeStack()
@@ -139,6 +208,52 @@ class EmailFieldInvalidCodeTests(unittest.TestCase):
         self.assertEqual(result, "RETYPED")
         self.assertEqual(typed, [2])
         self.assertEqual(stack.typed, [EXPECTED])
+        self.assertEqual(stack.human_delays, [160])
+
+    def test_terminal_failure_is_ai_eligible_only_after_local_retype(self):
+        self.assertIs(validator.EmailFieldInvalid.ai_recoverable, True)
+
+    def test_done_hide_then_keyboard_reappears_is_retry_later_not_second_tap(self):
+        stack = FakeStack()
+        waits = [0]
+        done_taps = [1]
+        with (
+            mock.patch.object(validator, "log", lambda *_args, **_kwargs: None),
+            mock.patch.object(validator, "_wait", lambda *_args, **_kwargs: None),
+        ):
+            hidden_result = validator.step(
+                stack,
+                object(),
+                EXACT_KEYBOARD_HIDDEN,
+                EXPECTED,
+                [True],
+                "a0061",
+                [1],
+                [1],
+                [0],
+                waits,
+                email_done_taps=done_taps,
+            )
+            with self.assertRaises(validator.RedditEmailRetryLater) as caught:
+                validator.step(
+                    stack,
+                    object(),
+                    EXACT,
+                    EXPECTED,
+                    [True],
+                    "a0061",
+                    [1],
+                    [1],
+                    [0],
+                    waits,
+                    email_done_taps=done_taps,
+                )
+
+        self.assertEqual(hidden_result, "WAIT")
+        self.assertEqual(waits, [1])
+        self.assertEqual(stack.taps, [])
+        self.assertEqual(caught.exception.failure_code, "reddit_email_retry_later")
+        self.assertIn("Retry manually later", str(caught.exception))
 
 
 if __name__ == "__main__":

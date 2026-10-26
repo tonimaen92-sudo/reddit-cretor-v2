@@ -58,6 +58,14 @@ def selected_email_nodes(email: str = "fixture_grands.6h@icloud.com") -> list[No
     ]
 
 
+def selected_email_with_keyboard_nodes(
+    email: str = "fixture_grands.6h@icloud.com",
+) -> list[Node]:
+    rows = [row for row in selected_email_nodes(email) if row.text != "Continue"]
+    rows.append(Node(ntype="ocr", text="done", x=613, y=1157, w=81, h=23))
+    return rows
+
+
 def valid_password_png() -> bytes:
     image = Image.new("RGB", (1125, 2436), "white")
     draw = ImageDraw.Draw(image)
@@ -145,6 +153,49 @@ class RedditPasswordResumeTests(unittest.TestCase):
             )
         self.assertIs(result, advanced)
         self.assertEqual(stack.taps, [(645, 275), (370, 820)])
+
+    def test_expired_code_recovery_hides_keyboard_before_email_continue(self):
+        stack = Stack(valid_password_png())
+        selected = selected_email_nodes()
+        advanced = [node("Verify your email", 120, 150, 300)]
+        frames = iter([selected_email_with_keyboard_nodes(), selected, advanced])
+        logs: list[str] = []
+        with mock.patch.object(
+            password,
+            "dump_named",
+            side_effect=lambda *_args, **_kwargs: ("", next(frames)),
+        ):
+            result = password.recover_expired_verification(
+                stack,
+                object(),
+                expired_code_nodes(),
+                "fixture_grands.6h@icloud.com",
+                logs.append,
+            )
+        self.assertIs(result, advanced)
+        self.assertEqual(stack.taps, [(645, 275), (653, 1168), (370, 820)])
+        self.assertTrue(any("keyboard covering Continue" in line for line in logs))
+
+    def test_keyboard_done_may_submit_selected_email_without_duplicate_continue(self):
+        stack = Stack(valid_password_png())
+        advanced = [node("Verify your email", 120, 150, 300)]
+        frames = iter([selected_email_with_keyboard_nodes(), advanced])
+        logs: list[str] = []
+        with mock.patch.object(
+            password,
+            "dump_named",
+            side_effect=lambda *_args, **_kwargs: ("", next(frames)),
+        ):
+            result = password.recover_expired_verification(
+                stack,
+                object(),
+                expired_code_nodes(),
+                "fixture_grands.6h@icloud.com",
+                logs.append,
+            )
+        self.assertIs(result, advanced)
+        self.assertEqual(stack.taps, [(645, 275), (653, 1168)])
+        self.assertTrue(any("not tapping Continue again" in line for line in logs))
 
     def test_expired_code_email_continue_retries_exactly_once(self):
         stack = Stack(valid_password_png())

@@ -469,6 +469,21 @@ def signup_home_recovery_regressions() -> None:
             profile_dumps == [1] and stack.taps == taps_before_profile_stop,
             repr(stack.taps),
         )
+        wait_profile_error = None
+        try:
+            to_verify.wait_ui(stack, object(), "profile_wait", profile)
+        except Exception as exc:
+            wait_profile_error = exc
+        check(
+            "signup-wait-existing-profile-is-typed",
+            isinstance(wait_profile_error, to_verify.ExistingAccountContainerError),
+            type(wait_profile_error).__name__ if wait_profile_error else "no error",
+        )
+        check(
+            "signup-wait-existing-profile-no-mutation",
+            stack.taps == taps_before_profile_stop,
+            repr(stack.taps),
+        )
 
         unknown_dumps = [0]
 
@@ -688,8 +703,8 @@ def birthday_regressions() -> None:
     check("picker-no-adjacent-inference", about.selected_birthday(off_center) is None)
 
     # Frozen copy of the a0119 crash frame: the centered day row is absent
-    # because OCR drops the bold single-digit selection, and the day wheel
-    # cycles 1..31 in every month (31 sits directly above 1 in February).
+    # because OCR drops the bold single-digit selection. Short months can still
+    # render faded rows through 31, but those rows are not safe tap targets.
     missing_center_day = fixture_nodes("a0119_birthday_missing_centered_day")
     check(
         "picker-saved-dump-missing-centered-day-recovered",
@@ -733,12 +748,17 @@ def birthday_regressions() -> None:
     check("distance-year", about._axis_distance("year", 1999, 2004, target) == 5)
     check("distance-month-wrap-forward", about._axis_distance("month", 12, 2, target) == 2)
     check("distance-month-wrap-back", about._axis_distance("month", 2, 12, date(2004, 12, 1)) == -2)
-    check("distance-day-wrap", about._axis_distance("day", 28, 2, target) == 3)
+    check("distance-day-linear", about._axis_distance("day", 28, 2, target) == -26)
+    check(
+        "distance-day-transient-invalid-center-recoverable",
+        about._axis_distance("day", 31, 29, target) == -2,
+    )
     expect_phone_error(
-        "distance-day-range-change",
-        lambda: about._axis_distance("day", 31, 29, target),
+        "distance-day-invalid-target-rejected",
+        lambda: about._axis_distance("day", 28, 30, target),
         "invalid centered value",
     )
+    check("distance-day-bound-covers-noop-recovery", about.BIRTHDAY_AXIS_MAX_MOVES["day"] >= 60)
 
     # An exact visible row is tapped; no gesture is used.
     exact_stack = FakeStack()
@@ -2920,7 +2940,14 @@ def feed_regressions() -> None:
         def fake_swipes(*_args, **kwargs):
             target = kwargs["target"]
             completed = kwargs.get("completed", 0)
-            events.append(("swipes", target, completed))
+            events.append(
+                (
+                    "swipes",
+                    target,
+                    completed,
+                    kwargs.get("allow_created_account_feed_proof"),
+                )
+            )
             progress_fn = kwargs.get("progress_fn")
             if progress_fn is not None:
                 for value in range(completed + 1, target + 1):
@@ -2999,7 +3026,12 @@ def feed_regressions() -> None:
         "feed-configured-creation-runs-before-strict-cleanup",
         not configured_error
         and configured_events[:4]
-        == ["advance", "proof", ("mark-pending", 30), ("swipes", 30, 0)]
+        == [
+            "advance",
+            "proof",
+            ("mark-pending", 30),
+            ("swipes", 30, 0, True),
+        ]
         and configured_persists == list(range(1, 31))
         and ("close", proof) not in configured_events
         and configured_events[-2:]
@@ -3282,7 +3314,12 @@ def feed_regressions() -> None:
 
     def fake_resume_swipes(*_args, **kwargs):
         resume_events.append(
-            ("swipes", kwargs["completed"], kwargs["target"])
+            (
+                "swipes",
+                kwargs["completed"],
+                kwargs["target"],
+                kwargs.get("allow_created_account_feed_proof"),
+            )
         )
         for value in range(kwargs["completed"] + 1, kwargs["target"] + 1):
             kwargs["progress_fn"](value)
@@ -3322,7 +3359,7 @@ def feed_regressions() -> None:
             "local@example.invalid",
             {"allow_existing_sparse_feed": True},
         )
-        and ("swipes", 12, 30) in resume_events
+        and ("swipes", 12, 30, True) in resume_events
         and resume_persists == list(range(13, 31))
         and resume_events[-1] == ("strict-cleanup", True),
         repr(resume_events),

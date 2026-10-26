@@ -828,7 +828,7 @@ class PreserveSkipControllerTests(unittest.TestCase):
         self.assertEqual(
             checkpoint_writes,
             [
-                ("pending", "a0047", "ABC0047X"),
+                ("pending", "a0047", "ABC0047X-FULL"),
                 ("complete", "a0047"),
             ],
         )
@@ -858,7 +858,7 @@ class PreserveSkipControllerTests(unittest.TestCase):
         self.assertEqual(len(budget_instances), 2)
         self.assertTrue(all(budget.api_calls == 0 for budget in budget_instances))
 
-    def test_stalled_container_uses_recorded_uuid_once_without_ai(self):
+    def test_stalled_container_prefers_full_crane_uuid_over_ghost_prefix(self):
         app = self.harness(self, 1)
         app.bulk_state.update(stage="creating", slot_id="a0047")
         app._bulk_live_status = lambda _message: None
@@ -868,7 +868,8 @@ class PreserveSkipControllerTests(unittest.TestCase):
         row = {
             "id": "a0047",
             "ghost": True,
-            "ghost_container_instance": "GHOST-1",
+            "ghost_container_instance": "A9D61928",
+            "crane_container_instance": "A9D61928-64D3-4E78-991F-FC8DD2B7957F",
         }
         order = []
 
@@ -905,8 +906,8 @@ class PreserveSkipControllerTests(unittest.TestCase):
         self.assertEqual(
             order,
             [
-                ("pending", "a0047", "GHOST-1"),
-                ("delete", "a0047", "GHOST-1"),
+                ("pending", "a0047", "A9D61928-64D3-4E78-991F-FC8DD2B7957F"),
+                ("delete", "a0047", "A9D61928-64D3-4E78-991F-FC8DD2B7957F"),
                 ("complete", "a0047"),
             ],
         )

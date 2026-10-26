@@ -163,10 +163,15 @@ class BulkQueueTests(unittest.TestCase):
         del state["failure_reason"]
         del state["failure_code"]
         del state["failures"]
+        for field in (
+            "revision", "run_id", "writer_id", "recovery", "delete_containers",
+            "ip_reset_attempt_count", "radio_recovery",
+        ):
+            del state[field]
         state["version"] = 1
         self.path.write_text(json.dumps(state), encoding="utf-8")
         migrated = bulk_creation.load_state(self.path)
-        self.assertEqual(migrated["version"], 4)
+        self.assertEqual(migrated["version"], 7)
         self.assertIsNone(migrated["ip_attempt"])
         self.assertIsNone(migrated["failure_reason"])
         self.assertIsNone(migrated["failure_code"])
@@ -182,6 +187,11 @@ class BulkQueueTests(unittest.TestCase):
         del state["failure_reason"]
         del state["failure_code"]
         del state["failures"]
+        for field in (
+            "revision", "run_id", "writer_id", "recovery", "delete_containers",
+            "ip_reset_attempt_count", "radio_recovery",
+        ):
+            del state[field]
         state["version"] = 1
         original = json.dumps(state)
         self.path.write_text(original, encoding="utf-8")
@@ -206,10 +216,15 @@ class BulkQueueTests(unittest.TestCase):
         del state["failure_reason"]
         del state["failure_code"]
         del state["failures"]
+        for field in (
+            "revision", "run_id", "writer_id", "recovery", "delete_containers",
+            "ip_reset_attempt_count", "radio_recovery",
+        ):
+            del state[field]
         state["version"] = 2
         self.path.write_text(json.dumps(state), encoding="utf-8")
         migrated = bulk_creation.load_state(self.path)
-        self.assertEqual(migrated["version"], 4)
+        self.assertEqual(migrated["version"], 7)
         self.assertEqual(migrated["slot_id"], "a0047")
         self.assertEqual(migrated["queue"], state["queue"])
         self.assertEqual(migrated["ip_attempt"], attempt)
@@ -235,12 +250,17 @@ class BulkQueueTests(unittest.TestCase):
         )
         del state["failure_code"]
         del state["failures"]
+        for field in (
+            "revision", "run_id", "writer_id", "recovery", "delete_containers",
+            "ip_reset_attempt_count", "radio_recovery",
+        ):
+            del state[field]
         state["version"] = 3
         self.path.write_text(json.dumps(state), encoding="utf-8")
 
         migrated = bulk_creation.load_state(self.path)
 
-        self.assertEqual(migrated["version"], 4)
+        self.assertEqual(migrated["version"], 7)
         self.assertEqual(migrated["failure_code"], "reddit_code_timeout")
         self.assertEqual(migrated["queue"], state["queue"])
         self.assertEqual(migrated["remaining"], 1)

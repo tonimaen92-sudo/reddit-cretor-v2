@@ -179,14 +179,38 @@ class TargetCountTests(unittest.TestCase):
             "targetuser0": {"slot_id": "a0103", "status": "success"},
         }
 
-        requested, items, skipped = app._parse_fresh_bulk_editor()
+        requested, items, skipped, invalid_skipped = app._parse_fresh_bulk_editor()
 
-        self.assertEqual((requested, skipped), (2, 1))
+        self.assertEqual((requested, skipped, invalid_skipped), (2, 1, 0))
         self.assertEqual(
             [item.get("username") for item in items],
             ["TargetUser1", "TargetUser2"],
         )
         self.assertEqual(items[0]["birth_date"], row(1)["birth_date"])
+
+    def test_fresh_start_skips_invalid_credential_with_whole_aligned_row(self):
+        app = self.app(target="2", total_rows=4, consumed=0, original_count=2)
+        app.bulk_writer_id = "offline"
+        app._username_claim_owners = lambda: {}
+        credentials = [
+            "BadPassword0:short",
+            "TargetUser1:StrongPass1!",
+            "TargetUser2:StrongPass2!",
+            "TargetUser3:StrongPass3!",
+        ]
+        app.bulk_usernames_text = Text("\n".join(credentials))
+
+        requested, items, claimed_skipped, invalid_skipped = (
+            app._parse_fresh_bulk_editor()
+        )
+
+        self.assertEqual((requested, claimed_skipped, invalid_skipped), (2, 0, 1))
+        self.assertEqual(
+            [item.get("username") for item in items],
+            ["TargetUser1", "TargetUser2"],
+        )
+        self.assertEqual(items[0]["birth_date"], row(1)["birth_date"])
+        self.assertEqual(items[1]["birth_date"], row(2)["birth_date"])
 
 
 if __name__ == "__main__":

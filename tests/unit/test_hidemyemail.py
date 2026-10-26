@@ -73,6 +73,7 @@ A0083_BEFORE_FOCUS = load_fixture("a0083_before_create_retry.json")
 A0083_SELECTION_OVERLAY = load_fixture(
     "a0083_password_selection_overlay.json"
 )
+A0252_STUCK_OVERVIEW = load_fixture("a0252_hme_stuck_overview.json")
 # The on-screen keyboard is OCR-visible while a text field has focus.  A
 # fresh post-tap frame still shows the verified sheet plus the keyboard.
 KEYBOARD = SHEET_NO_PASSWORD + [node("space", 1170, x=256, w=231, h=25, ntype="ocr")]
@@ -1246,6 +1247,100 @@ class StopFlag:
 
 
 class HideMyEmailReentryTests(unittest.TestCase):
+    def test_real_a0252_overview_is_not_a_valid_ai_resume_postcondition(self):
+        self.assertFalse(
+            hidemyemail.hide_my_email_recovery_ready(A0252_STUCK_OVERVIEW)
+        )
+        self.assertTrue(hidemyemail.hide_my_email_recovery_ready(HME_LIST))
+
+    def test_post_unlock_settle_waits_without_tapping_for_delayed_list(self):
+        stack = Stack()
+        frames = iter([(None, OVERVIEW), (None, HME_LIST)])
+        names = []
+
+        def dump(_stack, _phone, name, _log):
+            names.append(name)
+            return next(frames)
+
+        with (
+            mock.patch.object(hidemyemail, "dump_named", side_effect=dump),
+            mock.patch.object(hidemyemail, "_HME_POST_UNLOCK_POLLS", 2),
+            mock.patch.object(hidemyemail.time, "sleep", return_value=None),
+        ):
+            result = hidemyemail._settle_hme_after_icloud_unlock(
+                stack, object(), lambda _message: None, OVERVIEW, None
+            )
+
+        self.assertIs(result, HME_LIST)
+        self.assertEqual(stack.taps, [])
+        self.assertEqual(
+            names,
+            [
+                "03_hme_after_unlock_settle_1",
+                "03_hme_after_unlock_settle_2",
+            ],
+        )
+
+    def test_post_unlock_settle_taps_once_only_after_chevron_is_verified(self):
+        stack = Stack()
+        actionable = OVERVIEW + [
+            node("No Hide My Email ›", 1050, x=70, w=620, h=40, ntype="ocr-line")
+        ]
+        frames = iter([(None, actionable), (None, HME_LIST)])
+
+        with (
+            mock.patch.object(
+                hidemyemail, "dump_named", side_effect=lambda *_a: next(frames)
+            ),
+            mock.patch.object(hidemyemail, "_HME_POST_UNLOCK_POLLS", 2),
+            mock.patch.object(hidemyemail.time, "sleep", return_value=None),
+        ):
+            result = hidemyemail._settle_hme_after_icloud_unlock(
+                stack, object(), lambda _message: None, OVERVIEW, None
+            )
+
+        self.assertIs(result, HME_LIST)
+        self.assertEqual(stack.taps, [OVERVIEW[2].center()])
+
+    def test_post_unlock_settle_exhausts_locally_before_ai_fallback(self):
+        stack = Stack()
+        with (
+            mock.patch.object(
+                hidemyemail, "dump_named", return_value=(None, OVERVIEW)
+            ) as dump,
+            mock.patch.object(hidemyemail, "_HME_POST_UNLOCK_POLLS", 2),
+            mock.patch.object(hidemyemail.time, "sleep", return_value=None),
+        ):
+            with self.assertRaisesRegex(
+                hidemyemail.HideMyEmailVisualRecoveryExhausted,
+                "post-unlock settling",
+            ) as raised:
+                hidemyemail._settle_hme_after_icloud_unlock(
+                    stack, object(), lambda _message: None, OVERVIEW, None
+                )
+
+        self.assertTrue(raised.exception.ai_recoverable)
+        self.assertEqual(stack.taps, [])
+        self.assertEqual(dump.call_count, 2)
+
+    def test_post_unlock_settle_honors_stop_before_any_device_action(self):
+        stack = Stack()
+        actionable = OVERVIEW + [
+            node("No Hide My Email ›", 1050, x=70, w=620, h=40, ntype="ocr-line")
+        ]
+        with mock.patch.object(hidemyemail, "dump_named") as dump:
+            with self.assertRaisesRegex(PhoneError, "Stopped"):
+                hidemyemail._settle_hme_after_icloud_unlock(
+                    stack,
+                    object(),
+                    lambda _message: None,
+                    actionable,
+                    StopFlag(True),
+                )
+
+        self.assertEqual(stack.taps, [])
+        dump.assert_not_called()
+
     def test_observed_cyrillic_ok_sheet_layout_derives_from_the_real_dump(self):
         controls = hidemyemail._icloud_password_sheet_controls(SHEET_WITH_PASSWORD)
         self.assertIsNotNone(controls)
@@ -1295,28 +1390,86 @@ class HideMyEmailReentryTests(unittest.TestCase):
 
     def test_still_on_overview_after_second_tap_fails_closed(self):
         stack = Stack()
-        dumps = iter([(None, OVERVIEW), (None, SHEET), (None, OVERVIEW)])
+        # No authentication boundary was observed, so an unchanged overview
+        # after both bounded row taps remains an unknown state and fails closed.
+        dumps = iter([(None, OVERVIEW), (None, OVERVIEW), (None, OVERVIEW)])
         with (
             mock.patch.object(hidemyemail, "dump_named", side_effect=lambda *_a: next(dumps)),
             mock.patch.object(hidemyemail, "_unlock_icloud_if_needed", side_effect=lambda _s, _p, _l, nodes, _stop: OVERVIEW if nodes is SHEET else nodes),
             mock.patch.object(hidemyemail.time, "sleep", return_value=None),
         ):
-            with self.assertRaisesRegex(PhoneError, "after bounded verified navigation"):
+            with self.assertRaisesRegex(
+                hidemyemail.HideMyEmailVisualRecoveryExhausted,
+                "after bounded verified navigation",
+            ) as raised:
                 hidemyemail.create_one_hide_my_email(object(), stack, lambda _message: None)
+        self.assertTrue(raised.exception.ai_recoverable)
+        self.assertEqual(
+            raised.exception.failure_code,
+            "icloud_hme_visual_recovery_exhausted",
+        )
         self.assertEqual(stack.taps, [OVERVIEW[2].center(), OVERVIEW[2].center()])
         self.assertEqual(stack.swipes, [])
 
-    def test_delayed_password_sheet_reenters_overview_row_before_create(self):
+    def test_first_tap_password_unlock_settles_if_second_tap_is_ignored(self):
+        stack = Stack(stop_after_create=True)
+        # First row tap opens authentication.  Unlock returns to the overview;
+        # the second bounded tap is ignored while Settings is settling, then a
+        # fresh frame reaches the HME list without another unverified tap.
+        dumps = iter([
+            (None, OVERVIEW),
+            (None, SHEET),
+            (None, OVERVIEW),
+            (None, HME_LIST),
+        ])
+        names = []
+
+        def dump(_stack, _phone, name, _log):
+            names.append(name)
+            return next(dumps)
+
+        with (
+            mock.patch.object(hidemyemail, "dump_named", side_effect=dump),
+            mock.patch.object(
+                hidemyemail,
+                "_unlock_icloud_if_needed",
+                side_effect=lambda _s, _p, _l, nodes, _stop: (
+                    OVERVIEW if nodes is SHEET else nodes
+                ),
+            ),
+            mock.patch.object(hidemyemail.time, "sleep", return_value=None),
+        ):
+            with self.assertRaises(StopAfterCreate):
+                hidemyemail.create_one_hide_my_email(
+                    object(), stack, lambda _message: None
+                )
+
+        self.assertEqual(
+            stack.taps[:2], [OVERVIEW[2].center(), OVERVIEW[2].center()]
+        )
+        self.assertEqual(stack.taps[2], HME_LIST[1].center())
+        self.assertEqual(stack.swipes, [])
+        self.assertEqual(
+            names,
+            [
+                "03_hme_before_create",
+                "03_hme_before_create_retry",
+                "03_hme_after_second_row_tap",
+                "03_hme_after_unlock_settle_1",
+            ],
+        )
+
+    def test_delayed_password_sheet_waits_for_hme_list_before_create(self):
         scrolled = [
             node("iCloud Backup", 380),
             node("ICLOUD+", 480),
             node("Private Relay", 540),
             node("Hide My Email", 620),
         ]
-        stack = Stack(stop_on_tap=4)
+        stack = Stack(stop_on_tap=3)
         # Overview -> unchanged after the first row tap -> the password sheet
         # appears only after the bounded second row tap -> HME list after the
-        # one verified post-unlock re-entry.
+        # the bounded post-unlock settle wait, without another row tap.
         dumps = iter([
             (None, scrolled),
             (None, scrolled),
@@ -1337,8 +1490,8 @@ class HideMyEmailReentryTests(unittest.TestCase):
             with self.assertRaises(StopAfterCreate):
                 hidemyemail.create_one_hide_my_email(object(), stack, lambda _message: None)
 
-        self.assertEqual(stack.taps[:3], [scrolled[3].center()] * 3)
-        self.assertEqual(stack.taps[3], HME_LIST[1].center())
+        self.assertEqual(stack.taps[:2], [scrolled[3].center()] * 2)
+        self.assertEqual(stack.taps[2], HME_LIST[1].center())
         self.assertEqual(stack.swipes, [])
         self.assertEqual(
             names,
@@ -1346,7 +1499,7 @@ class HideMyEmailReentryTests(unittest.TestCase):
                 "03_hme_before_create",
                 "03_hme_before_create_retry",
                 "03_hme_after_second_row_tap",
-                "03_hme_after_unlock_row_tap",
+                "03_hme_after_unlock_settle_1",
             ],
         )
 
@@ -1495,6 +1648,76 @@ class ICloudPasswordPipelineTests(unittest.TestCase):
         self.assertIsNone(app._pending_ui_recovery)
         # The agent sees the live sheet and may request deterministic local
         # password entry, but never receives the stored password value.
+        self.assertEqual(ghost_slot["ghost_container_state"], "ready")
+        self.assertNotIn("email", ghost_slot)
+
+    def test_exhausted_hme_navigation_enters_scoped_ai_with_local_guard(self):
+        from friend_poster.apps import creator
+        from friend_poster.services import ui_recovery_agent as recovery
+
+        app = self._app()
+        app.anthropic_recovery_enabled = True
+        app._set_ai_recovery_status = lambda _message: None
+        app._pending_ui_recovery = None
+        app._pending_ui_recovery_agent = None
+        app._pending_ui_recovery_chain = None
+        ghost_slot = self._ghost_slot()
+        seen = {}
+
+        class RecoveryAgent:
+            def __init__(self, _stack, _phone, **kwargs):
+                seen.update(kwargs)
+
+            def recover(self, error, previous=None):
+                self_error = error
+                self_previous = previous
+                self_guard = seen["resume_guard"]
+                seen["error"] = self_error
+                seen["previous"] = self_previous
+                seen["stuck_guard"] = self_guard(
+                    mock.Mock(nodes=A0252_STUCK_OVERVIEW)
+                )
+                seen["list_guard"] = self_guard(mock.Mock(nodes=HME_LIST))
+                return recovery.RecoverySession(
+                    incident_fingerprint="stuck-overview",
+                    final_fingerprint="hme-list",
+                    directive="resume_pipeline",
+                )
+
+        def create(*_args, **_kwargs):
+            raise hidemyemail.HideMyEmailVisualRecoveryExhausted(
+                "Hide My Email row remained after bounded verified navigation."
+            )
+
+        with (
+            mock.patch.object(creator, "_InactivityWatch", self._no_watch()),
+            mock.patch.object(creator, "UIRecoveryAgent", RecoveryAgent),
+            mock.patch.object(creator, "create_one_hide_my_email", side_effect=create),
+            mock.patch.object(creator, "set_slot_birth_date", lambda *_a: None),
+            mock.patch.object(creator, "get_slot", lambda _sid: ghost_slot),
+            mock.patch.object(creator, "load_slots", lambda: [ghost_slot]),
+            mock.patch.object(creator, "_load_pipeline_email_records", lambda: []),
+            mock.patch.object(creator, "_reconcile_pipeline_email", lambda *_a: None),
+            mock.patch.object(creator, "set_slot_email"),
+        ):
+            result = creator.App._run_creation_pipeline_attempt(
+                app,
+                "offline-password",
+                "a0047",
+                date(2005, 4, 20),
+                10,
+                manage_worker=False,
+                recovery_budget=recovery.RecoveryAttemptBudget(max_calls=3),
+            )
+
+        self.assertIs(result, creator._PIPELINE_RECOVERY_RETRY)
+        self.assertEqual(seen["workflow_scope"], "icloud_unlock")
+        self.assertIn("retry_icloud_unlock", seen["workflow_tools"])
+        self.assertFalse(seen["stuck_guard"][0])
+        self.assertTrue(seen["list_guard"][0])
+        self.assertIsInstance(
+            seen["error"], hidemyemail.HideMyEmailVisualRecoveryExhausted
+        )
         self.assertEqual(ghost_slot["ghost_container_state"], "ready")
         self.assertNotIn("email", ghost_slot)
 

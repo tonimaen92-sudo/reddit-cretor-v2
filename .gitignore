@@ -31,4 +31,5 @@ full-send/subscraper/chrome_bot_profile/
 # Local-only archives and generated reports
 archive/local-envs/
 reports/local/
+recovery_snapshots/
 

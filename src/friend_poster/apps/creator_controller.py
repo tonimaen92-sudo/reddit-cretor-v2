@@ -45,16 +45,20 @@ from friend_poster.core.bulk_creation import (
     consume_skipped,
     consume_stalled,
     empty_draft as empty_bulk_draft,
+    empty_radio_recovery,
     empty_state as empty_bulk_state,
     extend_queue as extend_bulk_queue,
     load_draft as load_bulk_draft,
     load_state as load_bulk_state,
     parse_queue as parse_bulk_queue,
+    parse_username_password as parse_bulk_credential,
     prepare_retry as prepare_bulk_retry,
+    radio_recovery_head_fingerprint,
     claim_state as claim_bulk_state,
     save_draft as save_bulk_draft,
     save_state as save_bulk_state,
     save_state_cas as save_bulk_state_cas,
+    utc_now as bulk_utc_now,
 )
 from friend_poster.core.bulk_owner_lock import acquire_bulk_owner_lock
 from friend_poster.core.username_lifecycle import (
@@ -91,6 +95,7 @@ from friend_poster.device.hidemyemail import (
     ICloudPasswordEntryError,
     create_one_hide_my_email,
     dismiss_icloud_password_sheet,
+    hide_my_email_recovery_ready,
 )
 from friend_poster.reddit.reddit_about import BIRTH_YEAR_MAX, BIRTH_YEAR_MIN
 from friend_poster.reddit.reddit_create_day1 import (
@@ -108,7 +113,13 @@ from friend_poster.reddit.reddit_open import (
     recover_existing_container,
     select_existing_container_from_compact_menu,
 )
-from friend_poster.reddit.reddit_to_verify import EmailFieldInvalid
+from friend_poster.reddit.reddit_to_verify import (
+    EmailFieldInvalid,
+    ExistingAccountContainerError,
+    RedditEmailRetryLater,
+    email_ready as reddit_email_ready,
+    retry_saved_email_field,
+)
 from friend_poster.reddit.reddit_username import USER_RE
 from friend_poster.core.slots import (
     CREATION_PROGRESS,
@@ -181,6 +192,11 @@ from friend_poster.services.ip_history import (
     record_configured_operation,
 )
 from friend_poster.services.ip_evidence import validate_pair
+from friend_poster.services.android_radio_reset import (
+    AndroidRadioResetError,
+    reset_android_cellular_radio,
+    restore_android_cellular_radio,
+)
 from friend_poster.apps import creator_persistence as _persistence
 from friend_poster.apps import creator_validation as _validation
 
@@ -225,6 +241,17 @@ STALL_RESET_FAILURE_CODE = "creation_stall_reset"
 CONTAINER_RECREATE_FAILURE_CODE = "container_recreate_required"
 AI_RECOVERY_BUDGET_EXHAUSTED_CODE = "ai_recovery_budget_exhausted"
 AI_DISCARD_REFUSED_CODE = "ai_discard_refused"
+# IP rotation is external and locally verifiable.  A new head first gets one
+# fast device-bound ADB phase.  The previous MacroDroid->ADB sequence remains
+# the bounded error handler, so neither Retry nor reconnect may manufacture a
+# fourth reset action.
+IP_AUTO_RETRY_MARKER_CODE = "ip_auto_retry_pending"
+IP_RETRY_EXHAUSTED_CODE = "ip_retry_exhausted"
+MAX_IP_RESET_ATTEMPTS_PER_HEAD = 3
+FAST_IP_TOTAL_SECONDS = 25.0
+FAST_IP_POLL_SECONDS = 1.0
+FAST_IP_AIRPLANE_HOLD_SECONDS = 10.0
+FAST_IP_SETTLE_SECONDS = 1.0
 
 # --- Start Batch / Resume machine-readable outcomes ----------------------- #
 # "Start Batch" always begins a genuinely new run; these codes make every
@@ -1681,11 +1708,19 @@ class App:
 
     def _on_start_bulk_batch(self) -> None:
         try:
-            requested, items, claimed_skipped = self._parse_fresh_bulk_editor()
+            requested, items, claimed_skipped, invalid_skipped = (
+                self._parse_fresh_bulk_editor()
+            )
             if claimed_skipped:
                 self.log(
                     f"BATCH start: ignored {claimed_skipped} username row(s) already "
                     "bound to processing or successful slots."
+                )
+            if invalid_skipped:
+                self.log(
+                    f"BATCH start: ignored {invalid_skipped} credential row(s) that "
+                    "failed local username/password validation; each aligned "
+                    "birth/swipe/delay row was skipped with it."
                 )
             current = dict(getattr(self, "bulk_state", empty_bulk_state()))
             superseded = (
@@ -1731,12 +1766,14 @@ class App:
         except UsernameLedgerError as exc:
             raise BulkError(str(exc)) from exc
 
-    def _parse_fresh_bulk_editor(self) -> tuple[int, list[dict], int]:
+    def _parse_fresh_bulk_editor(self) -> tuple[int, list[dict], int, int]:
         """Parse a new run after removing rows whose username is already owned.
 
-        The whole aligned row is skipped, so birth/swipe/delay data cannot drift
-        relative to the next unused username. Surplus rows remain available and
-        are pulled forward until the requested count is satisfied.
+        The whole aligned row is skipped for either an already-owned username or
+        an invalid explicit ``username:password`` pair, so birth/swipe/delay data
+        cannot drift relative to the next usable credential. Surplus rows remain
+        available and are pulled forward until the requested count is satisfied.
+        Username-only rows retain the established Reddit-suggestion fallback.
         """
         count_text = str(self.bulk_count_var.get() or "").strip()
         if re.fullmatch(r"[1-9]\d*", count_text) is None:
@@ -1751,6 +1788,7 @@ class App:
         owners = self._username_claim_owners()
         kept = [[], [], [], []]
         skipped = 0
+        invalid_skipped = 0
         row_count = max(len(column) for column in raw_columns[:3])
         for index in range(row_count):
             raw_credential = (
@@ -1761,6 +1799,12 @@ class App:
             if username and username.casefold() in owners:
                 skipped += 1
                 continue
+            if ":" in raw_credential:
+                try:
+                    parse_bulk_credential(raw_credential)
+                except BulkError:
+                    invalid_skipped += 1
+                    continue
             for column_index, column in enumerate(raw_columns):
                 kept[column_index].append(
                     column[index] if index < len(column) else ""
@@ -1773,7 +1817,7 @@ class App:
             parse_slot_birth_date,
             usernames_text="\n".join(kept[3]),
         )
-        return parsed_requested, items, skipped
+        return parsed_requested, items, skipped, invalid_skipped
 
     def _show_post_tab(self) -> None:
         self.nb.select(self.post_tab)
@@ -3511,6 +3555,26 @@ class App:
             else:
                 current = dict(self.bulk_state)
             stage = current.get("stage")
+            attempt = current.get("ip_attempt")
+            observation_deadline = (
+                str(attempt.get("observation_deadline_utc") or "").strip()
+                if isinstance(attempt, dict)
+                else ""
+            )
+            expired_active_ip_attempt = False
+            if stage in {"may_have_triggered", "retry_ip"} and observation_deadline:
+                try:
+                    deadline = datetime.fromisoformat(
+                        observation_deadline.replace("Z", "+00:00")
+                    )
+                    if deadline.tzinfo is None:
+                        deadline = deadline.replace(tzinfo=timezone.utc)
+                    expired_active_ip_attempt = deadline <= datetime.now(timezone.utc)
+                except (TypeError, ValueError):
+                    # A malformed deadline is not treated as an expired proof.
+                    # The ordinary worker path will fail closed on that invalid
+                    # durable attempt instead of silently extending it.
+                    expired_active_ip_attempt = False
             resume_sid = str(current.get("slot_id") or "")
             if (
                 resume_sid
@@ -3594,11 +3658,51 @@ class App:
                     state = dict(current, stage="retry_creation", failure_phase=None, failure_reason=None)
                 else:
                     state = dict(current, stage="ip_pending", failure_phase=None, failure_reason=None)
+            elif expired_active_ip_attempt:
+                # Retry / Resume is an explicit request to continue this saved
+                # in-flight reset.  Reopen only its read-only verification
+                # window: preserve the durable baseline, slot and queue and do
+                # not dispatch a second webhook merely because Creator was
+                # offline past the old deadline.  Automatic worker re-entry
+                # deliberately does not pass through this branch.
+                state = prepare_bulk_retry(
+                    dict(current, stage="paused", failure_phase="ip")
+                )
+                self.log(
+                    "BATCH IP resume: renewed the expired read-only verification "
+                    "window for the saved reset; no webhook was submitted."
+                )
             elif stage not in {None, "idle"}:
                 # An app restart leaves an active durable stage with no worker.
                 state = current
             else:
                 raise BulkError("There is no saved batch to resume.")
+            # Retry / Resume clears the human-readable pause reason, but never
+            # clears the durable IP action marker.  Clearing that marker used
+            # to manufacture another MacroDroid allowance on every click and
+            # was the source of the observed webhook loop.
+            if (
+                expired_active_ip_attempt
+                or current.get("failure_phase") == "ip"
+                or current.get("failure_code") in {
+                    IP_AUTO_RETRY_MARKER_CODE,
+                    IP_RETRY_EXHAUSTED_CODE,
+                }
+            ):
+                preserved_code = (
+                    current.get("failure_code")
+                    if current.get("failure_code") in {
+                        IP_AUTO_RETRY_MARKER_CODE,
+                        IP_RETRY_EXHAUSTED_CODE,
+                    }
+                    else None
+                )
+                state = dict(
+                    state,
+                    failure_phase=None,
+                    failure_reason=None,
+                    failure_code=preserved_code,
+                )
             self._persist_bulk(state, allow_from_stopped=True)
             # Resume must preserve the saved queue; show its real remaining
             # count without adopting the editor count or rewriting editor rows.
@@ -3785,10 +3889,67 @@ class App:
         *,
         code: str = "",
         already_elapsed: bool = False,
+        retryable: bool = True,
     ) -> bool:
-        """After the grace window, clear stale IP evidence and retry normally."""
+        """Retry only a pre-trigger baseline failure; otherwise pause safely.
+
+        Once either MacroDroid or the local Xiaomi phase has been claimed, no
+        generic retry path may submit another reset.  The dedicated IP checker
+        owns the one safe MacroDroid->ADB handoff; all other failures preserve
+        the queue head for read-only Resume verification.
+
+        This is deliberately local/non-AI recovery: Anthropic cannot rotate or
+        verify the proxy egress and must never receive these failures.
+        """
+        safe_reason = str(reason).strip()[:300] or "IP verification failed."
+        state = dict(self.bulk_state)
+        action_count = int(state.get("ip_reset_attempt_count") or 0)
+        baseline_retry_already_used = str(state.get("failure_code") or "") in {
+            IP_AUTO_RETRY_MARKER_CODE,
+        }
+        if not retryable:
+            self.log(
+                "BATCH IP: non-retryable local IP/configuration failure; pausing "
+                "with the current queue head preserved (Anthropic calls=0)."
+            )
+            self._pause_bulk(
+                "ip", safe_reason, code=code or "ip_nonretryable_failure"
+            )
+            return False
+        if action_count >= 1 or baseline_retry_already_used:
+            exhausted = (
+                action_count >= MAX_IP_RESET_ATTEMPTS_PER_HEAD
+                or code == IP_RETRY_EXHAUSTED_CODE
+            )
+            self.log(
+                f"BATCH IP: action phase {action_count}/"
+                f"{MAX_IP_RESET_ATTEMPTS_PER_HEAD} did not verify; pausing the "
+                "same queue head without another webhook, radio cycle, or "
+                "Anthropic call."
+            )
+            self._set_diag(
+                "set_disposition",
+                "IP action is no longer safely repeatable; batch paused",
+            )
+            self._set_diag(
+                "set_queue", "queue and slot preserved; current item not consumed"
+            )
+            self._pause_bulk(
+                "ip",
+                safe_reason,
+                code=(
+                    IP_RETRY_EXHAUSTED_CODE
+                    if exhausted
+                    else (
+                        IP_AUTO_RETRY_MARKER_CODE
+                        if baseline_retry_already_used
+                        else (code or "ip_verification_failed")
+                    )
+                ),
+            )
+            return False
         if not self._wait_bulk_failure_grace(
-            "ip", reason, already_elapsed=already_elapsed
+            "ip", safe_reason, already_elapsed=already_elapsed
         ):
             return False
         state = dict(self.bulk_state)
@@ -3799,9 +3960,12 @@ class App:
             verified_at_utc=None,
             trigger_deadline_utc=None,
             ready_at_utc=None,
-            failure_phase=None,
-            failure_reason=None,
-            failure_code=None,
+            # Persist the one allowed automatic retry before a second webhook
+            # can be submitted.  A crash here therefore fails closed instead
+            # of resetting the retry allowance.
+            failure_phase="ip",
+            failure_reason=safe_reason,
+            failure_code=IP_AUTO_RETRY_MARKER_CODE,
             ip_attempt=None,
             recovery=None,
         )
@@ -3818,10 +3982,11 @@ class App:
         else:
             self.log(
                 "BATCH IP: the three-minute recovery window expired; starting a "
-                "new verified IP reset for the same queue item."
+                "final verified IP reset (attempt 2/2) for the same queue item."
             )
             self._set_diag(
-                "set_disposition", "IP failure auto-retried after 180 seconds"
+                "set_disposition",
+                "IP failure auto-retried once after 180 seconds (attempt 2/2)",
             )
         self._set_diag("set_queue", "queue preserved; retrying the same item")
         return True
@@ -3870,6 +4035,44 @@ class App:
             )
             return False
         return self._stall_reset(sid, entry, reason, immediate=already_elapsed)
+
+    def _retry_reddit_email_later(self, sid: str, reason: str) -> bool:
+        """Retry one transient Reddit email rejection without destructive reset.
+
+        The current queue head, slot, exact container and saved email stay
+        unchanged.  One durable marker permits one delayed creation retry; a
+        repeated rejection pauses safely instead of looping or spending AI.
+        """
+        marker = "reddit_email_retry_later_auto_retry"
+        state = dict(self.bulk_state)
+        if str(state.get("failure_code") or "") == marker:
+            self.log(
+                f"BATCH {sid}: Reddit rejected the same saved email after the "
+                "single delayed retry; pausing without another submit, container "
+                "reset, queue advance or Anthropic call."
+            )
+            self._pause_bulk(
+                "creation", reason, code=RedditEmailRetryLater.failure_code
+            )
+            return False
+        if not self._wait_bulk_failure_grace("creation", reason):
+            return False
+        current = dict(self.bulk_state)
+        current.update(
+            stage="retry_creation",
+            failure_phase="creation",
+            failure_reason=str(reason).strip()[:300],
+            failure_code=marker,
+        )
+        self._persist_bulk(current)
+        self.log(
+            f"BATCH {sid}: retrying the same saved email once after the bounded "
+            "delay; queue, slot and container preserved; Anthropic calls=0."
+        )
+        self._set_diag(
+            "set_queue", "queue preserved; one delayed Reddit email retry"
+        )
+        return True
 
     def _retry_completed_cleanup_after_failure(self, sid: str, reason: str) -> bool:
         """Pause after one failed cleanup attempt; never enter a timed loop."""
@@ -3927,7 +4130,16 @@ class App:
                         "Automatic creation reset has no durable slot or queue head."
                     )
                 return self._reset_failed_creation(sid, dict(queue_rows[0]), reason)
-            return self._retry_ip_after_failure(reason, code=code)
+            return self._retry_ip_after_failure(
+                reason,
+                code=code,
+                retryable=code not in {
+                    "ip_authentication_failed",
+                    "ip_configuration_failed",
+                    "ip_history_failed",
+                    "ip_storage_failed",
+                },
+            )
         except (BulkError, OSError, TypeError, ValueError) as recovery_exc:
             # A durable-state write failure is the one case where destructive
             # recovery must stop: deleting a container before the queue update
@@ -4102,7 +4314,11 @@ class App:
                     f"{instance_id[:8]}; API calls=0."
                 )
             else:
-                instance_id = str(
+                # Ghost stores only the displayed short prefix, while Crane's
+                # prefs checkpoint stores the full UUID.  Prefer the full UUID
+                # so a legitimate stalled cleanup never tries to replace it
+                # with its own prefix (the live a0277 failure).
+                instance_id = crane_container_instance(row) or str(
                     row.get("ghost_container_instance") or ""
                 ).strip().upper()
                 if not instance_id:
@@ -4360,56 +4576,478 @@ class App:
         except (tk.TclError, AttributeError):
             pass
 
+    def _android_radio_config(self) -> tuple[str | None, str | None]:
+        """Return optional local ADB configuration without ever logging it."""
+        try:
+            secrets = load_secrets()
+        except Exception:
+            secrets = {}
+        adb_path = str(
+            secrets.get("xiaomi_adb_path")
+            or secrets.get("android_adb_path")
+            or ""
+        ).strip()
+        serial = str(
+            secrets.get("xiaomi_adb_serial")
+            or secrets.get("android_adb_serial")
+            or ""
+        ).strip()
+        return adb_path or None, serial or None
+
+    def _persist_radio_transition(
+        self,
+        phase: str,
+        *,
+        operation_id: str,
+        attempt_number: int,
+    ) -> None:
+        """Durably advance one slot-bound radio journal transition."""
+        order = {
+            "pending": 0,
+            "on_confirmed": 1,
+            "restore_pending": 2,
+            "off_confirmed": 3,
+            "verify_pending": 4,
+            "completed": 5,
+        }
+        if phase not in order:
+            raise BulkError("Android radio recovery reported an invalid phase.")
+        current = dict(self.bulk_state)
+        radio = dict(current.get("radio_recovery") or empty_radio_recovery())
+        existing = str(radio.get("state") or "none")
+        if existing != "none":
+            if (
+                str(radio.get("operation_id") or "") != operation_id
+                or int(radio.get("attempt") or 0) != attempt_number
+                or str(radio.get("head_fingerprint") or "")
+                != radio_recovery_head_fingerprint(current)
+            ):
+                raise BulkError("Android radio recovery no longer matches this queue head.")
+            if existing in order and order[phase] < order[existing]:
+                raise BulkError("Android radio recovery attempted to move backwards.")
+            if existing == phase:
+                return
+        elif phase != "pending":
+            raise BulkError("Android radio recovery was not claimed before mutation.")
+        elif int(current.get("ip_reset_attempt_count") or 0) != attempt_number - 1:
+            raise BulkError("Android radio recovery has no safe remaining attempt.")
+        current.update(
+            ip_reset_attempt_count=attempt_number,
+            radio_recovery={
+                "version": 1,
+                "state": phase,
+                "attempt": attempt_number,
+                "head_fingerprint": radio_recovery_head_fingerprint(current),
+                "operation_id": operation_id,
+                "updated_at_utc": bulk_utc_now(),
+            },
+        )
+        self._persist_bulk(current)
+        self.log(
+            f"BATCH IP: local Xiaomi recovery {phase} "
+            f"({attempt_number}/{MAX_IP_RESET_ATTEMPTS_PER_HEAD})."
+        )
+
+    def _renew_radio_ip_observation(
+        self,
+        *,
+        observation_seconds: float = 180.0,
+    ) -> dict:
+        """Open a fresh read-only verification window after the local cycle."""
+        current = dict(self.bulk_state)
+        attempt = dict(current.get("ip_attempt") or {})
+        if not attempt or not attempt.get("baseline"):
+            raise BulkError("Android radio recovery has no durable comparison IP.")
+        stamp = datetime.now(timezone.utc)
+        attempt.update(
+            candidate=None,
+            verification_evidence=None,
+            confirmation_floor=int(attempt.get("check_sequence") or 0),
+            observation_deadline_utc=(
+                stamp + timedelta(seconds=float(observation_seconds))
+            )
+            .isoformat()
+            .replace("+00:00", "Z"),
+        )
+        current.update(
+            stage="retry_ip",
+            trigger_deadline_utc=attempt["observation_deadline_utc"],
+            ip_attempt=attempt,
+            failure_phase=None,
+            failure_reason=None,
+        )
+        self._persist_bulk(current)
+        return dict(self.bulk_state)
+
+    def _run_xiaomi_radio_fallback(
+        self,
+        observations: list[dict],
+        *,
+        attempt_number: int | None = None,
+        fast: bool = False,
+    ) -> tuple[dict, list[dict]]:
+        """Perform/restore one journaled local cycle, then verify FalconProxy."""
+        try:
+            current = dict(self.bulk_state)
+            radio = dict(current.get("radio_recovery") or empty_radio_recovery())
+            radio_state = str(radio.get("state") or "none")
+            operation_id = str(radio.get("operation_id") or "")
+            perform_full_cycle = radio_state == "none"
+            if perform_full_cycle:
+                operation_id = str(uuid.uuid4())
+                spent = int(current.get("ip_reset_attempt_count") or 0)
+                attempt_number = attempt_number or (spent + 1)
+                if spent != attempt_number - 1:
+                    raise BulkError("Android radio recovery has no safe remaining attempt.")
+            else:
+                journal_attempt = int(radio.get("attempt") or 0)
+                if attempt_number is not None and attempt_number != journal_attempt:
+                    raise BulkError("Android radio recovery attempt metadata is invalid.")
+                attempt_number = journal_attempt
+            if not 1 <= int(attempt_number or 0) <= MAX_IP_RESET_ATTEMPTS_PER_HEAD:
+                raise BulkError("Android radio recovery attempt metadata is invalid.")
+
+            def transition(phase: str) -> None:
+                self._persist_radio_transition(
+                    phase,
+                    operation_id=operation_id,
+                    attempt_number=attempt_number,
+                )
+
+            adb_path, serial = self._android_radio_config()
+            if perform_full_cycle:
+                reset_kwargs = {}
+                if fast:
+                    reset_kwargs.update(
+                        airplane_hold_seconds=FAST_IP_AIRPLANE_HOLD_SECONDS,
+                        settle_seconds=FAST_IP_SETTLE_SECONDS,
+                    )
+                reset_android_cellular_radio(
+                    adb_path=adb_path,
+                    device_serial=serial,
+                    cancel_event=self.stop,
+                    on_transition=transition,
+                    **reset_kwargs,
+                )
+            elif radio_state in {"pending", "on_confirmed", "restore_pending"}:
+                # A crash could have happened immediately before or after the
+                # physical ON command.  Restore only; never repeat the cycle.
+                restore_android_cellular_radio(
+                    adb_path=adb_path,
+                    device_serial=serial,
+                    cancel_event=self.stop,
+                    on_transition=transition,
+                )
+            elif radio_state not in {
+                "off_confirmed", "verify_pending", "completed",
+            }:
+                raise BulkError("Android radio recovery state is invalid.")
+            elif radio_state != "completed":
+                # The physical safe state is already proven.  Close the
+                # durable journal before opening a read-only IP window.
+                transition("completed")
+
+            observation_seconds = FAST_IP_TOTAL_SECONDS if fast else 180.0
+            state = self._renew_radio_ip_observation(
+                observation_seconds=observation_seconds,
+            )
+            baseline = str(state.get("baseline_ip") or "")
+            attempt = state.get("ip_attempt")
+            if attempt and attempt.get("baseline"):
+                baseline_item = dict(attempt["baseline"])
+                if baseline_item not in observations:
+                    observations.append(baseline_item)
+            result = observe_proxy_without_trigger(
+                self.falcon_proxy_url,
+                baseline,
+                require_change=True,
+                cancel_event=self.stop,
+                attempt=attempt,
+                proxy_scope=self._bulk_proxy_scope(),
+                public_ip_url=DEFAULT_PUBLIC_IP_URL,
+                observation_seconds=observation_seconds,
+                poll_interval=(FAST_IP_POLL_SECONDS if fast else 4.0),
+                progress=self._bulk_progress,
+                on_observation=lambda item: observations.append(dict(item)),
+                on_checkpoint=lambda saved: self._checkpoint_bulk_ip_attempt(saved),
+            )
+            result["observation_only"] = True
+            result["local_radio_fallback"] = True
+            result["local_radio_primary"] = bool(fast)
+            result["ip_actions_exhausted"] = not fast
+            return result, observations
+        except AndroidRadioResetError as exc:
+            self.log(
+                "BATCH IP: local Xiaomi radio recovery failed safely "
+                f"({exc.category}); queue and slot remain preserved."
+            )
+            return {
+                "outcome": "cancelled" if exc.category == "cancelled" else "verification_failed",
+                "error": str(exc),
+                "error_category": f"android_radio_{exc.category}",
+                "local_radio_fallback": True,
+                "local_radio_primary": bool(fast),
+                "restore_verified": exc.restore_verified,
+                "ip_actions_exhausted": not fast,
+            }, observations
+        except BulkError as exc:
+            return {
+                "outcome": "verification_failed",
+                "error": str(exc),
+                "error_category": "storage",
+                "local_radio_fallback": True,
+                "local_radio_primary": bool(fast),
+                "ip_actions_exhausted": not fast,
+            }, observations
+
+    def _run_fast_xiaomi_ip_change(
+        self,
+        observations: list[dict],
+        *,
+        scope: str,
+        checkpoint,
+    ) -> tuple[dict, list[dict]]:
+        """Baseline first, then run one 10-second local Xiaomi reset."""
+        operation_id = str(uuid.uuid4())
+        local_error: AndroidRadioResetError | None = None
+        self.log(
+            "BATCH IP: starting fast Xiaomi ADB reset; target window 15-25s."
+        )
+
+        def before_local_reset(payload: dict) -> None:
+            current = dict(self.bulk_state)
+            if (
+                int(current.get("ip_reset_attempt_count") or 0) != 0
+                or dict(current.get("radio_recovery") or {})
+                != empty_radio_recovery()
+            ):
+                raise BulkError("Fast Xiaomi reset was already spent for this queue head.")
+            current.update(
+                stage="may_have_triggered",
+                baseline_ip=payload.get("baseline_ip"),
+                trigger_deadline_utc=payload.get("deadline_utc"),
+                ip_attempt=payload.get("attempt"),
+                failure_phase=None,
+                failure_reason=None,
+                failure_code=None,
+            )
+            self._persist_bulk(current)
+
+        def local_trigger(_unused_url: str, _timeout: float) -> dict:
+            nonlocal local_error
+            try:
+                adb_path, serial = self._android_radio_config()
+                reset_android_cellular_radio(
+                    adb_path=adb_path,
+                    device_serial=serial,
+                    cancel_event=self.stop,
+                    on_transition=lambda phase: self._persist_radio_transition(
+                        phase,
+                        operation_id=operation_id,
+                        attempt_number=1,
+                    ),
+                    airplane_hold_seconds=FAST_IP_AIRPLANE_HOLD_SECONDS,
+                    settle_seconds=FAST_IP_SETTLE_SECONDS,
+                )
+                return {
+                    "acknowledged": True,
+                    "uncertain": False,
+                    "status": 200,
+                    "error": "",
+                }
+            except AndroidRadioResetError as exc:
+                local_error = exc
+                return {
+                    "acknowledged": False,
+                    "uncertain": False,
+                    "status": None,
+                    "error": str(exc),
+                }
+
+        result = run_macrodroid_change(
+            # No request is made to this URL: ``local_trigger`` is the exact
+            # device-bound trigger.  The existing evidence engine is reused so
+            # baseline/checkpoint/two-confirmation semantics stay identical.
+            "https://local-xiaomi.invalid/reset",
+            self.falcon_proxy_url,
+            public_ip_url=DEFAULT_PUBLIC_IP_URL,
+            cancel_event=self.stop,
+            progress=self._bulk_progress,
+            on_observation=lambda item: observations.append(dict(item)),
+            before_trigger=before_local_reset,
+            on_checkpoint=checkpoint,
+            proxy_scope=scope,
+            require_baseline=True,
+            baseline_cycles=2,
+            operation_id=operation_id,
+            triggerer=local_trigger,
+            trigger_timeout=3.0,
+            check_timeout=3.0,
+            check_attempts=2,
+            retry_delay=0.5,
+            poll_interval=FAST_IP_POLL_SECONDS,
+            observation_seconds=FAST_IP_TOTAL_SECONDS,
+        )
+        result["local_radio_primary"] = True
+        if local_error is not None:
+            result.update(
+                error=str(local_error),
+                error_category=f"android_radio_{local_error.category}",
+                restore_verified=local_error.restore_verified,
+            )
+        return result, observations
+
+    def _run_macrodroid_ip_fallback(
+        self,
+        observations: list[dict],
+        *,
+        scope: str,
+        checkpoint,
+    ) -> tuple[dict, list[dict]]:
+        """Run the previous MacroDroid->ADB flow after the fast path fails."""
+        current = dict(self.bulk_state)
+        spent = int(current.get("ip_reset_attempt_count") or 0)
+        if spent >= MAX_IP_RESET_ATTEMPTS_PER_HEAD - 1:
+            return {
+                "outcome": "verification_failed",
+                "error": "No safe MacroDroid fallback attempt remains.",
+                "error_category": "attempts_exhausted",
+            }, observations
+        remote_attempt_number = spent + 1
+        existing_attempt = current.get("ip_attempt")
+        self.log(
+            "BATCH IP: fast local path did not verify; entering preserved "
+            f"MacroDroid fallback ({remote_attempt_number}/"
+            f"{MAX_IP_RESET_ATTEMPTS_PER_HEAD})."
+        )
+
+        def before_trigger(payload: dict) -> None:
+            latest = dict(self.bulk_state)
+            if int(latest.get("ip_reset_attempt_count") or 0) != spent:
+                raise BulkError("MacroDroid fallback no longer matches this queue head.")
+            radio = dict(latest.get("radio_recovery") or empty_radio_recovery())
+            if str(radio.get("state") or "none") not in {"none", "completed"}:
+                raise BulkError("Xiaomi radio recovery is not safely completed.")
+            latest.update(
+                stage="may_have_triggered",
+                baseline_ip=payload.get("baseline_ip"),
+                trigger_deadline_utc=payload.get("deadline_utc"),
+                ip_attempt=payload.get("attempt"),
+                ip_reset_attempt_count=remote_attempt_number,
+                radio_recovery=empty_radio_recovery(),
+                failure_phase=None,
+                failure_reason=None,
+                failure_code=None,
+            )
+            self._persist_bulk(latest)
+
+        result = run_macrodroid_change(
+            self.macrodroid_webhook,
+            self.falcon_proxy_url,
+            public_ip_url=DEFAULT_PUBLIC_IP_URL,
+            cancel_event=self.stop,
+            progress=self._bulk_progress,
+            on_observation=lambda item: observations.append(dict(item)),
+            before_trigger=before_trigger,
+            on_checkpoint=checkpoint,
+            proxy_scope=scope,
+            require_baseline=True,
+            baseline_cycles=12,
+            existing_attempt=(dict(existing_attempt) if existing_attempt else None),
+        )
+        result["macrodroid_fallback"] = True
+        if result.get("outcome") == "verified":
+            return result, observations
+        if (
+            result.get("outcome") == "no_change"
+            and result.get("trigger_acknowledged") is True
+            and int(self.bulk_state.get("ip_reset_attempt_count") or 0)
+            == remote_attempt_number
+            and remote_attempt_number < MAX_IP_RESET_ATTEMPTS_PER_HEAD
+        ):
+            self.log(
+                "BATCH IP: MacroDroid fallback was acknowledged but unchanged; "
+                "running its final journaled Xiaomi fallback."
+            )
+            return self._run_xiaomi_radio_fallback(
+                observations,
+                attempt_number=remote_attempt_number + 1,
+                fast=False,
+            )
+        return result, observations
+
+    def _checkpoint_bulk_ip_attempt(self, attempt: dict) -> None:
+        current = dict(self.bulk_state)
+        if current.get("stage") == "stopped":
+            raise BulkError("Batch stopped before IP checkpoint.")
+        baseline = attempt.get("baseline")
+        current.update(
+            ip_attempt=dict(attempt),
+            baseline_ip=(baseline or {}).get("ip") or current.get("baseline_ip"),
+        )
+        self._persist_bulk(current)
+
     def _run_bulk_ip_check(self, state: dict) -> tuple[dict, list[dict]]:
         observations: list[dict] = []
         scope = self._bulk_proxy_scope()
 
         def checkpoint(attempt: dict) -> None:
-            current = dict(self.bulk_state)
-            if current.get("stage") == "stopped":
-                raise BulkError("Batch stopped before IP checkpoint.")
-            baseline = attempt.get("baseline")
-            current.update(
-                ip_attempt=dict(attempt),
-                baseline_ip=(baseline or {}).get("ip") or current.get("baseline_ip"),
-            )
-            self._persist_bulk(current)
+            self._checkpoint_bulk_ip_attempt(attempt)
 
         stage = state.get("stage")
         if stage == "ip_pending":
-            operation_id = str(uuid.uuid4())
-
-            def before_trigger(payload: dict) -> None:
-                current = dict(self.bulk_state)
-                current.update(
-                    stage="may_have_triggered",
-                    baseline_ip=payload.get("baseline_ip"),
-                    trigger_deadline_utc=payload.get("deadline_utc"),
-                    ip_attempt=payload.get("attempt"),
-                    failure_phase=None,
-                )
-                self._persist_bulk(current)
-
-            result = run_macrodroid_change(
-                self.macrodroid_webhook,
-                self.falcon_proxy_url,
-                public_ip_url=DEFAULT_PUBLIC_IP_URL,
-                cancel_event=self.stop,
-                progress=self._bulk_progress,
-                on_observation=lambda item: observations.append(dict(item)),
-                before_trigger=before_trigger,
-                on_checkpoint=checkpoint,
-                proxy_scope=scope,
-                require_baseline=True,
-                # A transient proxy-auth outage has taken roughly one minute
-                # in production.  Keep observing for a bounded extended window
-                # and never submit a reset until a comparison IP is durable.
-                baseline_cycles=12,
-                operation_id=operation_id,
+            result, observations = self._run_fast_xiaomi_ip_change(
+                observations,
+                scope=scope,
+                checkpoint=checkpoint,
             )
             if result.get("outcome") == "verified":
                 result["trigger_attempted"] = True
-            return result, observations
+                return result, observations
+            if result.get("outcome") == "cancelled":
+                return result, observations
+            if result.get("error_category") in {"storage", "android_radio_journal_failed"}:
+                return result, observations
+            if result.get("restore_verified") is False:
+                return result, observations
+
+            latest_radio = dict(
+                self.bulk_state.get("radio_recovery") or empty_radio_recovery()
+            )
+            latest_radio_state = str(latest_radio.get("state") or "none")
+            if (
+                str(result.get("error_category") or "").startswith("android_radio_")
+                and latest_radio_state not in {"none", "completed"}
+            ):
+                # The reset failed after a durable transition.  Finish only
+                # the safe restore/readback path and verify the original
+                # baseline before allowing MacroDroid to perform another
+                # reset action.
+                result, observations = self._run_xiaomi_radio_fallback(
+                    observations,
+                    attempt_number=int(latest_radio.get("attempt") or 1),
+                    fast=True,
+                )
+                if result.get("outcome") == "verified":
+                    return result, observations
+                if (
+                    result.get("outcome") == "cancelled"
+                    or result.get("error_category") in {
+                        "storage", "android_radio_journal_failed",
+                    }
+                    or result.get("restore_verified") is False
+                ):
+                    return result, observations
+
+            # A locally completed reset which simply did not produce a
+            # verified change hands off immediately.  If ADB failed before its
+            # first durable transition, count remains zero and MacroDroid is
+            # still the first actual reset action.
+            return self._run_macrodroid_ip_fallback(
+                observations,
+                scope=scope,
+                checkpoint=checkpoint,
+            )
 
         baseline = str(state.get("baseline_ip") or "")
         if not baseline:
@@ -4420,6 +5058,46 @@ class App:
         attempt = state.get("ip_attempt")
         if attempt and attempt.get("baseline"):
             observations.append(dict(attempt["baseline"]))
+        radio = dict(state.get("radio_recovery") or empty_radio_recovery())
+        radio_state = str(radio.get("state") or "none")
+        if radio_state != "none":
+            radio_attempt = int(radio.get("attempt") or 0)
+            result, observations = self._run_xiaomi_radio_fallback(
+                observations,
+                attempt_number=radio_attempt,
+                fast=(radio_attempt == 1),
+            )
+            if result.get("outcome") == "verified":
+                return result, observations
+            if (
+                radio_attempt == 1
+                and result.get("outcome") != "cancelled"
+                and result.get("error_category") not in {
+                    "storage", "android_radio_journal_failed",
+                }
+                and result.get("restore_verified") is not False
+            ):
+                return self._run_macrodroid_ip_fallback(
+                    observations,
+                    scope=scope,
+                    checkpoint=checkpoint,
+                )
+            return result, observations
+        if (
+            int(state.get("ip_reset_attempt_count") or 0) == 1
+            and str(state.get("failure_code") or "")
+            == IP_RETRY_EXHAUSTED_CODE
+        ):
+            # v6 migration of the reported exhausted MacroDroid run lands
+            # here.  Its full observation window already elapsed, so use the
+            # one remaining local phase immediately instead of waiting again.
+            return self._run_xiaomi_radio_fallback(
+                observations,
+                attempt_number=2,
+                fast=False,
+            )
+        spent_actions = int(state.get("ip_reset_attempt_count") or 0)
+        fast_checkpoint_only = spent_actions == 0
         result = observe_proxy_without_trigger(
             self.falcon_proxy_url,
             baseline,
@@ -4428,12 +5106,48 @@ class App:
             attempt=attempt,
             proxy_scope=scope,
             public_ip_url=DEFAULT_PUBLIC_IP_URL,
+            observation_seconds=(
+                FAST_IP_TOTAL_SECONDS if fast_checkpoint_only else 180.0
+            ),
+            poll_interval=(
+                FAST_IP_POLL_SECONDS if fast_checkpoint_only else 4.0
+            ),
             progress=self._bulk_progress,
             on_observation=lambda item: observations.append(dict(item)),
             on_checkpoint=checkpoint,
         )
         if result.get("outcome") == "verified":
             result["observation_only"] = True
+            return result, observations
+        if (
+            result.get("outcome") == "no_change"
+            and int(self.bulk_state.get("ip_reset_attempt_count") or 0)
+            in {1, 2}
+            and dict(self.bulk_state.get("radio_recovery") or {})
+            == empty_radio_recovery()
+        ):
+            # MacroDroid was already durably claimed.  Only after the saved
+            # observation window proves no change may its local fallback run.
+            spent = int(self.bulk_state.get("ip_reset_attempt_count") or 0)
+            return self._run_xiaomi_radio_fallback(
+                observations,
+                attempt_number=spent + 1,
+                fast=False,
+            )
+        if (
+            result.get("outcome") == "no_change"
+            and int(self.bulk_state.get("ip_reset_attempt_count") or 0) == 0
+            and dict(self.bulk_state.get("radio_recovery") or {})
+            == empty_radio_recovery()
+        ):
+            # Creator stopped after the fast baseline checkpoint but before
+            # ADB claimed a physical transition.  Do not repeat the uncertain
+            # local path; continue with the preserved MacroDroid error handler.
+            return self._run_macrodroid_ip_fallback(
+                observations,
+                scope=scope,
+                checkpoint=checkpoint,
+            )
         return result, observations
 
     def _record_bulk_ip(self, result: dict, observations: list[dict]) -> str:
@@ -4500,6 +5214,7 @@ class App:
                 if not self._retry_ip_after_failure(
                     self.macrodroid_config_error,
                     code="macrodroid_setup_failed",
+                    retryable=False,
                 ):
                     return
             while not self.stop.is_set() and int(self.bulk_state.get("remaining") or 0) > 0:
@@ -4612,9 +5327,21 @@ class App:
                     if self.stop.is_set():
                         return
                     if result.get("outcome") != "verified":
+                        error_category = str(result.get("error_category") or "")
                         if self._retry_ip_after_failure(
                             str(result.get("error") or "IP verification failed."),
-                            code="ip_verification_failed",
+                            code=(
+                                IP_RETRY_EXHAUSTED_CODE
+                                if result.get("ip_actions_exhausted")
+                                else "ip_verification_failed"
+                            ),
+                            # ``no_change`` is returned only after the complete
+                            # observation deadline.  Do not add a redundant
+                            # second 180-second grace before the sole retry.
+                            already_elapsed=result.get("outcome") == "no_change",
+                            retryable=error_category not in {
+                                "authentication", "configuration", "storage",
+                            },
                         ):
                             continue
                         return
@@ -4625,6 +5352,7 @@ class App:
                         if self._retry_ip_after_failure(
                             f"Verified IP could not be persisted: {exc}",
                             code="ip_persist_failed",
+                            retryable=False,
                         ):
                             continue
                         return
@@ -4635,6 +5363,8 @@ class App:
                         verified_ip=str(result["new_ip"]),
                         verified_at_utc=confirmed_at,
                         failure_phase=None,
+                        failure_reason=None,
+                        failure_code=None,
                     )
                     self._persist_bulk(state)
                     freshly_verified = True
@@ -4651,10 +5381,14 @@ class App:
                         progress=self._bulk_progress,
                     )
                     if recheck.get("outcome") != "verified":
+                        error_category = str(recheck.get("error_category") or "")
                         if self._retry_ip_after_failure(
                             "Verified proxy IP could not be reconfirmed.",
                             code="proxy_recheck_failed",
                             already_elapsed=True,
+                            retryable=error_category not in {
+                                "authentication", "configuration", "storage",
+                            },
                         ):
                             continue
                         return
@@ -4669,6 +5403,7 @@ class App:
                                 f"Reused batch IP could not be persisted: {exc}",
                                 code="ip_persist_failed",
                                 already_elapsed=True,
+                                retryable=False,
                             ):
                                 continue
                             return
@@ -4707,6 +5442,10 @@ class App:
                     failure_code = str(
                         getattr(self, "_last_pipeline_failure_code", "") or ""
                     )
+                    if failure_code == RedditEmailRetryLater.failure_code:
+                        if self._retry_reddit_email_later(sid, reason):
+                            continue
+                        return
                     # Shared credential/modal failures and an unconfirmed
                     # exact-container selection must never be converted into
                     # a destructive stall reset when AI recovery was disabled
@@ -4718,6 +5457,7 @@ class App:
                         ICloudModalBlockingError.failure_code,
                         ContainerProvisioningReconcileError.failure_code,
                         ContainerSelectionError.failure_code,
+                        EmailFieldInvalid.failure_code,
                         AI_RECOVERY_BUDGET_EXHAUSTED_CODE,
                         AI_DISCARD_REFUSED_CODE,
                         "ai_discard_restart",
@@ -4825,7 +5565,20 @@ class App:
                 restart_after_failure = self._recover_bulk_loop_failure(
                     str(exc), code="bulk_save_failed"
                 )
-        except (BulkError, HistoryError, IpChangeError, PhoneError, OSError, TypeError, ValueError) as exc:
+        except HistoryError as exc:
+            if not self.stop.is_set():
+                restart_after_failure = self._recover_bulk_loop_failure(
+                    str(exc), code="ip_history_failed"
+                )
+        except IpChangeError as exc:
+            if not self.stop.is_set():
+                category = re.sub(
+                    r"[^a-z0-9_]+", "_", str(getattr(exc, "category", "") or "unknown").casefold()
+                ).strip("_")[:50] or "unknown"
+                restart_after_failure = self._recover_bulk_loop_failure(
+                    str(exc), code=f"ip_{category}_failed"
+                )
+        except (BulkError, PhoneError, OSError, TypeError, ValueError) as exc:
             if not self.stop.is_set():
                 restart_after_failure = self._recover_bulk_loop_failure(
                     str(exc), code="local_failure"
@@ -6411,6 +7164,67 @@ class App:
                         ),
                         handler=verified_create_select,
                     )
+                elif failure_code == EmailFieldInvalid.failure_code:
+                    workflow_scope = "account_form"
+                    recovery_context = {
+                        "stage": workflow_scope,
+                        "failure_code": failure_code,
+                        "required_result": (
+                            "saved email locally retyped and exact Reddit email "
+                            "field locally verified"
+                        ),
+                    }
+                    email_retry_verified = False
+
+                    def verified_retry_saved_email(_payload):
+                        nonlocal email_retry_verified
+                        verified_slot = get_slot(sid) or {}
+                        saved = str(verified_slot.get("email") or "").strip().lower()
+                        if not _valid_pipeline_email(saved):
+                            raise PhoneError(
+                                "Account-form recovery has no valid saved email."
+                            )
+                        retry_saved_email_field(
+                            stack,
+                            phone,
+                            saved,
+                            sid,
+                            stop=attempt_stop,
+                            log_fn=self.log,
+                        )
+                        email_retry_verified = True
+                        return "exact saved Reddit email field locally verified"
+
+                    workflow_tools[
+                        "verified_retry_saved_email_field"
+                    ] = RecoveryWorkflowTool(
+                        description=(
+                            "Force-clear and retype the controller-bound saved "
+                            "Hide My Email address, then prove the exact Reddit "
+                            "email field from a fresh local dump. The address is "
+                            "never revealed to or selected by the model, and this "
+                            "tool never taps Continue."
+                        ),
+                        handler=verified_retry_saved_email,
+                    )
+
+                    def account_form_resume_guard(observation):
+                        saved = str(
+                            (get_slot(sid) or {}).get("email") or ""
+                        ).strip().lower()
+                        if (
+                            email_retry_verified
+                            and _valid_pipeline_email(saved)
+                            and reddit_email_ready(observation.nodes, saved)
+                        ):
+                            return True, "exact saved Reddit email field locally proven"
+                        return (
+                            False,
+                            "saved Reddit email is not yet exact and locally proven; "
+                            "use verified_retry_saved_email_field before resuming",
+                        )
+
+                    resume_guard = account_form_resume_guard
                 elif str(failure_code).startswith("icloud_"):
                     workflow_scope = "icloud_unlock"
                     recovery_context["stage"] = workflow_scope
@@ -6469,6 +7283,20 @@ class App:
                             ),
                             handler=retry_icloud_unlock,
                         )
+
+                    def icloud_resume_guard(observation):
+                        saved = str((get_slot(sid) or {}).get("email") or "").strip().lower()
+                        if saved and _valid_pipeline_email(saved):
+                            return True, "Hide My Email checkpoint is locally verified"
+                        if hide_my_email_recovery_ready(observation.nodes):
+                            return True, "Hide My Email workflow screen is locally verified"
+                        return (
+                            False,
+                            "still outside the verified Hide My Email workflow; "
+                            "open the Hide My Email list before resuming",
+                        )
+
+                    resume_guard = icloud_resume_guard
                 chain = getattr(self, "_pending_ui_recovery_chain", None)
                 if not isinstance(chain, RecoveryChain):
                     chain = RecoveryChain()
@@ -6954,6 +7782,22 @@ class App:
                 disposition="attempt failed; batch pauses with the same queue item",
                 note="The generated email field was invalid (expected failure).",
             )
+        except RedditEmailRetryLater as exc:
+            self._last_pipeline_failure_shared = False
+            self._last_pipeline_failure_code = exc.failure_code
+            self._last_pipeline_failure_reason = str(exc)
+            self.log(f"FAILED PIPELINE {sid}: {exc}")
+            self.status.set("Reddit email temporarily rejected — bounded retry")
+            attempt_failure(
+                "expected",
+                exc=exc,
+                code=exc.failure_code,
+                disposition=(
+                    "transient Reddit email rejection; preserve the same queue "
+                    "item, slot, container and email for one delayed retry"
+                ),
+                note="Local bounded handler; Anthropic calls=0.",
+            )
         except SSHAuthError as exc:
             # SSH authentication failure prevents every account from working.
             self._last_pipeline_failure_shared = True
@@ -7286,6 +8130,65 @@ class App:
                     disposition="user Stop: attempt preserved and not retried",
                     note="The user pressed Stop; checkpoints stay preserved.",
                 )
+            elif isinstance(exc, ExistingAccountContainerError):
+                current_slot = get_slot(sid) or {}
+                bulk_state_now = getattr(self, "bulk_state", {})
+                replace_incomplete_container = bool(
+                    isinstance(bulk_state_now, dict)
+                    and bulk_state_now.get("stage")
+                    in {"creating", "retry_creation", "ip_verified"}
+                    and str(bulk_state_now.get("slot_id") or sid) == sid
+                    and not current_slot.get("reddit")
+                )
+                if replace_incomplete_container:
+                    # A strong profile proof means this newly selected container
+                    # is contaminated with pre-existing Reddit state.  Reuse the
+                    # same exact-UUID deletion/checkpoint path as the proven
+                    # missing-Crane-doorway recovery.  The outer batch loop then
+                    # rotates IP and provisions/selects a brand-new container.
+                    self._last_pipeline_failure_shared = False
+                    self._last_pipeline_failure_code = (
+                        CONTAINER_RECREATE_FAILURE_CODE
+                    )
+                    self._last_pipeline_failure_reason = str(exc)
+                    self.log(
+                        f"FAILED PIPELINE {sid}: strong existing-profile proof in "
+                        "an incomplete bulk container; Anthropic calls=0; "
+                        "requesting immediate verified container replacement."
+                    )
+                    self.status.set(
+                        "Existing profile detected — verified container replacement"
+                    )
+                    attempt_failure(
+                        "attempt_failure",
+                        exc=exc,
+                        code=CONTAINER_RECREATE_FAILURE_CODE,
+                        disposition=(
+                            "typed existing-profile contamination on an incomplete "
+                            "bulk attempt; run exact-UUID delete/new-IP/new-container "
+                            "replacement"
+                        ),
+                        note=(
+                            "No logout, profile mutation or Anthropic request was made."
+                        ),
+                    )
+                else:
+                    # Never delete a container from a manual run or after the
+                    # created-account checkpoint exists.
+                    self._last_pipeline_failure_shared = True
+                    self._last_pipeline_failure_code = exc.failure_code
+                    self._last_pipeline_failure_reason = str(exc)
+                    self.log(f"FAILED PIPELINE {sid}: {exc}")
+                    self.status.set("Failed — existing account preserved")
+                    attempt_failure(
+                        "attempt_failure",
+                        exc=exc,
+                        code=exc.failure_code,
+                        disposition=(
+                            "existing account/container preserved; automatic "
+                            "replacement is allowed only for an incomplete bulk attempt"
+                        ),
+                    )
             elif timed_out.is_set():
                 self._record_pipeline_timeout(sid)
                 attempt_failure(
@@ -7305,7 +8208,11 @@ class App:
                 # both the stack and HTTP wait throughout recovery.
                 return run_ai_recovery(
                     exc,
-                    failure_code=self._last_pipeline_failure_code or "",
+                    failure_code=(
+                        str(getattr(exc, "failure_code", "") or "")
+                        or self._last_pipeline_failure_code
+                        or ""
+                    ),
                 )
             else:
                 # Generic PhoneError is deterministic/local by default.  It is

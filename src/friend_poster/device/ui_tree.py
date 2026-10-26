@@ -43,6 +43,20 @@ def preview_detail_enabled() -> bool:
     return _PREVIEW_DETAIL
 
 
+def _log_encoding_safe(log: LogFn, message: str) -> None:
+    """Retry a diagnostic line with ASCII escapes if its sink rejects Unicode.
+
+    Windows console streams may still use a legacy code page such as cp1252.
+    UI text is untrusted and can contain any script, so a diagnostic preview
+    must never abort the phone workflow merely because the sink cannot encode
+    one of its characters. Other logger failures remain visible.
+    """
+    try:
+        log(message)
+    except UnicodeEncodeError:
+        log(message.encode("ascii", errors="backslashreplace").decode("ascii"))
+
+
 class OperationCancelled(PhoneError):
     """Raised when Creator Stop cancels a pending phone operation."""
 
@@ -1471,23 +1485,34 @@ def dump_named(
     mode = "" if persist else " (transient; not saved)"
     detailed = preview and preview_detail_enabled()
     if detailed:
-        log(f"== frame begin: {stem} ==")
-    log(f"{stem}: {len(nodes)} nodes, {len(clickable)} labeled{mode}")
+        _log_encoding_safe(log, f"== frame begin: {stem} ==")
+    _log_encoding_safe(
+        log, f"{stem}: {len(nodes)} nodes, {len(clickable)} labeled{mode}"
+    )
     if preview:
         shown = clickable if detailed else clickable[:12]
         for n in shown:
-            log(f"  - {n.ntype} {n.labels()[:80]!r} [{n.x},{n.y} {n.w}x{n.h}]")
+            _log_encoding_safe(
+                log,
+                f"  - {n.ntype} {n.labels()[:80]!r} [{n.x},{n.y} {n.w}x{n.h}]",
+            )
         if detailed:
             hidden = len(clickable) - len(shown)
             if hidden > 0:
-                log(f"  - ... {hidden} more labeled node(s) omitted")
-            log(f"== frame end: {stem} ({len(shown)} of {len(clickable)} labeled) ==")
+                _log_encoding_safe(
+                    log, f"  - ... {hidden} more labeled node(s) omitted"
+                )
+            _log_encoding_safe(
+                log,
+                f"== frame end: {stem} ({len(shown)} of {len(clickable)} labeled) ==",
+            )
     else:
         # Privacy-sensitive screens keep preview=False; report safe metadata only
         # so the suppression is explained without exposing any label text.
-        log(
+        _log_encoding_safe(
+            log,
             f"  - frame preview suppressed (privacy-sensitive); "
-            f"{len(nodes)} nodes, {len(clickable)} labeled"
+            f"{len(nodes)} nodes, {len(clickable)} labeled",
         )
     return blob, nodes
 

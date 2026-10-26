@@ -699,6 +699,26 @@ class UiTreeDetailTests(unittest.TestCase):
         self.assertIn("5 nodes, 5 labeled", joined)
         self.assertNotIn("label-0", joined)
 
+    def test_ui_preview_escapes_text_rejected_by_legacy_console_encoding(self) -> None:
+        from friend_poster.device import ui_tree
+
+        nodes = [ui_tree.Node(text="feed-\u0425", x=10, y=10, w=100, h=20)]
+        lines: list[str] = []
+
+        def cp1252_log(message: str) -> None:
+            message.encode("cp1252")
+            lines.append(message)
+
+        stack = type("S", (), {"dump_xml": lambda self: "<x/>", "backend": ""})()
+        with mock.patch.object(ui_tree, "parse_nodes", lambda _blob: nodes):
+            ui_tree.dump_named(
+                stack, None, "unicode", cp1252_log, persist=False, preview=True
+            )
+
+        joined = "\n".join(lines)
+        self.assertIn(r"\u0425", joined)
+        self.assertNotIn("\u0425", joined)
+
 
 if __name__ == "__main__":
     unittest.main()

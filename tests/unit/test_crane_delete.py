@@ -14,6 +14,15 @@ def node(label: str, *, x: int = 100, y: int = 300, w: int = 120, h: int = 40) -
     return Node(label=label, x=x, y=y, w=w, h=h)
 
 
+def edit_nodes(*items: Node) -> list[Node]:
+    return [
+        node("Reddit", x=303, y=96, w=124, h=25),
+        node("Done", x=647, y=98, w=75, h=23),
+        node("CONTAINERS", x=56, y=403, w=175, h=20),
+        *items,
+    ]
+
+
 def crane_prefs(rows, *, active: str = "DEFAULT") -> bytes:
     return plistlib.dumps(
         {
@@ -87,6 +96,103 @@ class CraneDeleteTests(unittest.TestCase):
 
         self.assertTrue(crane_delete.is_reddit_list(nodes))
 
+    def test_edit_waits_for_complete_crane_postcondition_before_row_scan(self):
+        stack = Stack()
+        pane = [
+            node("< Applications", x=6, y=92, w=244, h=30),
+            node("Reddit", x=303, y=96, w=124, h=25),
+            node("Edit", x=647, y=98, w=75, h=23),
+            node("CONTAINERS", x=56, y=403, w=175, h=20),
+            node("a0103", x=53, y=534, w=107, h=27),
+        ]
+        transient = [node("Settings", x=89, y=56, w=96, h=15)]
+        edit = [
+            node("Reddit", x=303, y=96, w=124, h=25),
+            node("Done", x=647, y=98, w=75, h=23),
+            node("CONTAINERS", x=56, y=403, w=175, h=20),
+            node("- a0103", x=69, y=529, w=153, h=26),
+        ]
+
+        with (
+            mock.patch.object(
+                crane_delete,
+                "dump",
+                side_effect=[(b"", transient), (b"", edit)],
+            ) as dump,
+            mock.patch.object(crane_delete.time, "sleep"),
+        ):
+            result = crane_delete.tap_edit(stack, object(), pane)
+
+        self.assertIs(result, edit)
+        self.assertEqual(stack.taps, [pane[2].center()])
+        self.assertEqual(dump.call_count, 2)
+
+    def test_edit_dismisses_unknown_containers_prompt_non_destructively(self):
+        stack = Stack()
+        pane = [
+            node("< Applications", x=6, y=92, w=244, h=30),
+            node("Reddit", x=303, y=96, w=124, h=25),
+            node("Edit", x=647, y=98, w=75, h=23),
+            node("CONTAINERS", x=56, y=403, w=175, h=20),
+            node("a0103", x=53, y=534, w=107, h=27),
+        ]
+        remind = node("Remind Me Later", x=230, y=880, w=290, h=35)
+        prompt = [
+            *pane,
+            node("Unknown Containers Found", x=150, y=455, w=450, h=30),
+            node("Import Containers", x=230, y=730, w=290, h=35),
+            node("Delete Containers", x=230, y=805, w=290, h=35),
+            remind,
+        ]
+        edit = [
+            node("Reddit", x=303, y=96, w=124, h=25),
+            node("Done", x=647, y=98, w=75, h=23),
+            node("CONTAINERS", x=56, y=403, w=175, h=20),
+            node("- a0103", x=69, y=529, w=153, h=26),
+        ]
+
+        with (
+            mock.patch.object(
+                crane_delete,
+                "dump",
+                side_effect=[(b"", prompt), (b"", pane), (b"", edit)],
+            ),
+            mock.patch.object(crane_delete.time, "sleep"),
+        ):
+            result = crane_delete.tap_edit(stack, object(), pane)
+
+        self.assertIs(result, edit)
+        self.assertEqual(
+            stack.taps,
+            [pane[2].center(), remind.center(), pane[2].center()],
+        )
+
+    def test_row_scan_aborts_if_transition_falls_back_to_reddit_feed(self):
+        stack = Stack()
+        edit = [
+            node("Reddit", x=303, y=96, w=124, h=25),
+            node("Done", x=647, y=98, w=75, h=23),
+            node("CONTAINERS", x=56, y=403, w=175, h=20),
+            node("a0102", x=53, y=534, w=107, h=27),
+        ]
+        foreign_feed = [node("< Settings", x=81, y=55), node("Reddit", y=105)]
+
+        with (
+            mock.patch.object(crane_delete, "flick_list"),
+            mock.patch.object(
+                crane_delete, "dump", return_value=(b"", foreign_feed)
+            ),
+            mock.patch.object(crane_delete.time, "sleep"),
+        ):
+            with self.assertRaisesRegex(
+                crane_delete.PhoneError, "Edit pane was lost"
+            ):
+                crane_delete.tap_red_delete_r1(
+                    stack, object(), edit, "a0103", absent_ok=True
+                )
+
+        self.assertEqual(stack.taps, [])
+
     def test_live_edit_row_targets_minus_inside_combined_ocr_node(self):
         # Sanitized geometry captured from the live Crane Reddit edit pane:
         # XXTouch merges the red minus and slot name into one OCR node.
@@ -124,6 +230,8 @@ class CraneDeleteTests(unittest.TestCase):
         target = node("a0069", x=110, y=410)
         delete = node("Delete", x=600, y=410)
         after = [node("Done", x=650, y=40)]
+        initial = edit_nodes(node("a0068", y=500))
+        found = edit_nodes(target)
 
         with (
             mock.patch.object(crane_delete, "flick_list") as flick,
@@ -131,7 +239,7 @@ class CraneDeleteTests(unittest.TestCase):
                 crane_delete,
                 "dump",
                 side_effect=[
-                    (b"", [target]),
+                    (b"", found),
                     (b"", [target, delete]),
                     (b"", after),
                 ],
@@ -139,7 +247,7 @@ class CraneDeleteTests(unittest.TestCase):
             mock.patch.object(crane_delete.time, "sleep"),
         ):
             result = crane_delete.tap_red_delete_r1(
-                stack, object(), [node("a0068")], "a0069"
+                stack, object(), initial, "a0069"
             )
 
         flick.assert_called_once_with(stack)
@@ -149,7 +257,7 @@ class CraneDeleteTests(unittest.TestCase):
 
     def test_delete_refuses_to_tap_when_exact_container_never_appears(self):
         stack = Stack()
-        unchanged = [node("a0068")]
+        unchanged = edit_nodes(node("a0068", y=500))
 
         with (
             mock.patch.object(crane_delete, "flick_list"),
@@ -261,6 +369,72 @@ class CraneDeleteTests(unittest.TestCase):
         self.assertEqual(stack.taps, [marker.center(), settings.center()])
         self.assertIs(result, pane)
 
+    def test_cleanup_retries_from_home_when_settings_transition_is_stale(self):
+        from friend_poster.reddit import reddit_open
+
+        stack = Stack()
+        icon = node("Reddit", y=900)
+        marker = node("Container", y=350)
+        system = node("Edit Home Screen", y=900)
+        settings = node("Settings", y=800)
+        haptic = [marker, system]
+        picker = [
+            node("Container", y=120),
+            node("Default", y=400),
+            node("a0270", y=500),
+            node("New Container", y=650),
+            settings,
+        ]
+        stale_hme = [node("All Set", y=340), node("Done", y=1200)]
+        pane = [
+            node("< Applications", x=6, y=92, w=244, h=30),
+            node("Reddit", y=80),
+            node("Edit", x=650, y=80),
+            node("CONTAINERS", y=300),
+            node("a0270", y=410),
+        ]
+
+        with (
+            mock.patch.object(
+                reddit_open, "_find_reddit_from_home", return_value=icon
+            ) as find_home,
+            mock.patch.object(reddit_open, "long_press_home_icon") as long_press,
+            mock.patch.object(
+                reddit_open, "haptic_system_action", return_value=system
+            ),
+            mock.patch.object(
+                reddit_open, "crane_submenu_marker", return_value=marker
+            ),
+            mock.patch.object(
+                reddit_open, "crane_container_list", return_value=True
+            ),
+            mock.patch.object(
+                crane_delete,
+                "dump",
+                side_effect=[
+                    (b"", [node("Home")]),
+                    (b"", haptic),
+                    (b"", picker),
+                    (b"", stale_hme),
+                    (b"", haptic),
+                    (b"", picker),
+                    (b"", pane),
+                ],
+            ),
+            mock.patch.object(crane_delete.time, "sleep") as sleep,
+        ):
+            result = crane_delete.back_to_reddit_list(stack, object())
+
+        self.assertEqual(find_home.call_count, 2)
+        self.assertEqual(long_press.call_count, 2)
+        self.assertEqual(stack.homes, 1)
+        self.assertEqual(
+            stack.taps,
+            [marker.center(), settings.center(), marker.center(), settings.center()],
+        )
+        self.assertEqual(sleep.call_args_list.count(mock.call(3.0)), 2)
+        self.assertIs(result, pane)
+
     def test_live_expanded_picker_requires_all_safe_anchors(self):
         frame = [
             node("Remove App", x=275, y=296, w=196, h=25),
@@ -297,6 +471,7 @@ class CraneDeleteTests(unittest.TestCase):
         stack = Stack()
         target = node("a0069", x=110, y=410)
         delete = node("Delete", x=600, y=410)
+        initial = edit_nodes(target)
 
         with (
             mock.patch.object(
@@ -313,7 +488,7 @@ class CraneDeleteTests(unittest.TestCase):
                 crane_delete.PhoneError, "deletion was not confirmed"
             ):
                 crane_delete.tap_red_delete_r1(
-                    stack, object(), [target], "a0069"
+                    stack, object(), initial, "a0069"
                 )
 
 

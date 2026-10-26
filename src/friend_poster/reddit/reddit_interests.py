@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import json
+import math
 import random
 import re
 import sys
@@ -22,6 +23,7 @@ from friend_poster.core.slots import (  # noqa: E402
 )
 from friend_poster.device.ssh_device import Phone, PhoneError  # noqa: E402
 from friend_poster.device.ui_tree import Node, TapStack, collapsed_text, dump_named, find_label_exact  # noqa: E402
+from friend_poster.services.ui_recovery_agent import UnknownVisualStateError  # noqa: E402
 
 os.environ["SKIP_SHOT"] = "1"
 
@@ -94,6 +96,7 @@ CUSTOMIZE_ANCHOR_FIX_SCROLLS = 2
 CUSTOMIZE_ANCHOR_FIX_SETTLE_SECONDS = 0.6
 CUSTOMIZE_PENDING_VERIFY_RETRIES = 3
 CUSTOMIZE_PENDING_VERIFY_SETTLE_SECONDS = 0.8
+CUSTOMIZE_CHECKPOINT_VERSION = 3
 CUSTOMIZE_TITLE_Y = (140, 260)
 CUSTOMIZE_ACTION_Y = (1180, 1285)
 CUSTOMIZE_ANCHOR_X = (20, 350)
@@ -264,10 +267,16 @@ def customize_search_node(nodes):
         if node.ntype == "ocr-line" or not node.on_screen():
             continue
         words = tuple(collapsed_text(node.labels()).split())
-        marker = words == expected or (
-            len(words) == len(expected) + 1
-            and len(words[0]) == 1
-            and words[1:] == expected
+        candidate = words
+        if len(candidate) == len(expected) + 1 and len(candidate[0]) == 1:
+            # The search glyph is sometimes exposed as one OCR character.
+            candidate = candidate[1:]
+        marker = candidate == expected or (
+            len(candidate) == len(expected)
+            and _at_most_one_ocr_edit(
+                " ".join(candidate),
+                " ".join(expected),
+            )
         )
         if not marker:
             continue
@@ -441,6 +450,12 @@ def customize_topics(nodes):
     if anchor is None and search is None:
         return []
     content_bottom = anchor.y if anchor is not None else min(skip.y, continue_node.y) - 25
+    # A selected pill can reflow the last OCR topic partly underneath Reddit's
+    # fixed action bar (live a0292).  The pixel classifier deliberately rejects
+    # that clipped region, so keep the topic extractor on the same boundary.
+    # Otherwise an unrelated, unselected bottom label can abort verification of
+    # an already-successful pending tap before its checkpoint is committed.
+    content_bottom = min(content_bottom, CUSTOMIZE_ACTION_Y[0] - 25)
     out = []
     seen: set[str] = set()
     for node in nodes:
@@ -586,11 +601,11 @@ def _wait_screen_close(stack, phone, predicate, stem: str, label: str):
         if _meaningful(last):
             return last
     if last is not None and predicate(last):
-        raise PhoneError(
+        raise UnknownVisualStateError(
             f"{label} remained after one exact Continue tap. "
             "Did not tap Continue again."
         )
-    raise PhoneError(
+    raise UnknownVisualStateError(
         f"{label} next screen stayed blank or unclear after one Continue tap."
     )
 
@@ -625,8 +640,12 @@ def _wait_after_single_tap(
         if _meaningful(last):
             return last
     if last is not None and predicate(last):
-        raise PhoneError(f"{label} remained after one exact tap. Did not tap again.")
-    raise PhoneError(f"Screen stayed blank after {label}. Did not guess a next action.")
+        raise UnknownVisualStateError(
+            f"{label} remained after one exact tap. Did not tap again."
+        )
+    raise UnknownVisualStateError(
+        f"Screen stayed blank after {label}. Did not guess a next action."
+    )
 
 
 def advance_post_interests(stack: TapStack, phone: Phone, *, initial_nodes=None):
@@ -649,7 +668,7 @@ def advance_post_interests(stack: TapStack, phone: Phone, *, initial_nodes=None)
 
         if notification_sheet(nodes):
             if notification_tapped:
-                raise PhoneError(
+                raise UnknownVisualStateError(
                     "Notification explanation remained after exact OK. Did not tap again."
                 )
             ok = find_label_exact(nodes, ("OK", "Ok"))
@@ -669,7 +688,7 @@ def advance_post_interests(stack: TapStack, phone: Phone, *, initial_nodes=None)
 
         if native_notification_prompt(nodes):
             if native_tapped:
-                raise PhoneError(
+                raise UnknownVisualStateError(
                     "iOS notification prompt remained after exact Allow. Did not tap again."
                 )
             allow = find_label_exact(nodes, ("Allow",))
@@ -691,7 +710,7 @@ def advance_post_interests(stack: TapStack, phone: Phone, *, initial_nodes=None)
             if ads_tapped:
                 close = ads_close_node(nodes)
                 if close is None or ads_close_tapped:
-                    raise PhoneError(
+                    raise UnknownVisualStateError(
                         "Ads personalization remained after exact Reject and has no "
                         "single unused bounded close action. Did not tap again."
                     )
@@ -732,7 +751,7 @@ def advance_post_interests(stack: TapStack, phone: Phone, *, initial_nodes=None)
             )
             continue
 
-        raise PhoneError(
+        raise UnknownVisualStateError(
             "Unknown screen after Interests. Preserved it without tapping; "
             "see the latest 928-931 dump."
         )
@@ -740,7 +759,9 @@ def advance_post_interests(stack: TapStack, phone: Phone, *, initial_nodes=None)
     if proven_home_feed(nodes):
         log("POST_INTERESTS=HOME_FEED")
         return nodes
-    raise PhoneError("Post-Interests prompts did not reach a proven Home feed.")
+    raise UnknownVisualStateError(
+        "Post-Interests prompts did not reach a proven Home feed."
+    )
 
 
 def _record_interests(sid: str, tapped: list[str]) -> None:
@@ -778,11 +799,63 @@ def _customize_checkpoint_path(sid: str) -> str:
     return os.path.join(LOG_DIR, f"{sid}.interests_checkpoint.json")
 
 
+def _valid_customize_bounds(bounds) -> bool:
+    """Return whether durable OCR bounds can identify one Customize pill."""
+    if (
+        not isinstance(bounds, list)
+        or len(bounds) != 4
+        or any(type(value) not in (int, float) for value in bounds)
+        or any(not math.isfinite(float(value)) for value in bounds)
+    ):
+        return False
+    x, y, width, height = (float(value) for value in bounds)
+    return (
+        x >= 8
+        and y >= 420
+        and width >= 60
+        and 14 <= height <= 35
+        and x + width <= 748
+        and y + height < CUSTOMIZE_ACTION_Y[0] - 25
+    )
+
+
+def _customize_bounds_overlap(left, right) -> bool:
+    """Reject two labels whose durable proof could address the same pill."""
+    lx, ly, lw, lh = (float(value) for value in left)
+    rx, ry, rw, rh = (float(value) for value in right)
+    horizontal = min(lx + lw, rx + rw) > max(lx, rx)
+    vertical = min(ly + lh, ry + rh) > max(ly, ry)
+    return horizontal and vertical
+
+
+def _valid_customize_proofs(proofs: dict, pending: dict | None = None) -> bool:
+    if not isinstance(proofs, dict) or len(proofs) > INTEREST_SELECTION_COUNT:
+        return False
+    rectangles: list[list[float]] = []
+    for label, bounds in proofs.items():
+        if not isinstance(label, str) or not label or not _valid_customize_bounds(bounds):
+            return False
+        if any(_customize_bounds_overlap(bounds, prior) for prior in rectangles):
+            return False
+        rectangles.append(bounds)
+    if pending is not None:
+        bounds = pending.get("bounds") if isinstance(pending, dict) else None
+        if not _valid_customize_bounds(bounds):
+            return False
+        if any(_customize_bounds_overlap(bounds, prior) for prior in rectangles):
+            return False
+    return True
+
+
 def _load_customize_checkpoint(sid: str) -> dict:
     path = _customize_checkpoint_path(sid)
     if not os.path.isfile(path):
         return {
-            "version": 2, "slot_id": sid, "initial": [], "customize": [],
+            "version": CUSTOMIZE_CHECKPOINT_VERSION,
+            "slot_id": sid,
+            "initial": [],
+            "customize": [],
+            "selected_proofs": {},
             "pending_customize": None,
         }
     try:
@@ -790,19 +863,45 @@ def _load_customize_checkpoint(sid: str) -> dict:
             state = json.load(source)
     except (OSError, ValueError) as exc:
         raise PhoneError("Interests checkpoint could not be read safely.") from exc
-    if isinstance(state, dict) and state.get("version") == 1 and set(state) == {
-        "version", "slot_id", "initial", "customize",
-    }:
-        state = {
-            **state, "version": 2, "pending_customize": None,
-        }
+    if isinstance(state, dict):
+        if state.get("version") == 1 and set(state) == {
+            "version", "slot_id", "initial", "customize",
+        }:
+            state = {
+                **state,
+                "version": CUSTOMIZE_CHECKPOINT_VERSION,
+                "selected_proofs": {},
+                "pending_customize": None,
+            }
+        elif state.get("version") == 2 and set(state) == {
+            "version", "slot_id", "initial", "customize", "pending_customize",
+        }:
+            state = {
+                **state,
+                "version": CUSTOMIZE_CHECKPOINT_VERSION,
+                "selected_proofs": {},
+            }
+            # Version 2 used two writes after verification.  If the process
+            # stopped between them, keep the action pending and verify it from
+            # the live screen once more instead of trusting the partial write.
+            old_pending = state.get("pending_customize")
+            if isinstance(old_pending, dict) and old_pending.get("label") in state.get(
+                "customize", []
+            ):
+                state["customize"] = [
+                    label
+                    for label in state["customize"]
+                    if label != old_pending.get("label")
+                ]
     pending = state.get("pending_customize") if isinstance(state, dict) else None
+    proofs = state.get("selected_proofs") if isinstance(state, dict) else None
     if (
         not isinstance(state, dict)
         or set(state) != {
-            "version", "slot_id", "initial", "customize", "pending_customize",
+            "version", "slot_id", "initial", "customize", "selected_proofs",
+            "pending_customize",
         }
-        or state["version"] != 2
+        or state["version"] != CUSTOMIZE_CHECKPOINT_VERSION
         or state["slot_id"] != sid
         or any(
             not isinstance(state[key], list)
@@ -811,6 +910,9 @@ def _load_customize_checkpoint(sid: str) -> dict:
             for key in ("initial", "customize")
         )
         or len(state["customize"]) > INTEREST_SELECTION_COUNT
+        or not isinstance(proofs, dict)
+        or not set(proofs).issubset(state["customize"])
+        or not _valid_customize_proofs(proofs, pending)
         or (
             pending is not None
             and (
@@ -818,11 +920,11 @@ def _load_customize_checkpoint(sid: str) -> dict:
                 or set(pending) != {"label", "bounds"}
                 or not isinstance(pending["label"], str)
                 or not pending["label"]
-                or not isinstance(pending["bounds"], list)
-                or len(pending["bounds"]) != 4
-                or any(type(value) not in (int, float) for value in pending["bounds"])
+                or pending["label"] in state["customize"]
+                or not _valid_customize_bounds(pending["bounds"])
             )
         )
+        or len(state["customize"]) + (pending is not None) > INTEREST_SELECTION_COUNT
     ):
         raise PhoneError("Interests checkpoint is malformed; no topic was tapped.")
     return state
@@ -906,9 +1008,10 @@ def _at_most_one_ocr_edit(observed: str, expected: str) -> bool:
 
     Reddit can repaint a selected pill with a checkmark and move its text.  On
     the live a0231 frame the same topic changed from ``prut`` to ``pr$ut``.
-    This deliberately small comparison is only used after the pill fill has
-    already been classified as selected and the row still matches the durable
-    pending-tap checkpoint.
+    This deliberately small comparison is used only behind stronger identity
+    evidence: either the selected pill still matches the durable pending-tap
+    bounds, or the complete pixel-proven selected set has one unique bijection
+    to the equally sized durable checkpoint set.
     """
     left = observed.casefold()
     right = expected.casefold()
@@ -928,10 +1031,80 @@ def _at_most_one_ocr_edit(observed: str, expected: str) -> bool:
     return False
 
 
-class CustomizeSelectionUnclear(PhoneError):
-    """A pending Customize tap that local evidence cannot safely reconcile."""
+def _reconcile_pixel_selected_labels(
+    observed: set[str], expected: set[str]
+) -> set[str] | None:
+    """Canonicalize a pixel-proven selected set through one unique OCR bijection.
 
-    ai_recoverable = False
+    The caller has already proved the selected fill for every member of
+    ``observed`` from the matching screenshot.  This helper therefore changes
+    identities only; it never promotes an unselected topic.  Exact identities
+    are reserved first.  Every remaining observed label must then map to a
+    different remaining checkpoint label by at most one OCR edit, and there
+    must be exactly one complete mapping.  Unequal, missing, extra, or
+    ambiguous sets are intentionally left unreconciled.
+    """
+    visible = set(observed)
+    checkpoint = set(expected)
+    if len(visible) != len(checkpoint):
+        return None
+
+    exact = visible & checkpoint
+    remaining_visible = visible - exact
+    remaining_checkpoint = checkpoint - exact
+    if not remaining_visible:
+        return set(checkpoint)
+
+    candidates = {
+        label: tuple(
+            candidate
+            for candidate in sorted(remaining_checkpoint)
+            if _at_most_one_ocr_edit(label, candidate)
+        )
+        for label in remaining_visible
+    }
+    if any(not matches for matches in candidates.values()):
+        return None
+
+    # At most four topics are selected.  Count perfect matchings, stopping as
+    # soon as a second one proves ambiguity.  Sorting by degree makes the
+    # uniqueness proof deterministic and keeps the search tiny.
+    ordered = sorted(remaining_visible, key=lambda label: (len(candidates[label]), label))
+    matching_count = 0
+
+    def count_matchings(index: int, used: set[str]) -> None:
+        nonlocal matching_count
+        if matching_count > 1:
+            return
+        if index == len(ordered):
+            matching_count += 1
+            return
+        for candidate in candidates[ordered[index]]:
+            if candidate in used:
+                continue
+            used.add(candidate)
+            count_matchings(index + 1, used)
+            used.remove(candidate)
+            if matching_count > 1:
+                return
+
+    count_matchings(0, set())
+    if matching_count != 1:
+        return None
+    return set(checkpoint)
+
+
+class CustomizeSelectionUnclear(PhoneError):
+    """A Customize selection frame that bounded local evidence cannot reconcile.
+
+    Any tap is durably checkpointed before the action and pending verification
+    obtains several fresh frames without tapping again.  If a pixel-proven set
+    still cannot be matched uniquely to the checkpoint, scoped UI recovery may
+    navigate the live screen; it still cannot change the checkpoint, queue, or
+    container.
+    """
+
+    ai_recoverable = True
 
 
 def _pending_checked_pill_matches(node, label: str, pending: dict) -> bool:
@@ -956,11 +1129,218 @@ def _pending_checked_pill_matches(node, label: str, pending: dict) -> bool:
     return same_row and overlaps and nearby
 
 
+def _customize_selected_pixel(pixel) -> bool:
+    red, green, blue = pixel
+    return (
+        180 <= red <= 230
+        and 195 <= green <= 240
+        and 205 <= blue <= 245
+        and 7 <= green - red <= 30
+        and 4 <= blue - green <= 25
+    )
+
+
+def _pixel_only_selected_pill_proofs(image, nodes) -> list[list[int]]:
+    """Find selected-color pills that have no overlapping OCR topic node.
+
+    This is intentionally used only by the caller's first-selection pending
+    recovery.  Reddit can widen that pill, move it to the next row, and omit
+    its white label from OCR.  A unique selected-color component supplies new
+    durable text-band bounds without guessing the missing label.
+    """
+    anchor = show_more_topics_node(nodes)
+    skip, continue_node = customize_action_nodes(nodes)
+    if skip is None or continue_node is None:
+        return []
+    content_bottom = anchor.y if anchor is not None else min(skip.y, continue_node.y) - 25
+
+    def pixel_at(x: int, y: int):
+        sample_x = round(x * image.width / 750)
+        sample_y = round(y * image.height / 1334)
+        if not (0 <= sample_x < image.width and 0 <= sample_y < image.height):
+            return (0, 0, 0)
+        return image.getpixel((sample_x, sample_y))
+
+    bands: list[list[int]] = []
+    active: list[int] | None = None
+    for y in range(420, max(420, int(content_bottom))):
+        selected_count = sum(
+            _customize_selected_pixel(pixel_at(x, y)) for x in range(8, 748)
+        )
+        if selected_count >= 45:
+            if active is None:
+                active = [y, y]
+            else:
+                active[1] = y
+        elif active is not None:
+            bands.append(active)
+            active = None
+    if active is not None:
+        bands.append(active)
+
+    topic_nodes = customize_topics(nodes)
+    proofs: list[list[int]] = []
+    for top, bottom in bands:
+        height = bottom - top + 1
+        if not (20 <= height <= 70):
+            continue
+        minimum_column_pixels = max(6, height // 5)
+        qualified = []
+        for x in range(8, 748):
+            count = sum(
+                _customize_selected_pixel(pixel_at(x, y))
+                for y in range(top, bottom + 1)
+            )
+            if count >= minimum_column_pixels:
+                qualified.append(x)
+        groups: list[list[int]] = []
+        for x in qualified:
+            if not groups or x - groups[-1][-1] > 8:
+                groups.append([x])
+            else:
+                groups[-1].append(x)
+        for group in groups:
+            left, right = group[0], group[-1]
+            width = right - left + 1
+            if width < 60:
+                continue
+            proof = [left, round((top + bottom) / 2) - 9, width, 18]
+            if not _valid_customize_bounds(proof):
+                continue
+            if any(_customize_topic_overlaps_bounds(node, proof) for node in topic_nodes):
+                continue
+            if _customize_pill_pixel_state(image, proof) == "selected":
+                proofs.append(proof)
+    return proofs
+
+
+def _customize_pill_pixel_state(image, bounds) -> str:
+    """Classify one proven topic rectangle from its fresh screenshot.
+
+    ``bounds`` are the 750x1334 OCR coordinates durably saved before a tap.
+    Reddit can replace that topic's entire OCR node with a checkmark after the
+    tap (live a0267), so pending verification must be able to sample the saved
+    rectangle directly.  The color thresholds and six sample points are the
+    same strict evidence used for OCR-backed pills below.
+    """
+    if (
+        not isinstance(bounds, (list, tuple))
+        or len(bounds) != 4
+        or any(type(value) not in (int, float) for value in bounds)
+        or any(not math.isfinite(float(value)) for value in bounds)
+    ):
+        raise PhoneError("Saved pending Customize bounds are malformed; no topic was tapped.")
+    x, y, width, height = (float(value) for value in bounds)
+    if (
+        x < 8
+        or y < 420
+        or width < 60
+        or not (14 <= height <= 35)
+        or x + width > 748
+        or y + height >= CUSTOMIZE_ACTION_Y[0]
+    ):
+        raise PhoneError(
+            "Saved pending Customize bounds are outside the topic region; no topic was tapped."
+        )
+
+    center_x = x + width / 2
+    center_y = y + height / 2
+    spread = min(width * 0.15, 25)
+    selected_count = 0
+    unselected_count = 0
+    # OCR bounds describe the text, not the whole pill. Once Reddit inserts a
+    # checkmark, long labels are shifted to the right and the text's right-side
+    # sample can fall outside the pill entirely (live a0394). The left and
+    # centre samples remain inside both selected and unselected pills, so use
+    # only those four strict background samples. This keeps the classifier
+    # fail-closed while allowing a pixel-proven checked pill to survive reflow.
+    for offset_x in (-spread, 0):
+        for offset_y in (-18, -14):
+            sample_x = round((center_x + offset_x) * image.width / 750)
+            sample_y = round((center_y + offset_y) * image.height / 1334)
+            if not (0 <= sample_x < image.width and 0 <= sample_y < image.height):
+                raise PhoneError("Customize topic is outside the screenshot.")
+            pixel = image.getpixel((sample_x, sample_y))
+            if _customize_selected_pixel(pixel):
+                selected_count += 1
+            elif min(pixel) >= 245:
+                unselected_count += 1
+    if selected_count >= 3:
+        return "selected"
+    if unselected_count >= 3:
+        return "unselected"
+    return "unknown"
+
+
+def _clipped_expected_customize_nodes(nodes, expected_label: str):
+    """Return exact expected pills confined to the narrow pre-action band.
+
+    ``customize_topics`` intentionally excludes this band because an arbitrary
+    OCR label partly hidden by the fixed action bar is unsafe to classify. A
+    durable expected selection is different: when its exact checked label is
+    fully above the action bar, the fresh pixels can prove it without a tap.
+    """
+    matches = []
+    for node in nodes:
+        if node.ntype == "ocr-line" or not node.on_screen():
+            continue
+        label = customize_topic_label(node)
+        if _canonical_checked_label(label, {expected_label}) != expected_label:
+            continue
+        if (
+            node.x < 8
+            or node.x + node.w > 748
+            or node.w < 60
+            or not (14 <= node.h <= 35)
+            or node.y + node.h < CUSTOMIZE_ACTION_Y[0] - 25
+            or node.y + node.h >= CUSTOMIZE_ACTION_Y[0]
+        ):
+            continue
+        matches.append(node)
+    return matches
+
+
+def _customize_bounds_belong_to_topic_region(nodes, bounds) -> bool:
+    """Require durable bounds to remain inside this proven topic grid."""
+    if not _valid_customize_bounds(bounds):
+        return False
+    x, y, width, height = (float(value) for value in bounds)
+    anchor = show_more_topics_node(nodes)
+    skip, continue_node = customize_action_nodes(nodes)
+    if skip is None or continue_node is None:
+        return False
+    content_bottom = anchor.y if anchor is not None else min(skip.y, continue_node.y) - 25
+    return (
+        x >= 8
+        and y >= 420
+        and width >= 60
+        and 14 <= height <= 35
+        and x + width <= 748
+        and y + height < content_bottom
+    )
+
+
+def _pending_bounds_belong_to_topic_region(nodes, pending: dict) -> bool:
+    bounds = pending.get("bounds") if isinstance(pending, dict) else None
+    return _customize_bounds_belong_to_topic_region(nodes, bounds)
+
+
+def _customize_topic_overlaps_bounds(node, bounds) -> bool:
+    """Return whether a live OCR topic occupies a durable proof rectangle."""
+    x, y, width, height = (float(value) for value in bounds)
+    same_row = abs(node.center()[1] - (y + height / 2)) <= 24
+    horizontal = min(node.x + node.w, x + width) > max(node.x, x)
+    return same_row and horizontal
+
+
 def _selected_customize_topics(
     nodes,
     screenshot_stem: str,
     expected_labels: set[str] | None = None,
     pending: dict | None = None,
+    pixel_selected_labels: set[str] | None = None,
+    selected_proofs: dict[str, list] | None = None,
+    observed_selected_bounds: dict[str, list] | None = None,
 ) -> set[str]:
     """Classify checked pills from the fresh same-stem screenshot, or stop."""
     from PIL import Image
@@ -977,36 +1357,32 @@ def _selected_customize_topics(
         raise PhoneError("Customize screenshot is stale; no topic was tapped.")
     selected: set[str] = set()
     expected = set(expected_labels or ())
+    proofs = dict(selected_proofs or {})
+    if not _valid_customize_proofs(proofs, pending):
+        raise PhoneError("Customize selection proofs are malformed; no topic was tapped.")
+    if pixel_selected_labels is not None:
+        pixel_selected_labels.clear()
+    if observed_selected_bounds is not None:
+        observed_selected_bounds.clear()
     try:
         with Image.open(png_path) as source:
             image = source.convert("RGB")
             if image.width < 750 or image.height < 1334:
                 raise PhoneError("Customize screenshot has unexpected dimensions.")
+            topic_nodes = customize_topics(nodes)
             pending_matches: list[tuple[str, object]] = []
-            for node in customize_topics(nodes):
+            for node in topic_nodes:
                 label = customize_topic_label(node)
-                classifications: list[str] = []
-                # XXTouch JSON coordinates are text centers. The pill fill is
-                # visible just above the glyphs, away from the checkmark.
-                cx, cy = node.center()
-                spread = min(node.w * 0.15, 25)
-                for offset_x in (-spread, 0, spread):
-                    # The lower samples can land on the tall glyphs in this
-                    # device's OCR (observed on a0048 Public Transit). Both
-                    # positions stay inside the pill above those glyphs.
-                    for offset in (-18, -14):
-                        sx = round((cx + offset_x) * image.width / 750)
-                        sy = round((cy + offset) * image.height / 1334)
-                        if not (0 <= sx < image.width and 0 <= sy < image.height):
-                            raise PhoneError("Customize topic is outside the screenshot.")
-                        red, green, blue = image.getpixel((sx, sy))
-                        if 180 <= red <= 230 and 195 <= green <= 240 and 205 <= blue <= 245 and 7 <= green - red <= 30 and 4 <= blue - green <= 25:
-                            classifications.append("selected")
-                        elif min(red, green, blue) >= 245:
-                            classifications.append("unselected")
-                        else:
-                            classifications.append("unknown")
-                if classifications.count("selected") >= 5:
+                pixel_state = _customize_pill_pixel_state(
+                    image, [node.x, node.y, node.w, node.h]
+                )
+                if pixel_state == "selected":
+                    # Preserve the exact label attached to this pixel-proven
+                    # selected pill.  The caller uses only this same-frame
+                    # identity to keep an OCR alias out of the unselected pool;
+                    # no fuzzy label is ever excluded from that pool.
+                    if pixel_selected_labels is not None:
+                        pixel_selected_labels.add(label)
                     # A checked pill's glyph is occasionally merged into its
                     # OCR label as a checkmark-like prefix (a0051: "V RPGs";
                     # a0145: "• Hiking").  Only remove that prefix when the
@@ -1026,14 +1402,136 @@ def _selected_customize_topics(
                             pending_matches.append((label, node))
                             label = canonical
                     selected.add(label)
-                elif classifications.count("unselected") < 5:
-                    raise PhoneError(
+                    if observed_selected_bounds is not None and label in expected:
+                        observed_selected_bounds[label] = [
+                            node.x, node.y, node.w, node.h,
+                        ]
+                elif pixel_state != "unselected":
+                    raise CustomizeSelectionUnclear(
                         f"Customize topic {label!r} has ambiguous selected state; no topic was tapped."
                     )
-            if pending is not None and len(pending_matches) != 1:
-                raise PhoneError(
-                    "Pending Customize tap did not map to exactly one checked pill; no topic was tapped."
-                )
+            if pending is not None:
+                if len(pending_matches) > 1:
+                    raise CustomizeSelectionUnclear(
+                        "Pending Customize tap mapped to multiple checked pills; no topic was tapped."
+                    )
+                if not pending_matches:
+                    if not _pending_bounds_belong_to_topic_region(nodes, pending):
+                        raise CustomizeSelectionUnclear(
+                            "Pending Customize bounds no longer match the proven topic grid; "
+                            "no topic was tapped."
+                        )
+                    if any(
+                        _customize_topic_overlaps_bounds(node, pending["bounds"])
+                        for node in topic_nodes
+                    ):
+                        raise CustomizeSelectionUnclear(
+                            "A different OCR topic occupies the pending Customize bounds; "
+                            "no topic was tapped."
+                        )
+                    pending_state = _customize_pill_pixel_state(image, pending["bounds"])
+                    if pending_state == "selected":
+                        canonical = str(pending["label"])
+                        selected.add(canonical)
+                        pending_matches.append((canonical, None))
+                        log(
+                            "Pending Customize selection verified from its saved "
+                            "bounds after OCR omitted the selected label."
+                        )
+                    elif (
+                        not selected
+                        and not proofs
+                        and expected == {str(pending["label"])}
+                    ):
+                        pixel_only = _pixel_only_selected_pill_proofs(image, nodes)
+                        if len(pixel_only) != 1:
+                            raise CustomizeSelectionUnclear(
+                                "First pending Customize selection did not map to one "
+                                "unique OCR-missing selected pill; no topic was tapped."
+                            )
+                        canonical = str(pending["label"])
+                        selected.add(canonical)
+                        pending_matches.append((canonical, None))
+                        if observed_selected_bounds is not None:
+                            observed_selected_bounds[canonical] = pixel_only[0]
+                        log(
+                            "First pending Customize selection verified as the unique "
+                            "OCR-missing selected pill after Reddit reflowed it."
+                        )
+                    else:
+                        raise CustomizeSelectionUnclear(
+                            "Pending Customize label is absent and its saved bounds are not "
+                            "proven selected; no topic was tapped."
+                        )
+            if expected_labels is not None:
+                reconciled = _reconcile_pixel_selected_labels(selected, expected)
+                if reconciled is not None:
+                    selected = reconciled
+                elif selected.issubset(expected):
+                    active_proofs = dict(proofs)
+                    if pending is not None:
+                        active_proofs[str(pending["label"])] = list(pending["bounds"])
+                    for missing in sorted(expected - selected):
+                        clipped = _clipped_expected_customize_nodes(nodes, missing)
+                        if len(clipped) > 1:
+                            raise CustomizeSelectionUnclear(
+                                "A clipped expected Customize selection mapped to multiple "
+                                "OCR pills; no topic was tapped."
+                            )
+                        if clipped:
+                            if _customize_pill_pixel_state(
+                                image,
+                                [clipped[0].x, clipped[0].y, clipped[0].w, clipped[0].h],
+                            ) != "selected":
+                                raise CustomizeSelectionUnclear(
+                                    "A clipped expected Customize selection is not "
+                                    "pixel-proven selected; no topic was tapped."
+                                )
+                            selected.add(missing)
+                            log(
+                                "Clipped expected Customize selection verified from its exact "
+                                "checked label above the fixed action bar."
+                            )
+                            continue
+                        bounds = active_proofs.get(missing)
+                        if bounds is None:
+                            raise CustomizeSelectionUnclear(
+                                "A saved Customize selection disappeared from OCR and has no "
+                                "durable bounds proof; no topic was tapped."
+                            )
+                        if not _customize_bounds_belong_to_topic_region(nodes, bounds):
+                            raise CustomizeSelectionUnclear(
+                                "Saved Customize proof no longer belongs to the proven topic "
+                                "grid; no topic was tapped."
+                            )
+                        if any(
+                            _customize_topic_overlaps_bounds(node, bounds)
+                            for node in topic_nodes
+                        ):
+                            raise CustomizeSelectionUnclear(
+                                "A current OCR topic overlaps a missing Customize selection's "
+                                "saved proof; no topic was tapped."
+                            )
+                        if _customize_pill_pixel_state(image, bounds) != "selected":
+                            raise CustomizeSelectionUnclear(
+                                "An OCR-missing Customize selection is not pixel-proven at its "
+                                "saved bounds; no topic was tapped."
+                            )
+                        selected.add(missing)
+                        log(
+                            "Saved Customize selection verified from durable bounds after "
+                            "OCR omitted its label."
+                        )
+                    if selected != expected:
+                        raise CustomizeSelectionUnclear(
+                            "Pixel-proven Customize selections do not exactly match the saved "
+                            "selection set; no topic was tapped."
+                        )
+                else:
+                    raise CustomizeSelectionUnclear(
+                        "Pixel-proven Customize selections do not uniquely match "
+                        "the saved selection set; no topic was tapped."
+                    )
     except (OSError, ValueError) as exc:
         raise PhoneError("Customize screenshot could not be checked safely.") from exc
     return selected
@@ -1045,15 +1543,24 @@ def _capture_customize_state(
     stem: str,
     expected_labels: set[str] | None = None,
     pending: dict | None = None,
+    pixel_selected_labels: set[str] | None = None,
+    selected_proofs: dict[str, list] | None = None,
+    observed_selected_bounds: dict[str, list] | None = None,
 ):
     _blob, nodes = dump_named(stack, phone, stem, log, shot=True)
     if not customize_screen(nodes):
         dump_named(stack, phone, stem + "_unproven", log, shot=True)
-        raise PhoneError(
+        raise CustomizeSelectionUnclear(
             "Customize your feed layout is unproven; saved a fresh diagnostic screenshot."
         )
     return nodes, _selected_customize_topics(
-        nodes, stem, expected_labels, pending=pending
+        nodes,
+        stem,
+        expected_labels,
+        pending=pending,
+        pixel_selected_labels=pixel_selected_labels,
+        selected_proofs=selected_proofs,
+        observed_selected_bounds=observed_selected_bounds,
     )
 
 
@@ -1063,26 +1570,46 @@ def _capture_pending_customize_state(
     stem: str,
     expected_labels: set[str],
     pending: dict,
+    pixel_selected_labels: set[str] | None = None,
+    selected_proofs: dict[str, list] | None = None,
+    observed_selected_bounds: dict[str, list] | None = None,
 ):
     """Re-capture a pending tap without ever issuing a second tap.
 
     Reddit can paint the selected fill before OCR settles on the checkmark
     glyph.  A bounded series of fresh screenshots safely resolves that visual
-    race.  If every frame remains ambiguous, a typed non-AI error preserves the
-    checkpoint and pauses rather than spending recovery API calls.
+    race.  If every frame remains ambiguous, a typed visual-recovery error
+    preserves the checkpoint before the controller considers its bounded AI
+    fallback.
     """
+    if not _valid_customize_proofs(dict(selected_proofs or {}), pending):
+        raise PhoneError(
+            "Customize checkpoint proof is malformed; did not retry or call UI recovery."
+        )
     last_error: PhoneError | None = None
     for attempt in range(CUSTOMIZE_PENDING_VERIFY_RETRIES + 1):
         retry_stem = stem if attempt == 0 else f"{stem}_retry_{attempt}"
+        frame_pixel_selected: set[str] = set()
+        frame_selected_bounds: dict[str, list] = {}
         try:
-            return _capture_customize_state(
+            captured = _capture_customize_state(
                 stack,
                 phone,
                 retry_stem,
                 expected_labels,
                 pending=pending,
+                pixel_selected_labels=frame_pixel_selected,
+                selected_proofs=selected_proofs,
+                observed_selected_bounds=frame_selected_bounds,
             )
-        except PhoneError as exc:
+            if pixel_selected_labels is not None:
+                pixel_selected_labels.clear()
+                pixel_selected_labels.update(frame_pixel_selected)
+            if observed_selected_bounds is not None:
+                observed_selected_bounds.clear()
+                observed_selected_bounds.update(frame_selected_bounds)
+            return captured
+        except CustomizeSelectionUnclear as exc:
             last_error = exc
             if attempt >= CUSTOMIZE_PENDING_VERIFY_RETRIES:
                 raise CustomizeSelectionUnclear(str(exc)) from exc
@@ -1092,6 +1619,57 @@ def _capture_pending_customize_state(
             )
             time.sleep(CUSTOMIZE_PENDING_VERIFY_SETTLE_SECONDS)
     raise last_error or PhoneError("Pending Customize selection could not be proven.")
+
+
+def _capture_existing_customize_state(
+    stack: TapStack,
+    phone: Phone,
+    stem: str,
+    expected_labels: set[str],
+    *,
+    pixel_selected_labels: set[str] | None = None,
+    selected_proofs: dict[str, list] | None = None,
+    observed_selected_bounds: dict[str, list] | None = None,
+):
+    """Re-prove existing selections from fresh frames without issuing a tap."""
+    if not _valid_customize_proofs(dict(selected_proofs or {})):
+        raise PhoneError(
+            "Customize checkpoint proof is malformed; did not retry or call UI recovery."
+        )
+    last_error: CustomizeSelectionUnclear | None = None
+    for attempt in range(CUSTOMIZE_PENDING_VERIFY_RETRIES + 1):
+        retry_stem = stem if attempt == 0 else f"{stem}_retry_{attempt}"
+        frame_pixel_selected: set[str] = set()
+        frame_selected_bounds: dict[str, list] = {}
+        try:
+            captured = _capture_customize_state(
+                stack,
+                phone,
+                retry_stem,
+                expected_labels,
+                pixel_selected_labels=frame_pixel_selected,
+                selected_proofs=selected_proofs,
+                observed_selected_bounds=frame_selected_bounds,
+            )
+            if pixel_selected_labels is not None:
+                pixel_selected_labels.clear()
+                pixel_selected_labels.update(frame_pixel_selected)
+            if observed_selected_bounds is not None:
+                observed_selected_bounds.clear()
+                observed_selected_bounds.update(frame_selected_bounds)
+            return captured
+        except CustomizeSelectionUnclear as exc:
+            last_error = exc
+            if attempt >= CUSTOMIZE_PENDING_VERIFY_RETRIES:
+                raise CustomizeSelectionUnclear(str(exc)) from exc
+            log(
+                "Customize selections are not yet proven; waiting for a fresh "
+                f"frame ({attempt + 1}/{CUSTOMIZE_PENDING_VERIFY_RETRIES})."
+            )
+            time.sleep(CUSTOMIZE_PENDING_VERIFY_SETTLE_SECONDS)
+    raise last_error or CustomizeSelectionUnclear(
+        "Customize selections could not be proven from fresh frames."
+    )
 
 
 def _anchor_fully_visible(anchor, height: int) -> bool:
@@ -1106,6 +1684,7 @@ def _prove_customize_anchor(
     stem: str,
     *,
     expected_labels: set[str] | None = None,
+    allow_scroll: bool = True,
 ):
     """Prove the topic-list boundary before any pill is classified.
 
@@ -1117,6 +1696,22 @@ def _prove_customize_anchor(
     """
     for attempt in range(CUSTOMIZE_ANCHOR_FIX_SCROLLS + 1):
         anchor = show_more_topics_node(nodes)
+        # Once all four durable identities are present, this pass cannot choose
+        # or tap another topic.  Reddit may reflow the final row so the lower
+        # anchor disappears behind its fixed Skip/Continue bar (live a0292).
+        # The complete title/search/action geometry plus the action-bar-bounded
+        # topic extractor is sufficient for a read-only verification pass.
+        if (
+            anchor is None
+            and len(set(expected_labels or ())) >= INTEREST_SELECTION_COUNT
+            and customize_screen(nodes)
+            and customize_search_node(nodes) is not None
+        ):
+            log(
+                "Customize anchor is hidden after all required selections; "
+                "continuing with bounded read-only verification."
+            )
+            return nodes
         if anchor is not None and _label_words(anchor):
             # Only the saved png can prove the lower edge is inside the frame;
             # without it, a labelled marker is still trusted.
@@ -1131,6 +1726,11 @@ def _prove_customize_anchor(
                 return nodes
         if attempt == CUSTOMIZE_ANCHOR_FIX_SCROLLS:
             break
+        if not allow_scroll:
+            raise CustomizeSelectionUnclear(
+                "Customize anchor is clipped while durable selection bounds are active; "
+                "preserved the screen without scrolling or tapping."
+            )
         log("Customize topic anchor is clipped; scrolling once to prove the topic list.")
         small_scroll(stack)
         time.sleep(CUSTOMIZE_ANCHOR_FIX_SETTLE_SECONDS)
@@ -1164,6 +1764,77 @@ def _clip_leading_words(node, keep: int):
     )
 
 
+def _customize_topic_pool(
+    nodes,
+    selected: set[str],
+    pixel_selected_labels: set[str],
+) -> dict[str, object]:
+    """Build the visible pool without re-offering same-frame selected pills.
+
+    ``pixel_selected_labels`` contains only exact OCR labels whose pill fill was
+    proven selected in the screenshot paired with ``nodes``.  Skipping those
+    exact labels keeps a reconciled OCR alias out of the candidate pool without
+    fuzzy-matching (and therefore without hiding any unselected topic).
+    """
+    anchor = show_more_topics_node(nodes)
+    pool: dict[str, object] = {}
+    for node in customize_topics(nodes):
+        if anchor is not None and _reads_show_more(node):
+            # Belt and braces for the clipped boundary: even if the anchor's
+            # mangled tail survived the shape filter, only its canonical
+            # "show more" head may ever enter the pool - never as a topic.
+            node = _clip_leading_words(node, SHOW_MORE_KEEP_WORDS)
+        visible_label = customize_topic_label(node)
+        if visible_label in pixel_selected_labels:
+            continue
+        # Prefix canonicalization is exact against an already verified
+        # selection.  One-edit set reconciliation is deliberately not applied
+        # to the unselected pool.
+        canonical_label = _canonical_checked_label(visible_label, selected)
+        pool[canonical_label] = node
+    return pool
+
+
+def _merge_customize_selected_proofs(
+    existing: dict[str, list],
+    observed: dict[str, list],
+    selected: set[str],
+    *,
+    pending: dict | None = None,
+) -> dict[str, list]:
+    """Build the next durable proof map only from locally verified evidence."""
+    merged = {
+        label: list(bounds)
+        for label, bounds in existing.items()
+        if label in selected
+    }
+    for label, bounds in observed.items():
+        if label in selected:
+            merged[label] = list(bounds)
+    if pending is not None:
+        label = str(pending["label"])
+        if label not in selected:
+            raise PhoneError(
+                "Pending Customize proof cannot be saved before local selection verification."
+            )
+        merged[label] = list(observed.get(label, pending["bounds"]))
+    if not set(merged).issubset(selected) or not _valid_customize_proofs(merged):
+        raise PhoneError(
+            "Verified Customize selections produced ambiguous durable proof bounds."
+        )
+    return merged
+
+
+def _customize_topic_follows_proof(node, bounds) -> bool:
+    """Avoid moving an OCR-hidden selected pill by expanding an earlier pill."""
+    x, y, width, height = (float(value) for value in bounds)
+    proof_y = y + height / 2
+    node_y = node.center()[1]
+    if node_y > proof_y + 24:
+        return True
+    return abs(node_y - proof_y) <= 24 and node.x >= x + width
+
+
 def pick_customize_feed(
     stack: TapStack,
     phone: Phone,
@@ -1173,7 +1844,9 @@ def pick_customize_feed(
     prior: list[str] | None = None,
 ) -> list[str]:
     checkpoint = _load_customize_checkpoint(sid)
+    checkpoint["version"] = CUSTOMIZE_CHECKPOINT_VERSION
     checkpoint.setdefault("pending_customize", None)
+    checkpoint.setdefault("selected_proofs", {})
     if prior is not None:
         initial = list(dict.fromkeys(prior))
         if checkpoint["initial"] and checkpoint["initial"] != initial:
@@ -1182,65 +1855,109 @@ def pick_customize_feed(
         _save_customize_checkpoint(sid, checkpoint)
     initial = checkpoint["initial"]
     pending = checkpoint["pending_customize"]
+    selected_proofs = {
+        label: list(bounds)
+        for label, bounds in checkpoint["selected_proofs"].items()
+    }
     expected = set(checkpoint["customize"])
     if pending is not None:
         expected.add(str(pending["label"]))
+    pixel_selected_labels: set[str] = set()
+    observed_selected_bounds: dict[str, list] = {}
     # Prove the topic-list boundary from the live screen before anything else is
     # classified or tapped.  A clipped boundary is the a0140 failure mode.
     anchor_nodes = initial_nodes if initial_nodes is not None else []
     nodes = _prove_customize_anchor(
-        stack, phone, anchor_nodes, "924_customize_live", expected_labels=expected
+        stack,
+        phone,
+        anchor_nodes,
+        "924_customize_live",
+        expected_labels=expected,
+        allow_scroll=not (pending is not None or selected_proofs),
     )
     if pending is None:
-        nodes, selected = _capture_customize_state(
-            stack, phone, "924_customize_live", expected
+        nodes, selected = _capture_existing_customize_state(
+            stack,
+            phone,
+            "924_customize_live",
+            expected,
+            pixel_selected_labels=pixel_selected_labels,
+            selected_proofs=selected_proofs,
+            observed_selected_bounds=observed_selected_bounds,
         )
     else:
         nodes, selected = _capture_pending_customize_state(
-            stack, phone, "924_customize_live", expected, pending=pending
+            stack,
+            phone,
+            "924_customize_live",
+            expected,
+            pending=pending,
+            pixel_selected_labels=pixel_selected_labels,
+            selected_proofs=selected_proofs,
+            observed_selected_bounds=observed_selected_bounds,
         )
     saved = set(checkpoint["customize"])
     if not saved.issubset(selected):
         raise PhoneError("Saved customize selections are missing on screen; no topic was tapped.")
+    recovered_pending = pending is not None
     if pending is not None:
         canonical = str(pending["label"])
         if selected != saved | {canonical}:
             raise PhoneError(
                 "Pending Customize tap did not produce exactly one selected pill; no topic was tapped."
             )
-        checkpoint["customize"] = sorted(selected)
-        _save_customize_checkpoint(sid, checkpoint)
-        CREATION_PROGRESS.note()
+        selected_proofs = _merge_customize_selected_proofs(
+            selected_proofs,
+            observed_selected_bounds,
+            selected,
+            pending=pending,
+        )
+        # Commit the verified selection, its proof, and clearing the pending
+        # action in one atomic checkpoint replacement.  A failed save leaves
+        # the old pending action intact for a safe resume.
+        checkpoint.update(
+            customize=sorted(selected),
+            selected_proofs=selected_proofs,
+            pending_customize=None,
+        )
+        pending = None
+    else:
+        selected_proofs = _merge_customize_selected_proofs(
+            selected_proofs,
+            observed_selected_bounds,
+            selected,
+        )
     if len(selected) > INTEREST_SELECTION_COUNT:
         raise PhoneError("Customize your feed has more than four selected topics; no topic was tapped.")
     checkpoint["customize"] = sorted(selected)
+    checkpoint["selected_proofs"] = selected_proofs
+    checkpoint["pending_customize"] = None
     _save_customize_checkpoint(sid, checkpoint)
+    if recovered_pending:
+        CREATION_PROGRESS.note()
 
     want = INTEREST_SELECTION_COUNT
-    if len(selected) < want and checkpoint["pending_customize"] is not None:
-        # The recovered tap is proven, but another tap needs its own identity.
-        checkpoint["pending_customize"] = None
-        _save_customize_checkpoint(sid, checkpoint)
     while len(selected) < want:
-        anchor = show_more_topics_node(nodes)
-        pool: dict[str, object] = {}
-        for node in customize_topics(nodes):
-            if anchor is not None and _reads_show_more(node):
-                # Belt and braces for the clipped boundary: even if the anchor's
-                # mangled tail survived the shape filter, only its canonical
-                # "show more" head may ever enter the pool - never as a topic.
-                node = _clip_leading_words(node, SHOW_MORE_KEEP_WORDS)
-            # Selected pills may expose their checkmark as an OCR prefix
-            # (``V Italy``, ``• Hiking``, etc.).  Canonicalize every visible
-            # row against the already verified selections before constructing
-            # the candidate pool, so an existing selection can never be
-            # offered and tapped a second time under its prefixed spelling.
-            visible_label = customize_topic_label(node)
-            canonical_label = _canonical_checked_label(visible_label, selected)
-            pool[canonical_label] = node
-        choices = [label for label in pool if label not in selected]
+        pool = _customize_topic_pool(nodes, selected, pixel_selected_labels)
+        hidden_proofs = [
+            bounds
+            for label, bounds in selected_proofs.items()
+            if label not in observed_selected_bounds
+        ]
+        choices = [
+            label
+            for label, node in pool.items()
+            if label not in selected
+            and all(
+                _customize_topic_follows_proof(node, bounds)
+                for bounds in hidden_proofs
+            )
+        ]
         if len(choices) < want - len(selected):
-            raise PhoneError("Customize your feed has too few unselected topics; no topic was tapped.")
+            raise CustomizeSelectionUnclear(
+                "Customize your feed has too few safe topics after the last OCR-hidden "
+                "selection; no topic was tapped."
+            )
         # Narrow pills are less likely to push the lower-page anchor beneath
         # Reddit's fixed Continue bar when the selected pill grows wider.
         choices.sort(key=lambda item: (pool[item].w, item))
@@ -1260,6 +1977,9 @@ def pick_customize_feed(
             f"925_customize_verified_{len(selected) + 1}",
             selected | {label},
             pending=checkpoint["pending_customize"],
+            pixel_selected_labels=pixel_selected_labels,
+            selected_proofs=selected_proofs,
+            observed_selected_bounds=observed_selected_bounds,
         )
         if observed != selected | {label}:
             raise PhoneError(
@@ -1267,22 +1987,40 @@ def pick_customize_feed(
                 "saved a screenshot and did not tap again."
             )
         selected = observed
-        checkpoint["customize"] = sorted(selected)
-        checkpoint["pending_customize"] = None
+        selected_proofs = _merge_customize_selected_proofs(
+            selected_proofs,
+            observed_selected_bounds,
+            selected,
+            pending=checkpoint["pending_customize"],
+        )
+        checkpoint.update(
+            customize=sorted(selected),
+            selected_proofs=selected_proofs,
+            pending_customize=None,
+        )
         _save_customize_checkpoint(sid, checkpoint)
         CREATION_PROGRESS.note()
 
-    if checkpoint["pending_customize"] is None:
-        ready, confirmed = _capture_customize_state(
-            stack, phone, "926_customize_picked", selected
-        )
-    else:
-        ready, confirmed = _capture_pending_customize_state(
-            stack, phone, "926_customize_picked", selected,
-            pending=checkpoint["pending_customize"],
-        )
+    ready, confirmed = _capture_existing_customize_state(
+        stack,
+        phone,
+        "926_customize_picked",
+        selected,
+        pixel_selected_labels=pixel_selected_labels,
+        selected_proofs=selected_proofs,
+        observed_selected_bounds=observed_selected_bounds,
+    )
     if confirmed != selected:
-        raise PhoneError("Customize selections changed before Continue; did not tap.")
+        raise CustomizeSelectionUnclear(
+            "Customize selections changed before Continue; did not tap."
+        )
+    selected_proofs = _merge_customize_selected_proofs(
+        selected_proofs,
+        observed_selected_bounds,
+        selected,
+    )
+    checkpoint["selected_proofs"] = selected_proofs
+    _save_customize_checkpoint(sid, checkpoint)
     if not tap_continue_bar(
         stack,
         ready,

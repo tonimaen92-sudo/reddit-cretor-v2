@@ -9,6 +9,7 @@ from unittest import mock
 
 from friend_poster.apps import creator
 from friend_poster.reddit import reddit_create_day1 as create
+from friend_poster.reddit import reddit_enter_code as enter_code
 from friend_poster.reddit import reddit_to_verify as to_verify
 from friend_poster.core import slots
 from friend_poster.device.icloud_code import VerificationCodeTimeout
@@ -27,8 +28,124 @@ VERIFY_NODES = [
     node("If you don't see our email, check spam", 380),
     node("Continue", 900),
 ]
+VERIFY_WITH_CODE_NODES = VERIFY_NODES + [node("123456", 320)]
 USERNAME_NODES = [node("Create your username", 150)]
 ABOUT_NODES = [node("About you", 150), node("Birthday", 300)]
+
+
+class VerificationContinueRetryTests(unittest.TestCase):
+    def test_complete_code_retries_exact_continue_once(self):
+        class Stack:
+            def __init__(self):
+                self.taps = []
+
+            def tap_xy(self, x, y):
+                self.taps.append((x, y))
+
+        stack = Stack()
+        frames = iter([USERNAME_NODES])
+
+        with (
+            mock.patch.object(create, "dump_named", side_effect=lambda *_a, **_k: ("", next(frames))),
+            mock.patch.object(create, "_wait", return_value=None),
+        ):
+            outcome, nodes = create.wait_verification_outcome(
+                stack,
+                object(),
+                VERIFY_WITH_CODE_NODES,
+                stem="test_verify",
+                tries=0,
+            )
+
+        self.assertEqual(outcome, "username")
+        self.assertEqual(nodes, USERNAME_NODES)
+        self.assertEqual(len(stack.taps), 1)
+
+    def test_incomplete_code_never_retries_continue(self):
+        class Stack:
+            def __init__(self):
+                self.taps = []
+
+            def tap_xy(self, x, y):
+                self.taps.append((x, y))
+
+        stack = Stack()
+        outcome, _nodes = create.wait_verification_outcome(
+            stack,
+            object(),
+            VERIFY_NODES + [node("12345", 320)],
+            stem="test_verify",
+            tries=0,
+        )
+        self.assertEqual(outcome, "unknown")
+        self.assertEqual(stack.taps, [])
+
+
+class VerificationOcrDateRecoveryTests(unittest.TestCase):
+    def test_known_rejected_code_allows_bounded_date_ocr_clear(self):
+        class Stack:
+            def __init__(self):
+                self.events = []
+
+            def tap_xy(self, x, y):
+                self.events.append(("tap", x, y))
+
+            def press_backspace(self, count):
+                self.events.append(("backspace", count))
+
+        verify = node("Verify your email", 120)
+        field = node("Verification code", 260)
+        date_ocr = node("30.mar", 320)
+        invalid = node("Please enter a valid verification code", 390)
+        resend = node("Check vour spam folder or Resend", 520)
+        initial = [verify, field, date_ocr, invalid, resend]
+        cleared = [verify, field, invalid, resend]
+        frames = iter([initial, cleared])
+        stack = Stack()
+
+        with (
+            mock.patch.object(
+                enter_code,
+                "dump_named",
+                side_effect=lambda *_a, **_k: ("", next(frames)),
+            ),
+            mock.patch.object(enter_code.time, "sleep", return_value=None),
+            mock.patch.object(enter_code.time, "time", return_value=12345.5),
+        ):
+            resend_at, stale, result = enter_code.resend_invalid_code_once(
+                stack,
+                object(),
+                initial,
+                lambda _message: None,
+                rejected_code="112233",
+            )
+
+        self.assertEqual(resend_at, 12345.0)
+        self.assertEqual(stale, "112233")
+        self.assertEqual(result, cleared)
+        self.assertEqual(stack.events[-1], ("backspace", 8))
+
+    def test_date_ocr_without_known_code_remains_fail_closed(self):
+        class Stack:
+            def __init__(self):
+                self.events = []
+
+            def tap_xy(self, x, y):
+                self.events.append((x, y))
+
+        nodes = [
+            node("Verify your email", 120),
+            node("Verification code", 260),
+            node("30.mar", 320),
+            node("Please enter a valid verification code", 390),
+            node("Check vour spam folder or Resend", 520),
+        ]
+        stack = Stack()
+        with self.assertRaisesRegex(PhoneError, "could not be bounded"):
+            enter_code.resend_invalid_code_once(
+                stack, object(), nodes, lambda _message: None
+            )
+        self.assertEqual(stack.events, [])
 
 
 class VerifyBackProofTests(unittest.TestCase):
@@ -122,6 +239,54 @@ class SlotEmailCheckpointTests(unittest.TestCase):
 
 
 class VerificationRotationStateMachineTests(unittest.TestCase):
+    def test_submitted_checkpoint_with_retained_code_resumes_without_poll_or_retype(self):
+        state = {
+            "id": "a0049",
+            "email": "alias0@icloud.com",
+            "email_label": "a0049",
+            "email_replacement_index": 0,
+            "email_verification": {
+                "replacement_index": 0,
+                "label": "a0049",
+                "phase": "submitted",
+                "updated_at": "2026-10-24T21:30:00Z",
+            },
+        }
+        clears = []
+        with (
+            mock.patch.object(create, "get_slot", side_effect=lambda _sid: dict(state)),
+            mock.patch.object(
+                create,
+                "clear_email_verification",
+                side_effect=lambda *_args: clears.append("cleared"),
+            ),
+            mock.patch.object(
+                create,
+                "poll_reddit_code",
+                side_effect=AssertionError("retained code must not be polled again"),
+            ),
+            mock.patch.object(
+                create,
+                "type_code",
+                side_effect=AssertionError("retained code must not be retyped"),
+            ),
+            mock.patch.object(
+                create,
+                "wait_verification_outcome",
+                return_value=("username", USERNAME_NODES),
+            ) as wait,
+        ):
+            result = create._verify_email_with_replacements(
+                "a0049",
+                object(),
+                object(),
+                VERIFY_WITH_CODE_NODES,
+            )
+
+        self.assertEqual(result, USERNAME_NODES)
+        self.assertEqual(clears, ["cleared"])
+        self.assertEqual(wait.call_args.kwargs["stem"], "889_resume_submitted_user")
+
     def test_post_password_verify_reuses_active_email_and_reaches_about(self):
         state = {
             "id": "a0049",

@@ -43,6 +43,20 @@ def cleared_page_with_occluded_title() -> list[Node]:
     ]
 
 
+def available_page_with_occluded_title(value="Chosen_Name9") -> list[Node]:
+    """Available requested value while a transient banner covers the title."""
+    return [
+        node("Username", 60, 398, 135),
+        node(value, 90, 430, 320),
+        node("Great name! It's not taken, so it's all yours.", 80, 475, 500),
+        node("Need inspiration? Check out these usernames:", 40, 520, 520),
+        node("Continue", 300, 700, 140),
+        node("123", 50, 1140, 80),
+        node("space", 300, 1140, 100),
+        node("return", 600, 1140, 100),
+    ]
+
+
 def cleared_page_with_clipped_field_label() -> list[Node]:
     """Focused field where an iOS bubble covers the left edge of Username."""
     return [
@@ -158,6 +172,7 @@ class RequestedUsernameTests(unittest.TestCase):
         saved="",
         stack=None,
         *,
+        requested="Chosen_Name9",
         committer=None,
         checkpoint=None,
         owners=None,
@@ -196,7 +211,7 @@ class RequestedUsernameTests(unittest.TestCase):
                     stack,
                     object(),
                     "a0049",
-                    "Chosen_Name9",
+                    requested,
                     username_committer=committer,
                 )
             except PhoneError as exc:
@@ -218,6 +233,137 @@ class RequestedUsernameTests(unittest.TestCase):
             [("claim", "Chosen_Name9"), ("slot", "Chosen_Name9"), ("account", "Chosen_Name9")],
         )
         self.assertEqual(names, ["890_username", "890_username_cleared", "890_username_requested", "891_after_username"])
+
+    def test_available_name_survives_notification_occluding_title(self):
+        frames = iter([
+            page("RedditSuggestion"),
+            page(),
+            available_page_with_occluded_title(),
+            [node("Set a password", 180, 200, 340)],
+        ])
+        result, stack, written, names = self.run_case(frames)
+        self.assertEqual(result, "Chosen_Name9")
+        self.assertEqual(stack.typed, ["Chosen_Name9"])
+        self.assertEqual(len(written), 3)
+        self.assertEqual(
+            names,
+            ["890_username", "890_username_cleared", "890_username_requested", "891_after_username"],
+        )
+
+    def test_xxtouch_multiplication_glyph_is_normalized_to_lowercase_x(self):
+        self.assertEqual(
+            usernames.suggested_username(page("peachysoft×44")),
+            "peachysoftx44",
+        )
+
+    def test_ocr_x_confusion_does_not_retype_an_available_username(self):
+        frames = iter([
+            page("RedditSuggestion"),
+            page(),
+            page("peachysoft×44", True),
+            [node("Set a password", 180, 200, 340)],
+        ])
+        result, stack, written, names = self.run_case(
+            frames,
+            requested="peachysoftx44",
+        )
+        self.assertEqual(result, "peachysoftx44")
+        self.assertEqual(stack.typed, ["peachysoftx44"])
+        self.assertNotIn("890_username_requested_retype_1", names)
+        self.assertEqual(len(written), 3)
+
+    def test_ocr_uppercase_i_for_expected_lowercase_l_does_not_retype(self):
+        requested = "calmtrail9"
+        ocr_value = "caImtrail9"
+        frames = iter([
+            page("RedditSuggestion"),
+            page(),
+            page(ocr_value, True),
+            [node("Set a password", 180, 200, 340)],
+        ])
+        result, stack, written, names = self.run_case(
+            frames,
+            requested=requested,
+        )
+        self.assertEqual(result, requested)
+        self.assertEqual(stack.typed, [requested])
+        self.assertNotIn("890_username_requested_retype_1", names)
+        self.assertEqual(len(written), 3)
+
+    def test_lowercase_l_ocr_equivalence_is_expected_value_aware(self):
+        nodes = page("caImtrail9")
+        field = next(row for row in nodes if row.text == "Username")
+        self.assertTrue(
+            usernames._username_field_matches_candidate(
+                nodes, field, "calmtrail9"
+            )
+        )
+        self.assertFalse(
+            usernames._username_field_matches_candidate(
+                nodes, field, "calmtrai19"
+            )
+        )
+
+    def test_unreadable_field_token_is_not_mistaken_for_empty_before_retype(self):
+        corrupt = page()
+        corrupt.append(node("peachysoft§44", 90, 430, 320))
+        frames = iter([page("RedditSuggestion"), corrupt])
+        result, stack, written, _names = self.run_case(frames)
+        self.assertIsInstance(result, usernames.UsernameAvailabilityUnclear)
+        self.assertEqual(stack.typed, [])
+        self.assertEqual(written, [])
+
+    def test_transient_typed_value_mismatch_uses_fresh_read_without_retyping(self):
+        frames = iter([
+            page("RedditSuggestion"),
+            page(),
+            page("Chosen_Xame9"),
+            page("Chosen_Name9", True),
+            [node("Set a password", 180, 200, 340)],
+        ])
+        result, stack, written, names = self.run_case(frames)
+        self.assertEqual(result, "Chosen_Name9")
+        self.assertEqual(stack.typed, ["Chosen_Name9"])
+        self.assertEqual(stack.backspaces, [40])
+        self.assertIn("890_username_requested_verify_1", names)
+        self.assertEqual(len(written), 3)
+
+    def test_persistent_typed_value_mismatch_clears_and_retypes_once(self):
+        frames = iter([
+            page("RedditSuggestion"),
+            page(),
+            page("Chosen_Xame9"),
+            page("Chosen_Xame9"),
+            page("Chosen_Xame9"),
+            page(),
+            page("Chosen_Name9", True),
+            [node("Set a password", 180, 200, 340)],
+        ])
+        result, stack, written, names = self.run_case(frames)
+        self.assertEqual(result, "Chosen_Name9")
+        self.assertEqual(stack.typed, ["Chosen_Name9", "Chosen_Name9"])
+        self.assertEqual(stack.backspaces, [40, 40])
+        self.assertIn("890_username_requested_retype_1_cleared", names)
+        self.assertIn("890_username_requested_retype_1", names)
+        self.assertEqual(len(written), 3)
+
+    def test_persistent_mismatch_after_safe_retype_still_pauses(self):
+        frames = iter([
+            page("RedditSuggestion"),
+            page(),
+            page("Chosen_Xame9"),
+            page("Chosen_Xame9"),
+            page("Chosen_Xame9"),
+            page(),
+            page("Chosen_Xame9"),
+            page("Chosen_Xame9"),
+            page("Chosen_Xame9"),
+        ])
+        result, stack, written, _names = self.run_case(frames)
+        self.assertIsInstance(result, usernames.UsernameAvailabilityUnclear)
+        self.assertEqual(stack.typed, ["Chosen_Name9", "Chosen_Name9"])
+        self.assertEqual(stack.backspaces, [40, 40])
+        self.assertEqual(written, [])
 
     def test_transient_banner_may_occlude_title_after_field_is_proven_empty(self):
         frames = iter([

@@ -10,6 +10,7 @@ from unittest import mock
 from friend_poster.apps import creator
 from friend_poster.core.paths import FIXTURES_DIR
 from friend_poster.reddit import reddit_open
+from friend_poster.services.ui_recovery_agent import is_ui_recoverable_error
 import test_bulk_creator as bulk_tests
 
 
@@ -306,6 +307,24 @@ def test_instance_bound_changed_level2_selects_unique_requested_row():
     assert stack.flicks == []
 
 
+def test_proven_reddit_feed_outranks_incidental_slot_shaped_ocr():
+    # Sanitized shape of the live a0261 failure.  Feed content contained more
+    # than one model/name ending in digits, which the title-less Crane fallback
+    # deliberately treats as possible slot rows.  Strong Reddit feed framing
+    # must win before that weak fallback is consulted.
+    nodes = [
+        Node("Search Reddit", 200, 105, 250, 25),
+        Node("Home", 20, 1120, 90, 25),
+        Node("Create", 300, 1120, 100, 25),
+        Node("P320", 330, 680, 90, 25),
+        Node("P365", 330, 760, 90, 25),
+    ]
+
+    assert reddit_open.crane_container_list(nodes) is False
+    assert reddit_open.proven_home_feed(nodes) is True
+    assert reddit_open.post_selection_state(nodes, "a0261") == "reddit"
+
+
 def test_post_tap_launch_must_be_confirmed_before_open_returns():
     nodes = crane_list("a0094", "a0095")
     stack = Stack()
@@ -328,10 +347,54 @@ def test_post_tap_launch_must_be_confirmed_before_open_returns():
                 stack, object(), lambda _line: None, "a0095", "fixture@icloud.com"
             )
         except reddit_open.ContainerSelectionError as exc:
+            assert isinstance(exc, reddit_open.ContainerLaunchTransitionUnclear)
+            assert exc.ai_recoverable is True
             assert exc.failure_code == "reddit_container_selection_failed"
             assert "after one bounded fresh-route retry" in str(exc)
         else:
             raise AssertionError("unconfirmed launch unexpectedly continued")
+
+
+def test_ambiguous_retry_route_remains_local_only():
+    nodes = crane_list("a0094", "a0095")
+
+    with mock.patch.object(reddit_open, "get_slot", return_value={}), mock.patch.object(
+        reddit_open, "_transient_dump", return_value=("synthetic", nodes)
+    ), mock.patch.object(
+        reddit_open, "_find_reddit_from_home", return_value=Node("Reddit", 20, 20)
+    ), mock.patch.object(
+        reddit_open, "long_press_home_icon", return_value=None
+    ), mock.patch.object(
+        reddit_open,
+        "_tap_requested_container",
+        side_effect=["list", reddit_open.PhoneError("duplicate target rows")],
+    ), mock.patch.object(
+        reddit_open,
+        "_confirm_container_launch",
+        side_effect=reddit_open.PhoneError("first launch unclear"),
+    ):
+        try:
+            reddit_open.open_container(
+                Stack(), object(), lambda _line: None, "a0095", "fixture@icloud.com"
+            )
+        except reddit_open.ContainerSelectionError as exc:
+            assert not isinstance(exc, reddit_open.ContainerLaunchTransitionUnclear)
+            assert getattr(exc, "ai_recoverable", False) is False
+            assert "Could not safely reselect exact Crane row" in str(exc)
+        else:
+            raise AssertionError("ambiguous retry route unexpectedly continued")
+
+
+def test_only_post_selection_visual_exhaustion_enters_ai_recovery():
+    assert is_ui_recoverable_error(
+        reddit_open.ContainerLaunchTransitionUnclear("launch transition unclear")
+    )
+    assert not is_ui_recoverable_error(
+        reddit_open.ContainerSelectionError("target row is ambiguous")
+    )
+    assert not is_ui_recoverable_error(
+        reddit_open.CraneDoorwayUnavailable("doorway missing")
+    )
 
 
 def test_unconfirmed_first_click_reopens_crane_and_succeeds_once():
@@ -524,8 +587,17 @@ class ContainerSelectionPauseTests(unittest.TestCase):
     def test_instance_bound_changed_level2_selects_unique_requested_row(self):
         test_instance_bound_changed_level2_selects_unique_requested_row()
 
+    def test_proven_reddit_feed_outranks_incidental_slot_shaped_ocr(self):
+        test_proven_reddit_feed_outranks_incidental_slot_shaped_ocr()
+
     def test_post_tap_launch_must_be_confirmed_before_open_returns(self):
         test_post_tap_launch_must_be_confirmed_before_open_returns()
+
+    def test_ambiguous_retry_route_remains_local_only(self):
+        test_ambiguous_retry_route_remains_local_only()
+
+    def test_only_post_selection_visual_exhaustion_enters_ai_recovery(self):
+        test_only_post_selection_visual_exhaustion_enters_ai_recovery()
 
     def test_confirmed_exact_selection_logs_active_confirmation(self):
         test_confirmed_exact_selection_logs_active_confirmation()

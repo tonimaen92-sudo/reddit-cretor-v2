@@ -19,6 +19,10 @@ from friend_poster.services.ip_evidence import ConfirmationTracker, TRANSIENT_ER
 
 
 DEFAULT_PUBLIC_IP_URL = "https://api64.ipify.org?format=json"
+PUBLIC_IP_FALLBACK_URLS = (
+    "https://api.ipify.org?format=json",
+    "https://icanhazip.com",
+)
 TRIGGER_TIMEOUT_SECONDS = 10.0
 IP_CHECK_TIMEOUT_SECONDS = 15.0
 IP_CHECK_ATTEMPTS = 2
@@ -223,7 +227,7 @@ def parse_ip_payload(payload: Any) -> str:
     raise IpChangeError("The public IP response is too deeply nested.", category="invalid_response")
 
 
-def fetch_proxy_public_ip(
+def _fetch_proxy_public_ip_once(
     public_ip_url: str,
     proxy_url: str,
     timeout: float,
@@ -286,6 +290,48 @@ def fetch_proxy_public_ip(
         raise IpChangeError(f"Public IP endpoint returned HTTP {exc.code}.", category="authentication" if exc.code == 407 else "http") from None
     except Exception as exc:
         raise _network_error(exc) from None
+
+
+def fetch_proxy_public_ip(
+    public_ip_url: str,
+    proxy_url: str,
+    timeout: float,
+    *,
+    opener: Any | None = None,
+) -> str:
+    """Measure proxy egress with bounded redundant public-IP endpoints.
+
+    The configured target remains the durable evidence identity.  Secondary
+    endpoints are used only when that default target has a transient transport
+    or response failure; they observe the same explicitly configured proxy.
+    Authentication, proxy, and configuration failures never fall through.
+    All attempts share the caller's original timeout budget.
+    """
+    primary = _validate_https_url(public_ip_url, label="Public IP endpoint")
+    candidates = [primary]
+    if primary == DEFAULT_PUBLIC_IP_URL:
+        candidates.extend(PUBLIC_IP_FALLBACK_URLS)
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    last_error: IpChangeError | None = None
+    transient = TRANSIENT_ERRORS | {"invalid_response", "http", "tls"}
+    for endpoint in candidates:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            return _fetch_proxy_public_ip_once(
+                endpoint,
+                proxy_url,
+                remaining,
+                opener=opener,
+            )
+        except IpChangeError as exc:
+            last_error = exc
+            if exc.category not in transient:
+                raise
+    if last_error is not None:
+        raise last_error
+    raise IpChangeError("FalconProxy IP check timed out.", category="timeout")
 
 
 def trigger_webhook_once(
@@ -407,6 +453,7 @@ def run_macrodroid_change(
     require_baseline: bool = False,
     baseline_cycles: int = 1,
     operation_id: str | None = None,
+    existing_attempt: dict[str, Any] | None = None,
     triggerer: Callable[..., dict[str, Any]] = trigger_webhook_once,
     fetcher: Callable[..., str] = fetch_proxy_public_ip,
     monotonic: Callable[[], float] = time.monotonic,
@@ -419,7 +466,13 @@ def run_macrodroid_change(
     poll_interval: float = POLL_INTERVAL_SECONDS,
     observation_seconds: float = OBSERVATION_SECONDS,
 ) -> dict[str, Any]:
-    """Try for a baseline, trigger once, then observe proxy egress."""
+    """Try for/reuse a baseline, trigger once, then observe proxy egress.
+
+    ``existing_attempt`` is used by a bounded fallback which must keep the
+    original, durably saved comparison IP.  It never weakens evidence rules:
+    the saved scope/target/baseline are validated before a trigger can run,
+    and a fresh deadline plus confirmation floor are checkpointed first.
+    """
     emit = progress or (lambda _event: None)
     wait = waiter or cancel_event.wait
     started = monotonic()
@@ -508,39 +561,68 @@ def run_macrodroid_change(
 
     baseline_problem = ""
     baseline_category = ""
-    for cycle in range(max(1, int(baseline_cycles)) if require_baseline else 1):
+    if existing_attempt is not None:
         try:
-            old_ip, _retried, baseline_evidence = measure("baseline")
+            saved = copy.deepcopy(existing_attempt)
+            validate_attempt(
+                saved,
+                require_scope=proxy_scope is not None,
+                require_change=True,
+            )
+            if (
+                saved.get("proxy_scope") != proxy_scope
+                or saved.get("verification_target") != public_ip_url
+                or not saved.get("baseline")
+            ):
+                raise ValueError()
+            baseline_evidence = dict(saved["baseline"])
+            old_ip = normalize_ip(baseline_evidence.get("ip"))
             current_ip = old_ip
+            operation_id = str(saved["operation_id"])
+            check_sequence = int(saved["check_sequence"])
             last_success = _checked_at(now)
-            break
-        except _ObservationCancelled:
-            return _result("cancelled", elapsed_seconds=elapsed(), error="Observation canceled before trigger.")
-        except IpChangeError as exc:
-            if cancel_event.is_set():
-                return _result("cancelled", elapsed_seconds=elapsed(), error="Observation canceled before trigger.")
-            baseline_category = exc.category
-            baseline_problem = baseline_category
-            another_cycle = (require_baseline and cycle + 1 < max(1, int(baseline_cycles))
-                             and baseline_category in TRANSIENT_ERRORS | {"invalid_response"})
-            emit({
-                "phase": "baseline_warning",
-                "status": (
-                    f"Baseline unavailable ({baseline_problem}); retrying before reset."
-                    if another_cycle else
-                    (
-                        f"Baseline unavailable ({baseline_problem}); required-baseline mode "
-                        "will not submit an unverifiable reset."
-                        if require_baseline else
-                        f"Baseline unavailable ({baseline_problem}); submitting one trigger anyway. Change verification will be limited."
-                    )
-                ),
-                "old_ip": "", "current_ip": "", "elapsed_seconds": elapsed(),
-            })
-            if another_cycle and wait(float(poll_interval)):
-                return _result("cancelled", elapsed_seconds=elapsed(), error="Observation canceled before trigger.")
-            if not another_cycle:
+        except (ValueError, TypeError, KeyError, IpChangeError):
+            result = _result(
+                "verification_failed",
+                elapsed_seconds=elapsed(),
+                error="Saved IP attempt cannot be reused safely.",
+            )
+            result["error_category"] = "configuration"
+            return result
+    else:
+        for cycle in range(max(1, int(baseline_cycles)) if require_baseline else 1):
+            try:
+                old_ip, _retried, baseline_evidence = measure("baseline")
+                current_ip = old_ip
+                last_success = _checked_at(now)
                 break
+            except _ObservationCancelled:
+                return _result("cancelled", elapsed_seconds=elapsed(), error="Observation canceled before trigger.")
+            except IpChangeError as exc:
+                if cancel_event.is_set():
+                    return _result("cancelled", elapsed_seconds=elapsed(), error="Observation canceled before trigger.")
+                baseline_category = exc.category
+                baseline_problem = baseline_category
+                another_cycle = (require_baseline and cycle + 1 < max(1, int(baseline_cycles))
+                                 and baseline_category in TRANSIENT_ERRORS | {"invalid_response"})
+                emit({
+                    "phase": "baseline_warning",
+                    "status": (
+                        f"Baseline unavailable ({baseline_problem}); retrying before reset."
+                        if another_cycle else
+                        (
+                            f"Baseline unavailable ({baseline_problem}); required-baseline mode "
+                            "will not submit an unverifiable reset."
+                            if require_baseline else
+                            f"Baseline unavailable ({baseline_problem}); submitting one trigger anyway. Change verification will be limited."
+                        )
+                    ),
+                    "old_ip": "", "current_ip": "", "elapsed_seconds": elapsed(),
+                })
+                if another_cycle and wait(float(poll_interval)):
+                    return _result("cancelled", elapsed_seconds=elapsed(), error="Observation canceled before trigger.")
+                if not another_cycle:
+                    break
     if require_baseline and not old_ip:
         result = _result(
             "baseline_unavailable",
@@ -580,13 +662,24 @@ def run_macrodroid_change(
     trigger_deadline = trigger_started + max(1.0, float(observation_seconds))
     stamp = now().astimezone(timezone.utc)
     deadline_utc = (stamp + timedelta(seconds=max(1.0, float(observation_seconds)))).isoformat().replace("+00:00", "Z")
-    attempt = {
-        "operation_id": operation_id, "proxy_scope": proxy_scope,
-        "verification_target": public_ip_url, "baseline": baseline_evidence,
-        "check_sequence": check_sequence, "candidate": None,
-        "confirmation_floor": check_sequence, "verification_evidence": None,
-        "observation_deadline_utc": deadline_utc,
-    }
+    if existing_attempt is None:
+        attempt = {
+            "operation_id": operation_id, "proxy_scope": proxy_scope,
+            "verification_target": public_ip_url, "baseline": baseline_evidence,
+            "check_sequence": check_sequence, "candidate": None,
+            "confirmation_floor": check_sequence, "verification_evidence": None,
+            "observation_deadline_utc": deadline_utc,
+        }
+    else:
+        attempt = copy.deepcopy(existing_attempt)
+        attempt.update(
+            operation_id=operation_id,
+            check_sequence=check_sequence,
+            candidate=None,
+            confirmation_floor=check_sequence,
+            verification_evidence=None,
+            observation_deadline_utc=deadline_utc,
+        )
     if before_trigger is not None:
         try:
             before_trigger({
@@ -832,6 +925,7 @@ def observe_proxy_without_trigger(
     now: Callable[[], datetime] = datetime.now,
     attempt: dict | None = None, proxy_scope: str | None = None,
     public_ip_url: str = DEFAULT_PUBLIC_IP_URL,
+    poll_interval: float = POLL_INTERVAL_SECONDS,
     progress=None, on_observation=None, on_checkpoint=None,
 ) -> dict[str, Any]:
     """Read-only confirmation with the same evidence rules as a fresh reset."""
@@ -880,7 +974,8 @@ def observe_proxy_without_trigger(
         proxy_url, expected, attempt=attempt, require_change=require_change,
         cancel_event=cancel_event, deadline=deadline,
         fetcher=fetcher, monotonic=monotonic, waiter=waiter or cancel_event.wait,
-        now=now, progress=progress, on_observation=on_observation, on_checkpoint=on_checkpoint,
+        now=now, poll_interval=poll_interval, progress=progress,
+        on_observation=on_observation, on_checkpoint=on_checkpoint,
     )
     result["observation_only"] = True
     return result

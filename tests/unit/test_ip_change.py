@@ -124,6 +124,68 @@ class MacroDroidIpChangeTests(unittest.TestCase):
         self.assertEqual([row["check_sequence"] for row in observations], [1, 2, 3])
         self.assertTrue(all(row["observed_at_utc"].endswith("Z") for row in observations))
 
+    def test_fallback_reuses_saved_baseline_without_measuring_a_new_one(self):
+        clock = Clock()
+        cancel = CancelEvent(clock)
+        operation_id = "4dab4c4c-a333-4a1d-88e4-fab1479054d1"
+        deadline = (clock.now() + timedelta(seconds=60)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        baseline = {
+            "operation_id": operation_id,
+            "check_sequence": 5,
+            "phase": "baseline",
+            "ip": "198.51.100.1",
+            "observed_at_utc": clock.now().isoformat().replace("+00:00", "Z"),
+        }
+        saved = {
+            "operation_id": operation_id,
+            "proxy_scope": "a" * 64,
+            "verification_target": ip_change.DEFAULT_PUBLIC_IP_URL,
+            "baseline": baseline,
+            "check_sequence": 5,
+            "candidate": None,
+            "confirmation_floor": 5,
+            "verification_evidence": None,
+            "observation_deadline_utc": deadline,
+        }
+        values = iter(["198.51.100.2", "198.51.100.2"])
+        fetches = []
+        checkpoints = []
+        triggers = []
+
+        result = ip_change.run_macrodroid_change(
+            self.webhook,
+            self.proxy,
+            cancel_event=cancel,
+            proxy_scope="a" * 64,
+            existing_attempt=saved,
+            before_trigger=checkpoints.append,
+            triggerer=lambda *_args: triggers.append(True) or {
+                "acknowledged": True,
+                "uncertain": False,
+                "status": 200,
+                "error": "",
+            },
+            fetcher=lambda *_args: fetches.append(True) or next(values),
+            monotonic=clock.monotonic,
+            now=clock.now,
+            waiter=cancel.wait,
+            poll_interval=1,
+            observation_seconds=10,
+        )
+
+        self.assertEqual(result["outcome"], "verified")
+        self.assertEqual(len(fetches), 2)
+        self.assertEqual(triggers, [True])
+        self.assertEqual(checkpoints[0]["baseline_ip"], baseline["ip"])
+        proof = result["verification_evidence"]
+        self.assertEqual(proof["baseline"], baseline)
+        self.assertEqual(
+            [item["check_sequence"] for item in proof["confirmations"]],
+            [6, 7],
+        )
+
     def test_one_trigger_attempt_http_200_without_change(self):
         result, triggers, fetches, _events = self.run_macro(["198.51.100.1"] * 8)
         self.assertEqual(result["outcome"], "no_change")
@@ -340,6 +402,70 @@ class MacroDroidIpChangeTests(unittest.TestCase):
         self.assertFalse(session.calls[0][1]["allow_redirects"])
         self.assertEqual(session.adapters[0][1].max_retries.total, 0)
         self.assertTrue(session.closed)
+
+    def test_default_probe_falls_back_to_secondary_endpoint_on_connection_error(self):
+        proxy = "socks5h://user:private-token@proxy.invalid:1080"
+
+        class Response:
+            status_code = 200
+            content = b'{"ip":"198.51.100.99"}'
+
+        class Session:
+            def __init__(self):
+                self.trust_env = True
+                self.calls = []
+
+            def mount(self, *_args):
+                pass
+
+            def get(self, url, **_kwargs):
+                self.calls.append(url)
+                if len(self.calls) == 1:
+                    raise ip_change.requests.exceptions.ConnectionError("offline")
+                return Response()
+
+            def close(self):
+                pass
+
+        session = Session()
+        with mock.patch.dict(sys.modules, {"socks": mock.MagicMock()}), mock.patch.object(
+            ip_change.requests, "Session", return_value=session
+        ):
+            observed = ip_change.fetch_proxy_public_ip(
+                ip_change.DEFAULT_PUBLIC_IP_URL, proxy, 10
+            )
+        self.assertEqual(observed, "198.51.100.99")
+        self.assertEqual(
+            session.calls,
+            [ip_change.DEFAULT_PUBLIC_IP_URL, ip_change.PUBLIC_IP_FALLBACK_URLS[0]],
+        )
+
+    def test_custom_probe_does_not_switch_endpoints(self):
+        proxy = "socks5h://user:private-token@proxy.invalid:1080"
+
+        class Session:
+            trust_env = True
+            calls = 0
+
+            def mount(self, *_args):
+                pass
+
+            def get(self, *_args, **_kwargs):
+                self.calls += 1
+                raise ip_change.requests.exceptions.ConnectionError("offline")
+
+            def close(self):
+                pass
+
+        session = Session()
+        with mock.patch.dict(sys.modules, {"socks": mock.MagicMock()}), mock.patch.object(
+            ip_change.requests, "Session", return_value=session
+        ):
+            with self.assertRaises(ip_change.IpChangeError):
+                ip_change.fetch_proxy_public_ip(
+                    "https://status.example.test/ip", proxy, 10
+                )
+        self.assertEqual(session.calls, 1)
 
     def test_socks_auth_failure_is_redacted_and_never_falls_back(self):
         proxy = "socks5h://user:private-token@proxy.invalid:1080"

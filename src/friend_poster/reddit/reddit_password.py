@@ -18,10 +18,12 @@ from friend_poster.core.slots import (  # noqa: E402
 from friend_poster.reddit.reddit_to_verify import (  # noqa: E402
     continue_btn as email_continue_btn,
     email_ready,
+    keyboard_done_btn,
     welcome as email_screen,
 )
 from friend_poster.device.ssh_device import Phone, PhoneError  # noqa: E402
 from friend_poster.device.ui_tree import TapStack, collapsed_text, dump_named, find_label_exact  # noqa: E402
+from friend_poster.services.ui_recovery_agent import UnknownVisualStateError  # noqa: E402
 
 os.environ["SKIP_SHOT"] = "1"
 
@@ -36,6 +38,7 @@ PASSWORD_STALL_POLL_SECONDS = 5.0
 PASSWORD_STALL_SAFETY_SECONDS = 195.0
 EXPIRED_EMAIL_RETURN_POLLS = 8
 EXPIRED_EMAIL_TRANSITION_POLLS = 8
+EXPIRED_EMAIL_KEYBOARD_POLLS = 3
 
 
 def log(msg: str) -> None:
@@ -200,6 +203,42 @@ def recover_expired_verification(
     selected = _wait_for_selected_email(stack, phone, email, lg)
     cont = email_continue_btn(selected)
     if cont is None:
+        keyboard_done = keyboard_done_btn(selected)
+        if keyboard_done is not None:
+            lg(
+                "Expired-code recovery returned the exact selected email with "
+                "the keyboard covering Continue; tapping the proven Done key once "
+                f"[{keyboard_done.x},{keyboard_done.y} "
+                f"{keyboard_done.w}x{keyboard_done.h}]."
+            )
+            stack.tap_xy(*keyboard_done.center())
+            CREATION_PROGRESS.note()
+            for attempt in range(EXPIRED_EMAIL_KEYBOARD_POLLS):
+                _cancelable_wait(stack, 0.8)
+                _blob, selected = dump_named(
+                    stack,
+                    phone,
+                    f"905_expired_email_keyboard_done_{attempt}",
+                    lg,
+                    shot=True,
+                    preview=False,
+                )
+                outcome = _email_submit_outcome(selected, email)
+                if outcome == "advanced":
+                    lg(
+                        "Keyboard Done submitted the exact selected email and "
+                        "advanced; not tapping Continue again."
+                    )
+                    return selected
+                if outcome == "unknown":
+                    raise PhoneError(
+                        "Keyboard Done left the exact selected-email form. Did not "
+                        "guess or submit another control."
+                    )
+                cont = email_continue_btn(selected)
+                if cont is not None:
+                    break
+    if cont is None:
         raise PhoneError(
             "Reddit returned to the exact selected email, but its enabled Continue "
             "button was not proven. Did not tap another control."
@@ -219,7 +258,7 @@ def recover_expired_verification(
     if outcome == "advanced":
         return after
     if outcome == "unknown":
-        raise PhoneError(
+        raise UnknownVisualStateError(
             "The first selected-email Continue left an unrecognized screen. "
             "Did not risk a duplicate submit."
         )
@@ -247,11 +286,11 @@ def recover_expired_verification(
     if outcome == "advanced":
         return after
     if outcome == "unknown":
-        raise PhoneError(
+        raise UnknownVisualStateError(
             "The selected-email Continue retry left an unrecognized screen. "
             "Did not submit it a third time."
         )
-    raise PhoneError(
+    raise UnknownVisualStateError(
         "Selected email remained after the one allowed Continue retry. "
         "Did not submit it a third time."
     )
@@ -377,7 +416,7 @@ def dismiss_passkey_prompt(
             return last
 
     if passkey_prompt(last):
-        raise PhoneError(
+        raise UnknownVisualStateError(
             "iOS passkey popup remained after one proven X tap. Did not repeat the tap."
         )
     if find_label_exact(last, ("Set a password",)) is not None:
@@ -385,7 +424,7 @@ def dismiss_passkey_prompt(
             "iOS passkey popup closed, but Reddit remained on Set a password. "
             "Did not retype or resubmit the stored password."
         )
-    raise PhoneError(
+    raise UnknownVisualStateError(
         "iOS passkey popup closed, but Reddit did not reach About you. Did not guess."
     )
 

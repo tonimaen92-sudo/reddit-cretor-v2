@@ -1005,20 +1005,22 @@ class ControllerDeletionGateTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Bulk state v6: a durable per-batch deletion policy
+# Bulk state v7: deletion policy plus crash-safe radio recovery metadata
 # --------------------------------------------------------------------------- #
 
 
-class BulkStateV6Tests(unittest.TestCase):
-    def test_empty_state_is_v6_with_policy_off(self):
+class BulkStateV7Tests(unittest.TestCase):
+    def test_empty_state_is_v7_with_policy_off(self):
         state = bulk_creation.empty_state()
-        self.assertEqual(state["version"], 6)
+        self.assertEqual(state["version"], 7)
         self.assertIs(state["delete_containers"], False)
 
     def test_v5_state_migrates_without_retroactive_deletion(self):
         v5 = bulk_creation.empty_state()
         v5["version"] = 5
         v5.pop("delete_containers")
+        v5.pop("ip_reset_attempt_count")
+        v5.pop("radio_recovery")
         v5.update(
             queue=[{"birth_date": "01.01.2000", "swipes": 10, "delay_seconds": 2.0}],
             requested=1,
@@ -1030,7 +1032,7 @@ class BulkStateV6Tests(unittest.TestCase):
             path = Path(tmp) / "bulk.json"
             path.write_text(json.dumps(v5), encoding="utf-8")
             loaded = bulk_creation.load_state(path)
-            self.assertEqual(loaded["version"], 6)
+            self.assertEqual(loaded["version"], 7)
             self.assertIs(loaded["delete_containers"], False)
             self.assertEqual(loaded["stage"], "paused")
             self.assertEqual(loaded["remaining"], 1)
@@ -1038,10 +1040,10 @@ class BulkStateV6Tests(unittest.TestCase):
             self.assertEqual(len(loaded["queue"]), 1)
             # The migration is persisted so a restart sees the same policy.
             self.assertEqual(
-                json.loads(path.read_text(encoding="utf-8"))["version"], 6
+                json.loads(path.read_text(encoding="utf-8"))["version"], 7
             )
 
-    def test_v6_round_trips(self):
+    def test_v7_round_trips(self):
         state = bulk_creation.empty_state()
         state["delete_containers"] = True
         with tempfile.TemporaryDirectory() as tmp:

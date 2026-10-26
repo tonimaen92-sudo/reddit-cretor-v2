@@ -27,6 +27,7 @@ _RESEND_LINES = {
 }
 _SIX_DIGITS_RE = re.compile(r"^\d{6}$")
 _FIELD_DIGITS_RE = re.compile(r"^\d{1,6}$")
+_OCR_DATE_VALUE_RE = re.compile(r"^\d{1,2}\.[a-z]{3}\.?$", re.IGNORECASE)
 
 
 def log(msg: str) -> None:
@@ -141,6 +142,36 @@ def verification_code_digits(nodes) -> Node | None:
     return _verification_code_candidate(nodes, exactly_six=False)
 
 
+def _verification_ocr_value_candidate(nodes) -> Node | None:
+    """Bound a date-like OCR rendering immediately below the proven field.
+
+    iOS OCR occasionally renders a six-digit code as a short date.  This
+    supplies bounds only when the caller already knows the real code; it never
+    reconstructs or accepts the OCR text as a verification code.
+    """
+    field = find_label_exact(nodes or [], ("Verification code",))
+    if field is None:
+        return None
+    candidates = []
+    field_x, field_y = field.center()
+    for item in nodes or []:
+        if item.ntype == "ocr-line" or not item.on_screen() or not item.visible:
+            continue
+        if not any(
+            _OCR_DATE_VALUE_RE.fullmatch(collapsed_text(part))
+            for part in (item.value, item.text, item.label, item.name)
+            if part
+        ):
+            continue
+        item_x, item_y = item.center()
+        dy = item_y - field_y
+        if 0 <= dy <= 100 and abs(item_x - field_x) <= 250:
+            candidates.append((dy, abs(item_x - field_x), item))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda hit: (hit[0], hit[1]))[2]
+
+
 def _verification_code_text(item: Node) -> str | None:
     digits = _verification_digit_text(item)
     return digits if digits is not None and len(digits) == 6 else None
@@ -151,6 +182,8 @@ def resend_invalid_code_once(
     phone: Phone,
     nodes,
     log_fn=log,
+    *,
+    rejected_code: str | None = None,
 ) -> tuple[float, str, list[Node]]:
     """Resend once and prove the rejected value was removed.
 
@@ -162,7 +195,12 @@ def resend_invalid_code_once(
         raise PhoneError("Invalid-code recovery requires the Verify your email screen.")
     if invalid_code_message(nodes) is None:
         raise PhoneError("Invalid-code recovery requires Reddit's exact error message.")
+    known_rejected = str(rejected_code or "").strip()
+    if known_rejected and _SIX_DIGITS_RE.fullmatch(known_rejected) is None:
+        raise PhoneError("Known rejected verification code is not six digits.")
     stale = verification_code_value(nodes)
+    if stale is None and known_rejected:
+        stale = _verification_ocr_value_candidate(nodes)
     if stale is None:
         raise PhoneError(
             "Rejected verification value could not be bounded; did not tap Resend."
@@ -194,6 +232,8 @@ def resend_invalid_code_once(
         raise PhoneError("Verification code field missing after Resend.")
 
     retained = verification_code_value(after_resend)
+    if retained is None and known_rejected:
+        retained = _verification_ocr_value_candidate(after_resend)
     if retained is not None:
         # Tap the right edge of the observed value so backspace starts after
         # its final digit.  Both coordinates come from the fresh OCR bounds.
@@ -215,10 +255,17 @@ def resend_invalid_code_once(
 
     if find_label_exact(cleared, ("Verify your email",)) is None:
         raise PhoneError("Verify screen disappeared while clearing the rejected code.")
-    if verification_code_digits(cleared) is not None:
+    if (
+        verification_code_digits(cleared) is not None
+        or _verification_ocr_value_candidate(cleared) is not None
+    ):
         raise PhoneError("Rejected verification value remained after bounded clear.")
     stale_text = _verification_code_text(stale)
-    if stale_text is None:  # Kept defensive even though the node was proven above.
+    if known_rejected:
+        if stale_text is not None and stale_text != known_rejected:
+            raise PhoneError("Bounded rejected value did not match the known code.")
+        stale_text = known_rejected
+    if stale_text is None:
         raise PhoneError("Rejected verification value became unreadable after clearing.")
     return resend_at, stale_text, cleared
 

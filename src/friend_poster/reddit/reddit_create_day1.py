@@ -16,6 +16,7 @@ from friend_poster.reddit.feed_swipe import (  # noqa: E402
     normalize_feed_swipe_count,
     run_feed_swipes,
 )
+from friend_poster.services.ui_recovery_agent import UnknownVisualStateError  # noqa: E402
 from friend_poster.device.icloud_code import (  # noqa: E402
     PollCancelled,
     VerificationCodeTimeout,
@@ -26,6 +27,7 @@ from friend_poster.reddit.reddit_enter_code import (  # noqa: E402
     invalid_code_message,
     resend_invalid_code_once,
     type_code,
+    verification_code_value,
 )
 from friend_poster.reddit.reddit_interests import (  # noqa: E402
     ads_personalization_screen,
@@ -82,7 +84,12 @@ from friend_poster.core.slots import (  # noqa: E402
     reddit_cleanup_state,
     slot_reddit_done,
 )
-from friend_poster.device.ssh_device import Phone, PhoneError  # noqa: E402
+from friend_poster.device.ssh_device import (  # noqa: E402
+    BridgeTransportError,
+    Phone,
+    PhoneError,
+    is_recoverable_bridge_failure,
+)
 from friend_poster.device.ui_tree import OperationCancelled, TapStack, dump_named, find_label_exact  # noqa: E402
 
 os.environ["SKIP_SHOT"] = "1"
@@ -171,26 +178,60 @@ def wait_verification_outcome(
     one-shot.
     """
     nodes = list(initial_nodes or [])
-    for attempt in range(tries + 1):
-        _check_stop(stop)
-        if find_label_exact(nodes, ("Create your username",)) is not None:
-            return "username", nodes
-        if success_predicate is not None and success_predicate(nodes):
-            return success_outcome, nodes
-        if invalid_code_message(nodes) is not None:
-            return "invalid", nodes
-        if attempt == tries:
-            break
-        _wait(stop, 1.1)
-        _blob, nodes = dump_named(
-            stack,
-            phone,
-            f"{stem}_{attempt}",
-            log,
-            shot=False,
-            persist=False,
-            preview=False,
-        )
+    for submit_attempt in range(2):
+        for attempt in range(tries + 1):
+            _check_stop(stop)
+            if find_label_exact(nodes, ("Create your username",)) is not None:
+                return "username", nodes
+            if success_predicate is not None and success_predicate(nodes):
+                return success_outcome, nodes
+            if invalid_code_message(nodes) is not None:
+                return "invalid", nodes
+            if attempt == tries:
+                break
+            _wait(stop, 1.1)
+            _blob, nodes = dump_named(
+                stack,
+                phone,
+                f"{stem}_{submit_attempt}_{attempt}",
+                log,
+                shot=False,
+                persist=False,
+                preview=False,
+            )
+
+        # Reddit occasionally leaves the complete code and enabled Continue on
+        # the exact Verify screen after the first tap without showing an error.
+        # Retry only that freshly proven control, once; never retype the code.
+        verify = find_label_exact(nodes, ("Verify your email",))
+        field = find_label_exact(nodes, ("Verification code",))
+        cont = find_label_exact(nodes, ("Continue",))
+        if (
+            submit_attempt == 0
+            and verify is not None
+            and field is not None
+            and verification_code_value(nodes) is not None
+            and cont is not None
+            and "apple" not in str(cont.labels()).casefold()
+        ):
+            log(
+                "Verification remained on the exact screen with a complete code; "
+                "retrying the freshly proven Continue once without retyping."
+            )
+            stack.tap_xy(*cont.center())
+            CREATION_PROGRESS.note()
+            _wait(stop, 1.4)
+            _blob, nodes = dump_named(
+                stack,
+                phone,
+                f"{stem}_continue_retry",
+                log,
+                shot=False,
+                persist=False,
+                preview=False,
+            )
+            continue
+        break
     return "unknown", nodes
 
 
@@ -262,7 +303,7 @@ def _verify_email_after_password(
     )
     if outcome == "invalid":
         resend_at, stale_code, _cleared_nodes = resend_invalid_code_once(
-            stack, phone, nodes, emit
+            stack, phone, nodes, emit, rejected_code=code
         )
         emit("Post-password Verify: IMAP poll after the one exact Resend.")
         CREATION_PROGRESS.note()
@@ -316,6 +357,7 @@ def recover_invalid_verification_code(
     email: str,
     invalid_nodes,
     *,
+    rejected_code: str | None = None,
     log_fn=None,
     stop=None,
 ) -> list:
@@ -329,6 +371,7 @@ def recover_invalid_verification_code(
         phone,
         invalid_nodes,
         emit,
+        rejected_code=rejected_code,
     )
     emit("IMAP poll for the code sent after the one Resend.")
     # This bounded 150 s wait is real work, not a stall: mark it so the
@@ -554,6 +597,34 @@ def _verify_email_with_replacements(
                         f"{sid} has a submitted email checkpoint, but Reddit is not on Verify. "
                         "Did not resubmit the address."
                     )
+                if current_nodes and verification_code_value(current_nodes) is not None:
+                    emit(
+                        f"{sid}: submitted verification checkpoint retained a complete "
+                        "code; resume the bounded outcome check without polling or retyping."
+                    )
+                    outcome, username_nodes = wait_verification_outcome(
+                        stack,
+                        phone,
+                        current_nodes,
+                        stem="889_resume_submitted_user",
+                        stop=stop,
+                    )
+                    if outcome == "invalid":
+                        username_nodes = recover_invalid_verification_code(
+                            stack,
+                            phone,
+                            email,
+                            username_nodes,
+                            log_fn=emit,
+                            stop=stop,
+                        )
+                    elif outcome != "username":
+                        raise PhoneError(
+                            "Retained verification code did not reach Create your username; "
+                            "preserved the current screen."
+                        )
+                    clear_email_verification(sid, emit)
+                    return username_nodes
                 sent_at = time.time() - VERIFY_RESUME_LOOKBACK_SECONDS
             elif phase == "timed_out":
                 if (
@@ -638,6 +709,7 @@ def _verify_email_with_replacements(
                 phone,
                 email,
                 username_nodes,
+                rejected_code=code,
                 log_fn=emit,
                 stop=stop,
             )
@@ -910,6 +982,12 @@ class DeterministicCleanupError(PhoneError):
     ai_recoverable = False
 
 
+def _raise_cleanup_bridge_failure(exc: BaseException) -> None:
+    """Preserve transient bridge failures for the outer reconnect loop."""
+    if is_recoverable_bridge_failure(exc):
+        raise BridgeTransportError(str(exc)) from exc
+
+
 def _close_exact_bundle_after_completed_swipes(
     sid: str,
     phone: Phone,
@@ -1024,8 +1102,10 @@ def _close_exact_bundle_after_completed_swipes(
                 "one dismissal. Cleanup remains pending."
             )
     except PhoneError as exc:
+        _raise_cleanup_bridge_failure(exc)
         card_error = exc
     except Exception as exc:
+        _raise_cleanup_bridge_failure(exc)
         card_error = PhoneError(
             f"{sid}: Reddit Recents-card cleanup failed ({type(exc).__name__}). "
             "Cleanup remains pending."
@@ -1057,8 +1137,10 @@ def _close_exact_bundle_after_completed_swipes(
             f"({close_mode})."
         )
     except PhoneError as exc:
+        _raise_cleanup_bridge_failure(exc)
         close_error = exc
     except Exception as exc:
+        _raise_cleanup_bridge_failure(exc)
         close_error = PhoneError(
             f"{sid}: exact Reddit force close failed ({type(exc).__name__}). "
             "Cleanup remains pending."
@@ -1084,8 +1166,10 @@ def _close_exact_bundle_after_completed_swipes(
             stem="899_completed_swipes_home_verify",
         )
     except PhoneError as exc:
+        _raise_cleanup_bridge_failure(exc)
         home_error = exc
     except Exception as exc:
+        _raise_cleanup_bridge_failure(exc)
         home_error = PhoneError(
             f"{sid}: final iPhone Home verification failed "
             f"({type(exc).__name__})."
@@ -1500,11 +1584,32 @@ def run_slot(
                 clear_email_verification(sid, emit)
             username_nodes = initial_nodes
         elif resume_invalid_code:
+            emit(
+                "Resume invalid-code recovery: identify the already-rejected code "
+                "from IMAP before the sole bounded Resend."
+            )
+            CREATION_PROGRESS.note()
+            try:
+                rejected_code = poll_reddit_code(
+                    log=emit,
+                    timeout=45,
+                    after_ts=time.time() - VERIFY_RESUME_LOOKBACK_SECONDS,
+                    email_hint=email,
+                    stop=stop,
+                )
+            except PollCancelled as exc:
+                raise PhoneError(str(exc)) from exc
+            except (VerificationCodeTimeout, RuntimeError) as exc:
+                raise PhoneError(
+                    "Could not identify the already-rejected code; preserved the "
+                    "invalid Verify screen without tapping Resend."
+                ) from exc
             username_nodes = recover_invalid_verification_code(
                 stack,
                 phone,
                 email,
                 initial_nodes,
+                rejected_code=rejected_code,
                 log_fn=emit,
                 stop=stop,
             )
@@ -1523,7 +1628,10 @@ def run_slot(
             )
         for credential_round in range(2):
             if find_label_exact(username_nodes, ("Create your username",)) is None:
-                raise PhoneError("Create your username transition was not proven.")
+                raise UnknownVisualStateError(
+                    "Create your username transition was not proven after the "
+                    "bounded verification flow."
+                )
             if requested_username:
                 use_requested_username(
                     stack,
@@ -1565,7 +1673,7 @@ def run_slot(
                 username_nodes = transition_nodes
                 continue
             if not _post_password_about_screen(transition_nodes):
-                raise PhoneError(
+                raise UnknownVisualStateError(
                     "Post-password Verify left no proven Username or About screen."
                 )
             break
@@ -1584,7 +1692,9 @@ def run_slot(
         if find_label_exact(
             interests_nodes or [], ("Choose your interests", "Interests")
         ) is None:
-            raise PhoneError("About you completed but Interests did not remain on screen.")
+            raise UnknownVisualStateError(
+                "About you completed but Interests did not remain on screen."
+            )
     if resume_post_interests:
         advance_post_interests(stack, phone, initial_nodes=initial_nodes)
     else:
@@ -1625,6 +1735,7 @@ def run_slot(
             require_final_proof=True,
             continue_on_unclear=True,
             recover_from_home=recover_from_home,
+            allow_created_account_feed_proof=True,
             pause_count=feed_pause_count,
             fixed_delay_seconds=fixed_delay_seconds,
         )

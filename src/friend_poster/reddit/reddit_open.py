@@ -52,6 +52,19 @@ class ContainerSelectionError(PhoneError):
     failure_code = "reddit_container_selection_failed"
 
 
+class ContainerLaunchTransitionUnclear(ContainerSelectionError):
+    """Exact Crane selection was tapped, but its bounded launch stayed visual-only.
+
+    This is deliberately narrower than :class:`ContainerSelectionError`.  A
+    missing, duplicate or otherwise unproven container must never be delegated
+    to a model.  Once the exact local target has been tapped and both the normal
+    launch check and one fresh-route retry have failed, however, safe visual
+    navigation may use the scoped container-selection recovery.
+    """
+
+    ai_recoverable = True
+
+
 class CraneDoorwayUnavailable(ContainerSelectionError):
     """Stock iOS haptic had no Crane doorway and UUID recovery failed."""
 
@@ -1326,6 +1339,12 @@ def crane_container_list(nodes) -> bool:
     title, require at least two different slot IDs so an unrelated digit
     cannot authorize scrolling.
     """
+    # Reddit content/user/product labels can legitimately end in digits and
+    # satisfy the title-less slot fallback.  Feed structure is stronger,
+    # app-specific evidence and must never authorize Crane list taps/scrolls.
+    if proven_home_feed(nodes):
+        return False
+
     # Hide My Email can contain several exact aNNNN labels from previously
     # created aliases.  Those labels are account metadata, not Crane rows, and
     # must never authorize an in-place container-list scroll.
@@ -2267,6 +2286,11 @@ def reddit_ui(nodes) -> bool:
 
 def post_selection_state(nodes, name: str) -> str:
     """Classify the bounded transition after tapping a Crane container."""
+    # Keep the stronger Reddit check first even though ``crane_container_list``
+    # also rejects feeds.  This documents and preserves the classifier's
+    # precedence if list recognition grows new anchored layouts later.
+    if proven_home_feed(nodes):
+        return "reddit"
     if (
         crane_container_list(nodes)
         or crane_submenu_marker(nodes) is not None
@@ -2615,6 +2639,16 @@ def open_container(
                 allow_complete_visible_prefix=allow_complete_visible_prefix,
             )
             lg(f"CRANE_SELECTION_RETRY_PATH={retry_path}")
+        except OperationCancelled:
+            raise
+        except PhoneError as retry_route_exc:
+            # Row discovery and identity proof remain entirely local.  An
+            # absent/duplicate/unproven target cannot be made safe by AI.
+            raise ContainerSelectionError(
+                f"Could not safely reselect exact Crane row {name} during the "
+                f"bounded fresh-route retry: {retry_route_exc}"
+            ) from retry_route_exc
+        try:
             launch_proof = _confirm_container_launch(
                 stack,
                 phone,
@@ -2625,7 +2659,7 @@ def open_container(
         except OperationCancelled:
             raise
         except PhoneError as retry_exc:
-            raise ContainerSelectionError(
+            raise ContainerLaunchTransitionUnclear(
                 f"Exact Crane row {name} was not confirmed after one bounded "
                 f"fresh-route retry: {retry_exc}"
             ) from retry_exc

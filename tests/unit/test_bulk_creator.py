@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from unittest import mock
@@ -35,6 +36,33 @@ def trigger_checkpoint(old):
                         "baseline": result["verification_evidence"]["baseline"], "check_sequence": 1,
                         "candidate": None, "confirmation_floor": 1, "verification_evidence": None,
                         "observation_deadline_utc": deadline}}
+
+
+def radio_journal(state, phase="completed"):
+    """Return credential-free journal metadata bound to ``state``'s head."""
+    return {
+        "version": bulk_creation.RADIO_RECOVERY_VERSION,
+        "state": phase,
+        "attempt": creator.MAX_IP_RESET_ATTEMPTS_PER_HEAD,
+        "head_fingerprint": bulk_creation.radio_recovery_head_fingerprint(state),
+        "operation_id": str(uuid.uuid4()),
+        "updated_at_utc": "2026-10-23T10:00:00Z",
+    }
+
+
+def complete_radio_cycle(*, on_transition, **_kwargs):
+    """Offline Xiaomi reset seam which persists every real controller phase."""
+    for phase in (
+        "pending", "on_confirmed", "restore_pending", "off_confirmed",
+        "verify_pending", "completed",
+    ):
+        on_transition(phase)
+
+
+def restore_radio_only(*, on_transition, **_kwargs):
+    """Offline crash recovery seam; deliberately never re-enters airplane ON."""
+    for phase in ("restore_pending", "off_confirmed", "verify_pending", "completed"):
+        on_transition(phase)
 
 
 class Stop:
@@ -1224,7 +1252,159 @@ class BatchCreatorTests(unittest.TestCase):
         )
         phone.close.assert_called_once_with()
 
-    def test_email_field_invalid_batch_failure_routes_to_bounded_reset(self):
+    def test_existing_profile_in_incomplete_bulk_container_requests_replacement(self):
+        app = self.app(1)
+        app.status = mock.Mock()
+        app.bulk_state.update(stage="creating", slot_id="a0047")
+        slot = {
+            "id": "a0047",
+            "email": "fixture.saved_8h@icloud.com",
+            "reddit": False,
+            "ghost": True,
+            "ghost_container_state": "ready",
+            "ghost_container_instance": "instance-proof",
+            "crane_container_instance": "INSTANCE-PROOF-FULL",
+            "reddit_birth_date": "20.04.2005",
+        }
+        phone = mock.Mock()
+        app._connect = lambda _password: (phone, object())
+
+        def fail_reddit(*_args, **_kwargs):
+            raise creator.ExistingAccountContainerError(
+                "Bottom-nav You opened an existing account/profile."
+            )
+
+        with (
+            mock.patch.object(creator, "get_slot", return_value=slot),
+            mock.patch.object(creator, "run_create_reddit", side_effect=fail_reddit),
+            mock.patch.object(creator, "UIRecoveryAgent") as agent,
+        ):
+            success = creator.App._run_creation_pipeline(
+                app,
+                "offline-password",
+                "a0047",
+                date(2005, 4, 20),
+                10,
+                manage_worker=False,
+            )
+
+        self.assertFalse(success)
+        self.assertEqual(
+            app._last_pipeline_failure_code,
+            creator.CONTAINER_RECREATE_FAILURE_CODE,
+        )
+        self.assertFalse(app._last_pipeline_failure_shared)
+        agent.assert_not_called()
+        phone.close.assert_called_once_with()
+
+    def test_existing_profile_preserves_container_outside_active_bulk_attempt(self):
+        app = self.app(1)
+        app.status = mock.Mock()
+        app.bulk_state.update(stage="idle", slot_id=None)
+        slot = {
+            "id": "a0047",
+            "email": "fixture.saved_8h@icloud.com",
+            "reddit": False,
+            "ghost": True,
+            "ghost_container_state": "ready",
+            "ghost_container_instance": "instance-proof",
+            "crane_container_instance": "INSTANCE-PROOF-FULL",
+            "reddit_birth_date": "20.04.2005",
+        }
+        phone = mock.Mock()
+        app._connect = lambda _password: (phone, object())
+
+        with (
+            mock.patch.object(creator, "get_slot", return_value=slot),
+            mock.patch.object(
+                creator,
+                "run_create_reddit",
+                side_effect=creator.ExistingAccountContainerError(
+                    "Existing account profile is open."
+                ),
+            ),
+        ):
+            success = creator.App._run_creation_pipeline(
+                app,
+                "offline-password",
+                "a0047",
+                date(2005, 4, 20),
+                10,
+                manage_worker=False,
+            )
+
+        self.assertFalse(success)
+        self.assertEqual(
+            app._last_pipeline_failure_code,
+            creator.ExistingAccountContainerError.failure_code,
+        )
+        self.assertTrue(app._last_pipeline_failure_shared)
+        phone.close.assert_called_once_with()
+
+    def test_reddit_email_retry_later_is_typed_and_local(self):
+        app = self.app(1)
+        app.status = mock.Mock()
+        slot = {
+            "id": "a0047",
+            "email": "fixture.saved_8h@icloud.com",
+            "reddit": False,
+            "ghost": True,
+            "ghost_container_state": "ready",
+            "ghost_container_instance": "instance-proof",
+            "crane_container_instance": "INSTANCE-PROOF-FULL",
+            "reddit_birth_date": "20.04.2005",
+        }
+        phone = mock.Mock()
+        app._connect = lambda _password: (phone, object())
+
+        with (
+            mock.patch.object(creator, "get_slot", return_value=slot),
+            mock.patch.object(
+                creator,
+                "run_create_reddit",
+                side_effect=creator.RedditEmailRetryLater("retry later"),
+            ),
+            mock.patch.object(creator, "UIRecoveryAgent") as agent,
+        ):
+            success = creator.App._run_creation_pipeline(
+                app, "offline-password", "a0047", date(2005, 4, 20), 10,
+                manage_worker=False,
+            )
+
+        self.assertFalse(success)
+        self.assertEqual(
+            app._last_pipeline_failure_code,
+            creator.RedditEmailRetryLater.failure_code,
+        )
+        self.assertFalse(app._last_pipeline_failure_shared)
+        agent.assert_not_called()
+        phone.close.assert_called_once_with()
+
+    def test_reddit_email_retry_later_allows_one_delayed_retry_only(self):
+        app = self.app(1)
+        app.bulk_state.update(stage="creating", slot_id="a0047")
+        app._wait_bulk_failure_grace = mock.Mock(return_value=True)
+        app._persist_bulk = lambda state: setattr(app, "bulk_state", state)
+        app._pause_bulk = mock.Mock()
+
+        self.assertTrue(
+            creator.App._retry_reddit_email_later(app, "a0047", "retry later")
+        )
+        self.assertEqual(app.bulk_state["stage"], "retry_creation")
+        self.assertEqual(
+            app.bulk_state["failure_code"],
+            "reddit_email_retry_later_auto_retry",
+        )
+        self.assertFalse(
+            creator.App._retry_reddit_email_later(app, "a0047", "retry later")
+        )
+        app._pause_bulk.assert_called_once_with(
+            "creation",
+            "retry later",
+            code=creator.RedditEmailRetryLater.failure_code,
+        )
+
+    def test_email_field_invalid_batch_failure_pauses_without_reset(self):
         app = self.app(1)
         app.bulk_state.update(
             stage="retry_creation",
@@ -1241,8 +1421,9 @@ class BatchCreatorTests(unittest.TestCase):
         app._reset_failed_creation = lambda sid, entry, reason, **kwargs: resets.append(
             (sid, entry, reason, kwargs)
         ) or False
-        app._pause_bulk = lambda *_a, **_k: self.fail(
-            "ordinary incomplete failure was paused instead of reset"
+        pauses = []
+        app._pause_bulk = lambda phase, reason, **kwargs: pauses.append(
+            (phase, reason, kwargs.get("code"))
         )
 
         def rejected(*_args, **_kwargs):
@@ -1272,9 +1453,11 @@ class BatchCreatorTests(unittest.TestCase):
         ):
             creator.App._run_bulk_batch(app)
 
-        self.assertEqual(len(resets), 1)
-        self.assertEqual(resets[0][0], "a0047")
-        self.assertIn("873_email_still_invalid", resets[0][2])
+        self.assertEqual(resets, [])
+        self.assertEqual(len(pauses), 1)
+        self.assertEqual(pauses[0][0], "creation")
+        self.assertIn("873_email_still_invalid", pauses[0][1])
+        self.assertEqual(pauses[0][2], "reddit_email_field_invalid")
         self.assertEqual(app._last_pipeline_failure_code, "reddit_email_field_invalid")
         self.assertEqual(app.bulk_state["remaining"], 1)
         self.assertEqual(app.bulk_state["slot_id"], "a0047")
@@ -1380,7 +1563,7 @@ class BatchCreatorTests(unittest.TestCase):
         )
         self.assertEqual(app.bulk_state["failures"][0]["slot_id"], "a0047")
 
-    def test_failed_slot_enters_bounded_reset_without_starting_next_item(self):
+    def test_failed_email_slot_pauses_without_starting_next_item(self):
         app = self.app(2)
         app.bulk_state["queue"][0]["birth_date"] = "01.01.2003"
         app.bulk_state["queue"][1]["birth_date"] = "02.02.2004"
@@ -1410,8 +1593,9 @@ class BatchCreatorTests(unittest.TestCase):
         app._reset_failed_creation = lambda sid, entry, reason, **kwargs: resets.append(
             (sid, entry, reason, kwargs)
         ) or False
-        app._pause_bulk = lambda *_a, **_k: self.fail(
-            "ordinary incomplete failure was paused instead of reset"
+        pauses = []
+        app._pause_bulk = lambda phase, reason, **kwargs: pauses.append(
+            (phase, reason, kwargs.get("code"))
         )
 
         def pipeline(_password, sid, _birth, _swipes, **_kwargs):
@@ -1494,9 +1678,11 @@ class BatchCreatorTests(unittest.TestCase):
         self.assertEqual(deleted, [])
         self.assertEqual(retired, [])
         self.assertEqual(ghosts, ["a0047"])
-        self.assertEqual(len(resets), 1)
-        self.assertEqual(resets[0][0], "a0047")
-        self.assertIn("873_email_still_invalid", resets[0][2])
+        self.assertEqual(resets, [])
+        self.assertEqual(len(pauses), 1)
+        self.assertEqual(pauses[0][0], "creation")
+        self.assertIn("873_email_still_invalid", pauses[0][1])
+        self.assertEqual(pauses[0][2], "reddit_email_field_invalid")
         self.assertEqual(app.bulk_state["remaining"], 2)
         self.assertEqual(app.bulk_state["slot_id"], "a0047")
         self.assertEqual(len(app.bulk_state["queue"]), 2)
@@ -1644,6 +1830,307 @@ class BatchCreatorTests(unittest.TestCase):
         self.assertEqual(retries[0][1], "unexpected_local_failure")
         self.assertEqual(len(app.bulk_state["queue"]), 1)
 
+    def test_fast_adb_no_change_runs_old_macrodroid_then_final_adb(self):
+        app = self.app(1)
+        app.bulk_state["slot_id"] = "a0266"
+        app._android_radio_config = lambda: (None, "test-xiaomi")
+        original_queue = [dict(item) for item in app.bulk_state["queue"]]
+
+        def no_change(_webhook, _proxy, **kwargs):
+            kwargs["before_trigger"](trigger_checkpoint("198.51.100.1"))
+            triggerer = kwargs.get("triggerer")
+            if triggerer is not None:
+                triggerer(_webhook, kwargs.get("trigger_timeout", 3.0))
+            return {
+                "outcome": "no_change",
+                "error": "No IP change observed before the deadline.",
+                "error_category": "",
+                "trigger_acknowledged": True,
+            }
+
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(
+                creator, "run_macrodroid_change", side_effect=no_change
+            ) as webhook,
+            mock.patch.object(
+                creator, "reset_android_cellular_radio",
+                side_effect=complete_radio_cycle,
+            ) as adb_reset,
+            mock.patch.object(
+                creator, "restore_android_cellular_radio",
+                side_effect=AssertionError("fresh fallback restored instead of cycling"),
+            ) as adb_restore,
+            mock.patch.object(
+                creator, "observe_proxy_without_trigger",
+                return_value=verified_result("198.51.100.1", "198.51.100.2"),
+            ) as observe,
+            mock.patch.object(
+                creator.UIRecoveryAgent, "recover",
+                side_effect=AssertionError("IP rotation reached Anthropic"),
+            ) as ai_recover,
+        ):
+            result, _observations = creator.App._run_bulk_ip_check(
+                app, dict(app.bulk_state)
+            )
+
+        self.assertEqual(result["outcome"], "verified")
+        self.assertTrue(result["local_radio_fallback"])
+        self.assertEqual(webhook.call_count, 2)
+        self.assertEqual(
+            webhook.call_args_list[0].args[0],
+            "https://local-xiaomi.invalid/reset",
+        )
+        self.assertEqual(webhook.call_args_list[1].args[0], app.macrodroid_webhook)
+        self.assertEqual(adb_reset.call_count, 2)
+        adb_restore.assert_not_called()
+        observe.assert_called_once()
+        ai_recover.assert_not_called()
+        self.assertEqual(
+            app.bulk_state["ip_reset_attempt_count"],
+            creator.MAX_IP_RESET_ATTEMPTS_PER_HEAD,
+        )
+        self.assertEqual(app.bulk_state["radio_recovery"]["state"], "completed")
+        self.assertEqual(app.bulk_state["queue"], original_queue)
+        self.assertEqual(app.bulk_state["remaining"], 1)
+
+    def test_fast_adb_success_never_calls_real_macrodroid_fallback(self):
+        app = self.app(1)
+        app.bulk_state["slot_id"] = "a0266"
+        app._android_radio_config = lambda: (None, "test-xiaomi")
+
+        def fast_verified(target, _proxy, **kwargs):
+            self.assertEqual(target, "https://local-xiaomi.invalid/reset")
+            kwargs["before_trigger"](trigger_checkpoint("198.51.100.1"))
+            kwargs["triggerer"](target, kwargs["trigger_timeout"])
+            return verified_result("198.51.100.1", "198.51.100.2")
+
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(
+                creator, "run_macrodroid_change", side_effect=fast_verified
+            ) as change,
+            mock.patch.object(
+                creator, "reset_android_cellular_radio",
+                side_effect=complete_radio_cycle,
+            ) as adb_reset,
+        ):
+            result, _observations = creator.App._run_bulk_ip_check(
+                app, dict(app.bulk_state)
+            )
+
+        self.assertEqual(result["outcome"], "verified")
+        self.assertTrue(result["local_radio_primary"])
+        change.assert_called_once()
+        adb_reset.assert_called_once()
+        fast_call = change.call_args.kwargs
+        self.assertEqual(fast_call["observation_seconds"], 25.0)
+        self.assertEqual(fast_call["poll_interval"], 1.0)
+        self.assertEqual(fast_call["baseline_cycles"], 2)
+        self.assertEqual(
+            adb_reset.call_args.kwargs["airplane_hold_seconds"], 10.0
+        )
+        self.assertEqual(adb_reset.call_args.kwargs["settle_seconds"], 1.0)
+        self.assertEqual(app.bulk_state["ip_reset_attempt_count"], 1)
+        self.assertEqual(app.bulk_state["radio_recovery"]["state"], "completed")
+
+    def test_unavailable_fast_adb_immediately_hands_off_to_macrodroid(self):
+        app = self.app(1)
+        app.bulk_state["slot_id"] = "a0266"
+        app._android_radio_config = lambda: (None, "test-xiaomi")
+        targets = []
+
+        def change(target, _proxy, **kwargs):
+            targets.append(target)
+            kwargs["before_trigger"](trigger_checkpoint("198.51.100.1"))
+            if kwargs.get("triggerer") is not None:
+                trigger = kwargs["triggerer"](target, kwargs["trigger_timeout"])
+                return {
+                    "outcome": "verification_failed",
+                    "error": trigger["error"],
+                    "trigger_acknowledged": False,
+                }
+            return verified_result("198.51.100.1", "198.51.100.2")
+
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(
+                creator, "run_macrodroid_change", side_effect=change
+            ),
+            mock.patch.object(
+                creator,
+                "reset_android_cellular_radio",
+                side_effect=creator.AndroidRadioResetError(
+                    "The configured Xiaomi is not ready over ADB.",
+                    category="device_unavailable",
+                ),
+            ),
+        ):
+            result, _observations = creator.App._run_bulk_ip_check(
+                app, dict(app.bulk_state)
+            )
+
+        self.assertEqual(result["outcome"], "verified")
+        self.assertEqual(
+            targets,
+            ["https://local-xiaomi.invalid/reset", app.macrodroid_webhook],
+        )
+        self.assertEqual(app.bulk_state["ip_reset_attempt_count"], 1)
+        self.assertEqual(
+            app.bulk_state["radio_recovery"], bulk_creation.empty_radio_recovery()
+        )
+
+    def test_fast_adb_restart_restores_without_repeating_or_using_macrodroid(self):
+        app = self.app(1)
+        checkpoint = trigger_checkpoint("198.51.100.1")
+        app.bulk_state.update(
+            stage="retry_ip",
+            slot_id="a0266",
+            baseline_ip=checkpoint["baseline_ip"],
+            trigger_deadline_utc=checkpoint["deadline_utc"],
+            ip_attempt=checkpoint["attempt"],
+            ip_reset_attempt_count=1,
+        )
+        journal = radio_journal(app.bulk_state, "on_confirmed")
+        journal["attempt"] = 1
+        app.bulk_state["radio_recovery"] = journal
+        app._android_radio_config = lambda: (None, "test-xiaomi")
+
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(
+                creator, "reset_android_cellular_radio",
+                side_effect=AssertionError("restart repeated airplane ON"),
+            ) as reset,
+            mock.patch.object(
+                creator, "restore_android_cellular_radio",
+                side_effect=restore_radio_only,
+            ) as restore,
+            mock.patch.object(
+                creator, "observe_proxy_without_trigger",
+                return_value=verified_result("198.51.100.1", "198.51.100.2"),
+            ) as observe,
+            mock.patch.object(
+                creator, "run_macrodroid_change",
+                side_effect=AssertionError("restart called MacroDroid"),
+            ) as macrodroid,
+        ):
+            result, _observations = creator.App._run_bulk_ip_check(
+                app, dict(app.bulk_state)
+            )
+
+        self.assertEqual(result["outcome"], "verified")
+        reset.assert_not_called()
+        restore.assert_called_once()
+        macrodroid.assert_not_called()
+        self.assertEqual(observe.call_args.kwargs["observation_seconds"], 25.0)
+        self.assertEqual(observe.call_args.kwargs["poll_interval"], 1.0)
+
+    def test_crash_radio_journal_restores_only_without_repeating_cycle(self):
+        for crash_phase in ("pending", "on_confirmed", "restore_pending"):
+            with self.subTest(phase=crash_phase):
+                app = self.app(1)
+                checkpoint = trigger_checkpoint("198.51.100.1")
+                app.bulk_state.update(
+                    stage="retry_ip",
+                    slot_id="a0266",
+                    baseline_ip=checkpoint["baseline_ip"],
+                    trigger_deadline_utc=checkpoint["deadline_utc"],
+                    ip_attempt=checkpoint["attempt"],
+                    ip_reset_attempt_count=creator.MAX_IP_RESET_ATTEMPTS_PER_HEAD,
+                )
+                app.bulk_state["radio_recovery"] = radio_journal(
+                    app.bulk_state, crash_phase
+                )
+                app._android_radio_config = lambda: (None, "test-xiaomi")
+
+                with (
+                    mock.patch.object(
+                        creator, "save_bulk_state", lambda _state: None
+                    ),
+                    mock.patch.object(
+                        creator, "reset_android_cellular_radio",
+                        side_effect=AssertionError("crash resume repeated airplane ON"),
+                    ) as adb_reset,
+                    mock.patch.object(
+                        creator, "restore_android_cellular_radio",
+                        side_effect=restore_radio_only,
+                    ) as adb_restore,
+                    mock.patch.object(
+                        creator, "observe_proxy_without_trigger",
+                        return_value=verified_result(
+                            "198.51.100.1", "198.51.100.2"
+                        ),
+                    ) as observe,
+                    mock.patch.object(
+                        creator, "run_macrodroid_change",
+                        side_effect=AssertionError("crash resume resent webhook"),
+                    ) as webhook,
+                    mock.patch.object(
+                        creator.UIRecoveryAgent, "recover",
+                        side_effect=AssertionError("IP recovery reached Anthropic"),
+                    ) as ai_recover,
+                ):
+                    result, _observations = creator.App._run_bulk_ip_check(
+                        app, dict(app.bulk_state)
+                    )
+
+                self.assertEqual(result["outcome"], "verified")
+                self.assertEqual(app.bulk_state["radio_recovery"]["state"], "completed")
+                webhook.assert_not_called()
+                adb_reset.assert_not_called()
+                adb_restore.assert_called_once()
+                observe.assert_called_once()
+                ai_recover.assert_not_called()
+
+    def test_completed_radio_journal_rechecks_only_without_third_device_action(self):
+        app = self.app(1)
+        checkpoint = trigger_checkpoint("198.51.100.1")
+        app.bulk_state.update(
+            stage="retry_ip",
+            slot_id="a0266",
+            baseline_ip=checkpoint["baseline_ip"],
+            trigger_deadline_utc=checkpoint["deadline_utc"],
+            ip_attempt=checkpoint["attempt"],
+            ip_reset_attempt_count=creator.MAX_IP_RESET_ATTEMPTS_PER_HEAD,
+        )
+        app.bulk_state["radio_recovery"] = radio_journal(app.bulk_state)
+        app._android_radio_config = lambda: (None, "test-xiaomi")
+
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(
+                creator, "run_macrodroid_change",
+                side_effect=AssertionError("completed journal resent webhook"),
+            ) as webhook,
+            mock.patch.object(
+                creator, "reset_android_cellular_radio",
+                side_effect=AssertionError("completed journal repeated airplane ON"),
+            ) as adb_reset,
+            mock.patch.object(
+                creator, "restore_android_cellular_radio",
+                side_effect=AssertionError("completed journal repeated restore"),
+            ) as adb_restore,
+            mock.patch.object(
+                creator, "observe_proxy_without_trigger",
+                return_value=verified_result("198.51.100.1", "198.51.100.2"),
+            ) as observe,
+        ):
+            result, _observations = creator.App._run_bulk_ip_check(
+                app, dict(app.bulk_state)
+            )
+
+        self.assertEqual(result["outcome"], "verified")
+        webhook.assert_not_called()
+        adb_reset.assert_not_called()
+        adb_restore.assert_not_called()
+        observe.assert_called_once()
+        self.assertEqual(
+            app.bulk_state["ip_reset_attempt_count"],
+            creator.MAX_IP_RESET_ATTEMPTS_PER_HEAD,
+        )
+        self.assertEqual(app.bulk_state["radio_recovery"]["state"], "completed")
+
     def test_missing_baseline_routes_to_bounded_retry_without_creation(self):
         app = self.app(1)
         app.bulk_state.update(stage="retry_ip", slot_id="a0001", baseline_ip=None)
@@ -1660,6 +2147,232 @@ class BatchCreatorTests(unittest.TestCase):
         self.assertEqual(len(retries), 1)
         self.assertEqual(retries[0][1], "ip_verification_failed")
         self.assertEqual(len(app.bulk_state["queue"]), 1)
+
+    def test_exhausted_remote_and_adb_phases_pause_once_and_never_call_ai(self):
+        app = self.app(1)
+        original_queue = [dict(item) for item in app.bulk_state["queue"]]
+        app.bulk_state["slot_id"] = "a0262"
+        app._bulk_slot_and_entry = lambda state: (
+            "a0262", state["queue"][0], date(2000, 1, 1)
+        )
+        calls = []
+        logs = []
+        app.log = logs.append
+        app._set_diag = lambda *_args: None
+        app._pause_bulk = creator.App._pause_bulk.__get__(app, creator.App)
+
+        def unchanged(_state):
+            # The dedicated checker owns both action phases and returns only
+            # after MacroDroid and the one local ADB fallback are spent.
+            calls.append("macrodroid+adb")
+            app.bulk_state["ip_reset_attempt_count"] = (
+                creator.MAX_IP_RESET_ATTEMPTS_PER_HEAD
+            )
+            app.bulk_state["radio_recovery"] = radio_journal(app.bulk_state)
+            return {
+                "outcome": "no_change",
+                "error": "No IP change observed before the deadline.",
+                "error_category": "",
+            }, []
+
+        app._run_bulk_ip_check = unchanged
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(creator, "get_slot", return_value={
+                "id": "a0262", "reddit": False,
+            }),
+            mock.patch.object(
+                creator.UIRecoveryAgent,
+                "recover",
+                side_effect=AssertionError("IP failure reached Anthropic"),
+            ) as ai_recover,
+        ):
+            creator.App._run_bulk_batch(app)
+
+        self.assertEqual(calls, ["macrodroid+adb"])
+        # The checker already spent both bounded phases, so the generic
+        # failure path pauses instead of manufacturing a third action.
+        self.assertEqual(app.stop.waits, [])
+        self.assertEqual(app.bulk_state["stage"], "paused")
+        self.assertEqual(
+            app.bulk_state["failure_code"], creator.IP_RETRY_EXHAUSTED_CODE
+        )
+        self.assertEqual(app.bulk_state["slot_id"], "a0262")
+        self.assertEqual(app.bulk_state["queue"], original_queue)
+        self.assertEqual(app.bulk_state["remaining"], 1)
+        ai_recover.assert_not_called()
+        self.assertEqual(
+            app.bulk_state["ip_reset_attempt_count"],
+            creator.MAX_IP_RESET_ATTEMPTS_PER_HEAD,
+        )
+        self.assertTrue(any("without another webhook" in line for line in logs))
+
+    def test_ip_retry_marker_survives_worker_recreation_without_new_allowance(self):
+        first = self.app(1)
+        first.bulk_state["slot_id"] = "a0262"
+        first._set_diag = lambda *_args: None
+        with mock.patch.object(creator, "save_bulk_state", lambda _state: None):
+            self.assertTrue(creator.App._retry_ip_after_failure(
+                first, "Proxy exit did not change."
+            ))
+        durable = dict(first.bulk_state)
+        self.assertEqual(
+            durable["failure_code"], creator.IP_AUTO_RETRY_MARKER_CODE
+        )
+
+        reopened = self.app(1)
+        reopened.bulk_state = durable
+        reopened._set_diag = lambda *_args: None
+        reopened._pause_bulk = creator.App._pause_bulk.__get__(reopened, creator.App)
+        with mock.patch.object(creator, "save_bulk_state", lambda _state: None):
+            self.assertFalse(creator.App._retry_ip_after_failure(
+                reopened, "Proxy exit still did not change."
+            ))
+        self.assertEqual(reopened.stop.waits, [])
+        self.assertEqual(reopened.bulk_state["stage"], "paused")
+        self.assertEqual(
+            reopened.bulk_state["failure_code"], creator.IP_AUTO_RETRY_MARKER_CODE
+        )
+        self.assertEqual(reopened.bulk_state["slot_id"], "a0262")
+        self.assertEqual(reopened.bulk_state["remaining"], 1)
+
+    def test_explicit_retry_preserves_spent_remote_phase_for_adb_handoff(self):
+        app = self.app(1)
+        checkpoint = trigger_checkpoint("198.51.100.1")
+        app.bulk_state.update(
+            stage="paused",
+            slot_id="a0262",
+            baseline_ip=checkpoint["baseline_ip"],
+            trigger_deadline_utc=checkpoint["deadline_utc"],
+            ip_attempt=checkpoint["attempt"],
+            ip_reset_attempt_count=1,
+            failure_phase="ip",
+            failure_reason="IP reset limit reached.",
+            failure_code=creator.IP_RETRY_EXHAUSTED_CODE,
+        )
+        starts = []
+        app._start_bulk_worker = lambda: starts.append(dict(app.bulk_state))
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(creator, "get_slot", return_value={"id": "a0262"}),
+        ):
+            self.assertTrue(app.retry_bulk_batch(password="offline-password"))
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(app.bulk_state["stage"], "retry_ip")
+        self.assertIsNone(app.bulk_state["failure_phase"])
+        self.assertIsNone(app.bulk_state["failure_reason"])
+        self.assertEqual(
+            app.bulk_state["failure_code"], creator.IP_RETRY_EXHAUSTED_CODE
+        )
+        self.assertEqual(app.bulk_state["ip_reset_attempt_count"], 1)
+        self.assertEqual(
+            app.bulk_state["radio_recovery"],
+            bulk_creation.empty_radio_recovery(),
+        )
+        self.assertEqual(app.bulk_state["slot_id"], "a0262")
+        self.assertEqual(app.bulk_state["remaining"], 1)
+
+    def test_nonretryable_ip_failure_pauses_without_wait_or_ai(self):
+        app = self.app(1)
+        app.bulk_state["slot_id"] = "a0262"
+        app._set_diag = lambda *_args: None
+        app._pause_bulk = creator.App._pause_bulk.__get__(app, creator.App)
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(
+                creator.UIRecoveryAgent,
+                "recover",
+                side_effect=AssertionError("configuration failure reached Anthropic"),
+            ) as ai_recover,
+        ):
+            self.assertFalse(creator.App._retry_ip_after_failure(
+                app,
+                "FalconProxy configuration is invalid.",
+                code="macrodroid_setup_failed",
+                retryable=False,
+            ))
+        self.assertEqual(app.stop.waits, [])
+        self.assertEqual(app.bulk_state["stage"], "paused")
+        self.assertEqual(app.bulk_state["failure_code"], "macrodroid_setup_failed")
+        self.assertEqual(app.bulk_state["slot_id"], "a0262")
+        self.assertEqual(app.bulk_state["remaining"], 1)
+        ai_recover.assert_not_called()
+
+    def test_history_scope_failure_escaping_ip_check_pauses_immediately(self):
+        app = self.app(1)
+        original_queue = [dict(item) for item in app.bulk_state["queue"]]
+        app.bulk_state["slot_id"] = "a0262"
+        app._bulk_slot_and_entry = lambda state: (
+            "a0262", state["queue"][0], date(2000, 1, 1)
+        )
+        app._bulk_proxy_scope = mock.Mock(
+            side_effect=creator.HistoryError(
+                "The private proxy scope could not be established."
+            )
+        )
+        app._set_diag = lambda *_args: None
+        app._pause_bulk = creator.App._pause_bulk.__get__(app, creator.App)
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(creator, "get_slot", return_value={
+                "id": "a0262", "reddit": False,
+            }),
+            mock.patch.object(
+                creator.UIRecoveryAgent,
+                "recover",
+                side_effect=AssertionError("history failure reached Anthropic"),
+            ) as ai_recover,
+        ):
+            creator.App._run_bulk_batch(app)
+        self.assertEqual(app.stop.waits, [])
+        self.assertEqual(app.bulk_state["stage"], "paused")
+        self.assertEqual(app.bulk_state["failure_code"], "ip_history_failed")
+        self.assertEqual(app.bulk_state["slot_id"], "a0262")
+        self.assertEqual(app.bulk_state["queue"], original_queue)
+        self.assertEqual(app.bulk_state["remaining"], 1)
+        ai_recover.assert_not_called()
+
+    def test_verified_ip_clears_retry_marker_before_creation_resumes(self):
+        app = self.app(1)
+        app.bulk_state.update(
+            slot_id="a0262",
+            failure_phase="ip",
+            failure_reason="Previous reset did not verify.",
+            failure_code=creator.IP_AUTO_RETRY_MARKER_CODE,
+        )
+        app._bulk_slot_and_entry = lambda state: (
+            "a0262", state["queue"][0], date(2000, 1, 1)
+        )
+        app._run_bulk_ip_check = lambda _state: (
+            verified_result("198.51.100.1", "198.51.100.2"), []
+        )
+        observed = []
+
+        def pipeline(*_args, **_kwargs):
+            observed.append({
+                "stage": app.bulk_state["stage"],
+                "failure_phase": app.bulk_state["failure_phase"],
+                "failure_reason": app.bulk_state["failure_reason"],
+                "failure_code": app.bulk_state["failure_code"],
+            })
+            app.stop.set()
+            return False
+
+        app._run_pipeline_with_bridge_recovery = pipeline
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(creator, "get_slot", return_value={
+                "id": "a0262", "reddit": False,
+            }),
+            mock.patch.object(creator, "set_slot_falcon_proxy_ip", return_value=None),
+        ):
+            creator.App._run_bulk_batch(app)
+        self.assertEqual(observed, [{
+            "stage": "creating",
+            "failure_phase": None,
+            "failure_reason": None,
+            "failure_code": None,
+        }])
 
     def test_completed_slot_reconciles_queue_without_reset(self):
         app = self.app(1)
@@ -1777,6 +2490,195 @@ class BatchCreatorTests(unittest.TestCase):
         )
         self.assertEqual(app.bulk_state["ip_attempt"]["confirmation_floor"], 1)
 
+    def test_explicit_resume_renews_expired_active_ip_window_without_webhook(self):
+        for active_stage in ("may_have_triggered", "retry_ip"):
+            with self.subTest(stage=active_stage):
+                app = self.app(1)
+                checkpoint = trigger_checkpoint("198.51.100.1")
+                expired = dict(
+                    checkpoint["attempt"],
+                    observation_deadline_utc="2000-01-01T00:00:00Z",
+                )
+                original_queue = [dict(item) for item in app.bulk_state["queue"]]
+                app.bulk_state.update(
+                    stage=active_stage,
+                    slot_id="a0262",
+                    baseline_ip=checkpoint["baseline_ip"],
+                    trigger_deadline_utc="2000-01-01T00:00:00Z",
+                    ip_attempt=expired,
+                    ip_reset_attempt_count=1,
+                    failure_phase="ip",
+                    failure_code=creator.IP_AUTO_RETRY_MARKER_CODE,
+                )
+                starts = []
+                logs = []
+                app.log = logs.append
+                app._start_bulk_worker = lambda: starts.append(dict(app.bulk_state))
+                with (
+                    mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+                    mock.patch.object(creator, "get_slot", return_value={"id": "a0262"}),
+                    mock.patch.object(
+                        creator,
+                        "run_macrodroid_change",
+                        side_effect=AssertionError("resume submitted a webhook"),
+                    ) as reset,
+                ):
+                    self.assertTrue(app.retry_bulk_batch(password="offline-password"))
+
+                self.assertEqual(len(starts), 1)
+                self.assertEqual(app.bulk_state["stage"], "retry_ip")
+                self.assertEqual(app.bulk_state["slot_id"], "a0262")
+                self.assertEqual(app.bulk_state["baseline_ip"], checkpoint["baseline_ip"])
+                self.assertEqual(app.bulk_state["queue"], original_queue)
+                self.assertEqual(app.bulk_state["remaining"], 1)
+                self.assertIsNone(app.bulk_state["failure_phase"])
+                self.assertEqual(
+                    app.bulk_state["failure_code"],
+                    creator.IP_AUTO_RETRY_MARKER_CODE,
+                )
+                self.assertEqual(app.bulk_state["ip_reset_attempt_count"], 1)
+                renewed = datetime.fromisoformat(
+                    app.bulk_state["ip_attempt"]["observation_deadline_utc"].replace(
+                        "Z", "+00:00"
+                    )
+                )
+                self.assertGreater(renewed, datetime.now(timezone.utc))
+                self.assertEqual(
+                    app.bulk_state["trigger_deadline_utc"],
+                    app.bulk_state["ip_attempt"]["observation_deadline_utc"],
+                )
+                self.assertTrue(any("no webhook" in line for line in logs))
+                reset.assert_not_called()
+
+    def test_expired_resume_accepts_offline_ip_change_without_webhook(self):
+        app = self.app(1)
+        checkpoint = trigger_checkpoint("198.51.100.1")
+        app.bulk_state.update(
+            stage="may_have_triggered",
+            slot_id="a0262",
+            baseline_ip=checkpoint["baseline_ip"],
+            trigger_deadline_utc="2000-01-01T00:00:00Z",
+            ip_attempt=dict(
+                checkpoint["attempt"],
+                observation_deadline_utc="2000-01-01T00:00:00Z",
+            ),
+        )
+        app._bulk_slot_and_entry = lambda state: (
+            "a0262", state["queue"][0], date(2000, 1, 1)
+        )
+        app._start_bulk_worker = lambda: None
+        created = []
+        app._run_creation_pipeline = lambda *_a, **_k: created.append(True) or True
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(
+                creator,
+                "run_macrodroid_change",
+                side_effect=AssertionError("offline IP change submitted a webhook"),
+            ) as reset,
+            mock.patch.object(
+                creator,
+                "observe_proxy_without_trigger",
+                return_value=verified_result("198.51.100.1", "198.51.100.2"),
+            ),
+            mock.patch.object(
+                creator, "get_slot", side_effect=lambda _sid: {"complete": bool(created)}
+            ),
+            mock.patch.object(
+                creator, "_pipeline_slot_complete", lambda slot: slot["complete"]
+            ),
+            mock.patch.object(creator, "set_slot_falcon_proxy_ip", return_value=None),
+        ):
+            self.assertTrue(app.retry_bulk_batch(password="offline-password"))
+            creator.App._run_bulk_batch(app)
+
+        self.assertEqual(created, [True])
+        self.assertEqual(app.bulk_state["remaining"], 0)
+        self.assertEqual(app.bulk_state["queue"], [])
+        reset.assert_not_called()
+
+    def test_same_ip_after_renewed_resume_uses_adb_once_then_pauses(self):
+        app = self.app(1)
+        checkpoint = trigger_checkpoint("198.51.100.1")
+        app.bulk_state.update(
+            stage="may_have_triggered",
+            slot_id="a0262",
+            baseline_ip=checkpoint["baseline_ip"],
+            trigger_deadline_utc="2000-01-01T00:00:00Z",
+            ip_attempt=dict(
+                checkpoint["attempt"],
+                observation_deadline_utc="2000-01-01T00:00:00Z",
+            ),
+            ip_reset_attempt_count=1,
+            failure_phase="ip",
+            failure_code=creator.IP_AUTO_RETRY_MARKER_CODE,
+        )
+        app._bulk_slot_and_entry = lambda state: (
+            "a0262", state["queue"][0], date(2000, 1, 1)
+        )
+        app._start_bulk_worker = lambda: None
+        app._set_diag = lambda *_args: None
+        app._pause_bulk = creator.App._pause_bulk.__get__(app, creator.App)
+        app._android_radio_config = lambda: (None, "test-xiaomi")
+        unchanged = {
+            "outcome": "no_change",
+            "error": "No IP change observed before the deadline.",
+            "error_category": "",
+        }
+        with (
+            mock.patch.object(creator, "save_bulk_state", lambda _state: None),
+            mock.patch.object(creator, "get_slot", return_value={
+                "id": "a0262", "reddit": False,
+            }),
+            mock.patch.object(creator, "_pipeline_slot_complete", return_value=False),
+            mock.patch.object(
+                creator,
+                "run_macrodroid_change",
+                side_effect=AssertionError("resume submitted another webhook"),
+            ) as reset,
+            mock.patch.object(
+                creator,
+                "observe_proxy_without_trigger",
+                side_effect=[dict(unchanged), dict(unchanged)],
+            ) as observe,
+            mock.patch.object(
+                creator, "reset_android_cellular_radio",
+                side_effect=complete_radio_cycle,
+            ) as adb_reset,
+            mock.patch.object(
+                creator, "restore_android_cellular_radio",
+                side_effect=AssertionError("fresh fallback used restore-only path"),
+            ) as adb_restore,
+            mock.patch.object(
+                creator.UIRecoveryAgent, "recover",
+                side_effect=AssertionError("IP failure reached Anthropic"),
+            ) as ai_recover,
+        ):
+            self.assertTrue(app.retry_bulk_batch(password="offline-password"))
+            renewed_deadline = app.bulk_state["ip_attempt"][
+                "observation_deadline_utc"
+            ]
+            creator.App._run_bulk_batch(app)
+
+        self.assertGreater(renewed_deadline, "2000-01-01T00:00:00Z")
+        self.assertEqual(app.stop.waits, [])
+        self.assertEqual(app.bulk_state["stage"], "paused")
+        self.assertEqual(
+            app.bulk_state["failure_code"], creator.IP_RETRY_EXHAUSTED_CODE
+        )
+        self.assertEqual(
+            app.bulk_state["ip_reset_attempt_count"],
+            2,
+        )
+        self.assertEqual(app.bulk_state["radio_recovery"]["state"], "completed")
+        self.assertEqual(app.bulk_state["slot_id"], "a0262")
+        self.assertEqual(app.bulk_state["remaining"], 1)
+        reset.assert_not_called()
+        adb_reset.assert_called_once()
+        adb_restore.assert_not_called()
+        self.assertEqual(observe.call_count, 2)
+        ai_recover.assert_not_called()
+
     def test_real_verifier_outage_pattern_hands_off_once_and_saves_actual_time(self):
         app = self.app(1)
         app.bulk_state["slot_id"] = "a0046"
@@ -1791,23 +2693,36 @@ class BatchCreatorTests(unittest.TestCase):
                 raise value
             return value
         def run(webhook, proxy, **kwargs):
+            supplied_triggerer = kwargs.pop("triggerer", None)
+            if supplied_triggerer is not None:
+                def triggerer(*args):
+                    events.append("adb-trigger")
+                    return supplied_triggerer(*args)
+            else:
+                triggerer = lambda *_args: events.append("trigger") or {
+                    "acknowledged": True,
+                }
             return ip_change.run_macrodroid_change(
                 webhook, proxy, **kwargs, fetcher=fetch, monotonic=clock.monotonic,
                 now=clock.now, waiter=lambda seconds: clock.advance(seconds) or False,
-                triggerer=lambda *_args: events.append("trigger") or {"acknowledged": True},
+                triggerer=triggerer,
             )
         app._run_creation_pipeline = lambda *_a, **_k: events.append("create-and-close") or True
         with (
             tempfile.TemporaryDirectory() as folder,
             mock.patch.object(creator, "save_bulk_state", lambda state: bulk_creation.save_state(state, Path(folder) / "queue.json")),
             mock.patch.object(creator, "run_macrodroid_change", run),
+            mock.patch.object(
+                creator, "reset_android_cellular_radio",
+                side_effect=complete_radio_cycle,
+            ),
             mock.patch.object(creator, "get_slot", lambda _sid: {"complete": "create-and-close" in events}),
             mock.patch.object(creator, "_pipeline_slot_complete", lambda slot: slot["complete"]),
             mock.patch.object(creator, "set_slot_falcon_proxy_ip", lambda sid, ip, at: events.append((sid, ip, at))),
         ):
             app._run_bulk_batch()
             self.assertEqual(bulk_creation.load_state(Path(folder) / "queue.json")["remaining"], 0)
-        self.assertEqual(events, ["trigger", ("a0046", "31.217.14.168", "2026-10-16T12:00:13Z"), "create-and-close"])
+        self.assertEqual(events, ["adb-trigger", ("a0046", "31.217.14.168", "2026-10-16T12:00:03.500000Z"), "create-and-close"])
 
     def test_actual_legacy_retry_keeps_unknown_baseline_time_and_sends_no_reset(self):
         app = self.app(1)

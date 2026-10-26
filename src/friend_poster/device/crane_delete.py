@@ -230,6 +230,27 @@ def is_reddit_list(nodes) -> bool:
     return apps.x < 220 and edit.y < 130
 
 
+def _is_reddit_edit_list(nodes) -> bool:
+    """Prove that Crane's Reddit container pane finished entering Edit mode.
+
+    A live Settings transition can briefly expose only the ``Settings`` title.
+    Returning that transient frame lets the first list flick land in the
+    foreground Reddit app, where ordinary post text can be mistaken for an
+    absent container row.  Require the complete Crane edit signature before
+    any row scan or destructive gesture is allowed.
+    """
+    done = find_label_exact(nodes, ("Done",))
+    reddit = find_label_exact(nodes, ("Reddit",))
+    header = find_label_exact(nodes, ("CONTAINERS", "Containers"))
+    return (
+        done is not None
+        and done.y < 130
+        and reddit is not None
+        and reddit.y < 130
+        and header is not None
+    )
+
+
 def is_r1_detail(nodes) -> bool:
     title = find_label_exact(nodes, ("a0001", "r1", "r", "R"))
     if title is None or title.y > 130:
@@ -322,57 +343,77 @@ def back_to_reddit_list(stack: TapStack, phone: Phone):
         long_press_home_icon,
     )
 
-    icon = _find_reddit_from_home(stack, phone, log, "730_delete")
-    long_press_home_icon(stack, icon, log)
-    time.sleep(0.8)
-    blob, nodes = dump(stack, phone, "730_haptic")
-    crane_marker = (
-        crane_submenu_marker(nodes)
-        or crane_singular_parent_marker(nodes)
-        or find_label_exact(nodes, ("Container", "Containers"))
-    )
-    if haptic_system_action(nodes) is None or crane_marker is None:
-        raise PhoneError(
-            "Reddit long-press did not show a proven Crane container doorway; "
-            "did not guess a tap. See 730_haptic."
+    for attempt in range(2):
+        suffix = "" if attempt == 0 else "_retry"
+        icon = _find_reddit_from_home(
+            stack, phone, log, f"730_delete{suffix}"
         )
-    log("TAP Crane container doorway from Reddit long-press menu")
-    tap_label_center(stack, crane_marker, "Crane container doorway")
-    time.sleep(0.8)
-    blob, nodes = dump(stack, phone, "730_container_picker")
-    settings = find_label_exact(nodes, ("Settings",))
-    if settings is None or not (
-        crane_container_list(nodes)
-        or _is_expanded_haptic_container_picker(nodes)
-        or find_label_exact(
-            nodes, ("Select Container", "Switch Container", "Containers")
+        long_press_home_icon(stack, icon, log)
+        time.sleep(0.8)
+        _blob, nodes = dump(stack, phone, f"730_haptic{suffix}")
+        crane_marker = (
+            crane_submenu_marker(nodes)
+            or crane_singular_parent_marker(nodes)
+            or find_label_exact(nodes, ("Container", "Containers"))
         )
-    ):
-        raise PhoneError(
-            "Crane container picker did not expose its verified Settings row; "
-            "did not guess a tap. See 730_container_picker."
-        )
-    log("TAP Settings at the bottom of the Crane container picker")
-    tap_label_center(stack, settings, "Crane Settings")
-    time.sleep(1.1)
-    blob, nodes = dump(stack, phone, "730_reddit_settings")
-    if not is_reddit_list(nodes):
-        # Some Crane versions open their root pane first.  Follow the existing
-        # verified Applications -> Reddit path, never a coordinate guess.
-        if find_label_exact(nodes, ("Applications",)) is None:
+        if haptic_system_action(nodes) is None or crane_marker is None:
             raise PhoneError(
-                "Crane Settings did not open the Reddit container pane or Crane root. "
-                "See 730_reddit_settings."
+                "Reddit long-press did not show a proven Crane container doorway; "
+                f"did not guess a tap. See 730_haptic{suffix}."
             )
-        nodes = open_reddit_containers(stack, phone, nodes)
-    if not is_reddit_list(nodes):
-        raise PhoneError("Not on Crane Reddit list. See 730 dumps.")
-    return nodes
+        log("TAP Crane container doorway from Reddit long-press menu")
+        tap_label_center(stack, crane_marker, "Crane container doorway")
+        time.sleep(0.8)
+        _blob, nodes = dump(stack, phone, f"730_container_picker{suffix}")
+        settings = find_label_exact(nodes, ("Settings",))
+        if settings is None or not (
+            crane_container_list(nodes)
+            or _is_expanded_haptic_container_picker(nodes)
+            or find_label_exact(
+                nodes, ("Select Container", "Switch Container", "Containers")
+            )
+        ):
+            raise PhoneError(
+                "Crane container picker did not expose its verified Settings row; "
+                f"did not guess a tap. See 730_container_picker{suffix}."
+            )
+        log("TAP Settings at the bottom of the Crane container picker")
+        tap_label_center(stack, settings, "Crane Settings")
+
+        # Opening the Settings bundle can be noticeably slower than the haptic
+        # menu itself.  The live a0270 run still showed the previous Hide My
+        # Email pane after 1.1 seconds and reached Crane only after the cleanup
+        # had already paused.  Give the app switch three full seconds before
+        # judging the postcondition.
+        time.sleep(3.0)
+        _blob, nodes = dump(stack, phone, f"730_reddit_settings{suffix}")
+        if not is_reddit_list(nodes):
+            # Some Crane versions open their root pane first.  Follow the
+            # verified Applications -> Reddit path, never a coordinate guess.
+            if find_label_exact(nodes, ("Applications",)) is not None:
+                nodes = open_reddit_containers(stack, phone, nodes)
+        if is_reddit_list(nodes):
+            return nodes
+
+        if attempt == 0:
+            # A stale foreground pane can win the first Settings transition.
+            # Return to SpringBoard and replay the exact verified doorway once;
+            # no container action has happened yet, so this is idempotent.
+            log(
+                "Crane Settings postcondition was not ready after 3 seconds; "
+                "returning Home and retrying Reddit -> Container -> Settings once."
+            )
+            stack.press_home()
+            time.sleep(0.8)
+
+    raise PhoneError(
+        "Crane Settings did not open the Reddit container pane or Crane root "
+        "after one bounded Home retry. See 730_reddit_settings_retry."
+    )
 
 
 def tap_edit(stack: TapStack, phone: Phone, nodes):
-    done = find_label_exact(nodes, ("Done",))
-    if done is not None and done.y < 130:
+    if _is_reddit_edit_list(nodes):
         log("Already in Edit (Done visible)")
         return nodes
     edit = find_label_exact(nodes, ("Edit",))
@@ -380,12 +421,64 @@ def tap_edit(stack: TapStack, phone: Phone, nodes):
         raise PhoneError("Edit not on top right. See 730 dumps.")
     log("TAP Edit top right")
     tap_label_center(stack, edit, "Edit")
-    time.sleep(0.9)
-    os.environ.pop("SKIP_SHOT", None)
-    blob, nodes = dump(stack, phone, "731_edit", shot=True)
-    os.environ["SKIP_SHOT"] = "1"
-    log("EDIT " + visible_labels(nodes))
-    return nodes
+    # The a0280 cleanup reached a real Crane pane, tapped Edit, then sampled
+    # after 0.9s while Settings was still transitioning.  The subsequent scan
+    # flicked Reddit's feed for several minutes and incorrectly treated the
+    # exact row as absent.  Wait up to roughly three seconds for a *proven*
+    # Edit pane and never gesture on a transient/foreign frame.
+    unknown_prompt_dismissed = False
+    for probe in range(6):
+        time.sleep(0.8)
+        tag = "731_edit" if probe == 0 else f"731_edit_wait_{probe}"
+        if probe == 5:
+            os.environ.pop("SKIP_SHOT", None)
+        try:
+            blob, nodes = dump(stack, phone, tag, shot=probe == 5)
+        finally:
+            os.environ["SKIP_SHOT"] = "1"
+        log("EDIT " + visible_labels(nodes))
+        if _is_reddit_edit_list(nodes):
+            return nodes
+
+        # Crane can raise its own "Unknown Containers Found" alert over the
+        # Reddit pane.  The alert consumes the Edit tap, so merely waiting can
+        # never prove the postcondition.  Dismiss only the non-destructive
+        # "Remind Me Later" action, prove that the Reddit list is back, and
+        # replay Edit once.  Never choose Import/Delete automatically.
+        unknown = find_label_exact(nodes, ("Unknown Containers Found",))
+        remind = find_label_exact(nodes, ("Remind Me Later",))
+        if unknown is not None and remind is not None and not unknown_prompt_dismissed:
+            log(
+                "Crane Unknown Containers prompt blocked Edit; dismissing with "
+                "the non-destructive Remind Me Later action and replaying Edit once."
+            )
+            tap_label_center(stack, remind, "Remind Me Later")
+            unknown_prompt_dismissed = True
+            time.sleep(0.8)
+            _blob, nodes = dump(stack, phone, "731_unknown_containers_later")
+            if _is_reddit_edit_list(nodes):
+                return nodes
+            if not is_reddit_list(nodes):
+                raise PhoneError(
+                    "Crane Reddit pane was not restored after dismissing the "
+                    "Unknown Containers prompt; no container gesture was attempted."
+                )
+            edit = find_label_exact(nodes, ("Edit",))
+            if edit is None:
+                raise PhoneError(
+                    "Crane Edit was unavailable after dismissing the Unknown "
+                    "Containers prompt; no container gesture was attempted."
+                )
+            log("TAP Edit top right after dismissing Unknown Containers prompt")
+            tap_label_center(stack, edit, "Edit")
+            continue
+
+        if probe < 5:
+            log("Crane Edit postcondition is still transitioning; waiting locally.")
+    raise PhoneError(
+        "Crane Edit postcondition was not proven after bounded waiting; "
+        "no container-row gesture was attempted. See 731_edit_wait_5."
+    )
 
 
 def _red_minus_target(row, name: str) -> tuple[int, int, str]:
@@ -476,6 +569,11 @@ def tap_red_delete_r1(
     absent_ok: bool = False,
 ):
     """Tap the red minus and Delete button for one exact container row."""
+    if not _is_reddit_edit_list(nodes):
+        raise PhoneError(
+            "Crane Edit pane is not proven before the exact-row scan; "
+            "refused all container gestures."
+        )
     row = _find_exact_container_row(nodes, name)
     last = None
     stuck = 0
@@ -485,6 +583,11 @@ def tap_red_delete_r1(
         log(f"{name} off-screen in Edit -> scroll Crane containers")
         flick_list(stack)
         blob, nodes = dump(stack, phone, f"731_edit_{i}")
+        if not _is_reddit_edit_list(nodes):
+            raise PhoneError(
+                "Crane Edit pane was lost while scanning toward the bottom; "
+                "refused further container gestures."
+            )
         labels = visible_labels(nodes)
         log("EDIT " + labels)
         row = _find_exact_container_row(nodes, name)
@@ -501,6 +604,11 @@ def tap_red_delete_r1(
             log(f"{name} not found toward bottom -> scan back toward top")
             flick_list_toward_top(stack)
             blob, nodes = dump(stack, phone, f"731_edit_top_{i}")
+            if not _is_reddit_edit_list(nodes):
+                raise PhoneError(
+                    "Crane Edit pane was lost while scanning toward the top; "
+                    "refused further container gestures."
+                )
             labels = visible_labels(nodes)
             log("EDIT " + labels)
             row = _find_exact_container_row(nodes, name)

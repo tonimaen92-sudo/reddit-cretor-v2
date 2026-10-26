@@ -33,6 +33,8 @@ USER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{1,28}$")
 MAX_SUGGESTION_REFRESHES = 2
 USERNAME_AVAILABILITY_POLLS = 4
 USERNAME_TRANSITION_POLLS = 8
+USERNAME_TYPED_VALUE_POLLS = 2
+USERNAME_RETYPE_ATTEMPTS = 1
 USERNAME_STALL_POLL_SECONDS = 5.0
 USERNAME_STALL_SAFETY_SECONDS = 195.0
 REFRESH_LABELS = (
@@ -219,7 +221,10 @@ def _prove_requested_username_available(
     """Boundedly re-read availability, with screenshot proof when OCR omits it."""
     last = nodes
     for attempt in range(USERNAME_AVAILABILITY_POLLS + 1):
-        if suggested_username(last) != requested:
+        field = find_label_exact(last, ("Username",))
+        if field is None or not _username_field_matches_candidate(
+            last, field, requested
+        ):
             raise UsernameAvailabilityUnclear(
                 "Reddit changed the requested username while checking availability. "
                 "Did not tap Continue."
@@ -348,8 +353,20 @@ def _wait_after_requested_username(
             phone.progress_note = progress_hook
 
 
-def _username_value_below_field(nodes, field) -> str | None:
-    """Return only a username-shaped value rendered directly below *field*."""
+_USERNAME_OCR_TRANSLATION = str.maketrans(
+    {
+        # Apple's rendered lowercase x is occasionally exposed by XXTouch OCR
+        # as a multiplication/cross glyph. Reddit usernames cannot contain
+        # these glyphs, so normalizing them is unambiguous.
+        "×": "x",
+        "✕": "x",
+        "✖": "x",
+    }
+)
+
+
+def _username_token_below_field(nodes, field) -> str | None:
+    """Return any rendered token directly below *field*, even if OCR-corrupt."""
     hits = []
     for n in nodes:
         if n.ntype == "ocr-line" or not n.on_screen():
@@ -376,10 +393,37 @@ def _username_value_below_field(nodes, field) -> str | None:
             hits.append((n, token))
     if hits:
         hits.sort(key=lambda t: abs(t[0].y - field.y))
-        token = hits[0][1]
-        if USER_RE.match(token):
-            return token
+        return hits[0][1]
     return None
+
+
+def _username_value_below_field(nodes, field) -> str | None:
+    """Return a normalized username-shaped value rendered below *field*."""
+    token = _username_token_below_field(nodes, field)
+    if token is not None:
+        normalized = token.translate(_USERNAME_OCR_TRANSLATION)
+        if USER_RE.fullmatch(normalized):
+            return normalized
+    return None
+
+
+def _username_field_matches_candidate(nodes, field, candidate: str) -> bool:
+    """Match a known candidate through one proven XXTouch OCR ambiguity.
+
+    XXTouch can render a lowercase ``l`` in Reddit's username field as an
+    uppercase ``I``.  This remains expected-value-aware: every other position
+    must be exact after the existing unambiguous x-glyph translation.
+    """
+    token = _username_token_below_field(nodes, field)
+    if token is None:
+        return False
+    observed = token.translate(_USERNAME_OCR_TRANSLATION)
+    if USER_RE.fullmatch(observed) is None or len(observed) != len(candidate):
+        return False
+    return all(
+        actual == expected or (expected == "l" and actual == "I")
+        for expected, actual in zip(candidate, observed)
+    )
 
 
 def suggested_username(nodes) -> str | None:
@@ -639,6 +683,23 @@ def _requested_username_controls(nodes):
     cont = find_label_exact(nodes, ("Continue",))
     keyboard_open = _username_keyboard_open(nodes)
     inspiration = _page_node(nodes, "need inspiration?")
+
+    # A transient in-app notification can cover only the page title after the
+    # requested username has been typed. Accept that narrowly proven state:
+    # the field, inspiration copy, keyboard and Continue geometry must still
+    # match, and Reddit must explicitly say the name is available.
+    if (
+        title is None
+        and field is not None
+        and cont is not None
+        and inspiration is not None
+        and keyboard_open
+        and requested_username_available(nodes)
+        and 350 <= field.center()[1] <= 470
+        and 480 <= inspiration.center()[1] <= 650
+        and 650 <= cont.center()[1] <= 800
+    ):
+        return field
     if field is None and title and cont and inspiration and keyboard_open:
         clipped = [
             node
@@ -689,11 +750,11 @@ def _requested_username_empty_after_clear(nodes) -> bool:
         except UsernameAvailabilityUnclear:
             return False
         if exact_field is not None:
-            return suggested_username(nodes) is None
+            return _username_token_below_field(nodes, exact_field) is None
         # A clipped anchor is accepted only by _requested_username_controls()
         # with the full fixed page/keyboard geometry.  Since suggested_username
         # intentionally needs the exact label, inspect the proven anchor here.
-        return _username_value_below_field(nodes, field) is None
+        return _username_token_below_field(nodes, field) is None
 
     field = find_label_exact(nodes, ("Username",))
     cont = find_label_exact(nodes, ("Continue",))
@@ -708,7 +769,7 @@ def _requested_username_empty_after_clear(nodes) -> bool:
         and 650 <= cont.center()[1] <= 800
     ):
         return False
-    return suggested_username(nodes) is None
+    return _username_token_below_field(nodes, field) is None
 
 
 def _type_requested_candidate(
@@ -719,52 +780,94 @@ def _type_requested_candidate(
     index: int,
 ):
     """Replace the proven field value with one durable local candidate."""
-    field = _requested_username_controls(nodes)
-    current = _username_value_below_field(nodes, field)
-    if current == candidate:
-        return nodes
-    # On this proven Reddit layout, the username value is directly beneath the
-    # floating label. Tapping the right side positions the cursor at the end.
-    stack.tap_xy(650, field.center()[1] + 32)
-    if current:
-        stack.press_backspace(40)
-        _cancelable_wait(stack, 0.5)
-        _, cleared = dump_named(
+    base_stem = (
+        "890_username_requested"
+        if index == 0
+        else f"890_username_variant_{index}"
+    )
+    current_nodes = nodes
+    for typing_attempt in range(USERNAME_RETYPE_ATTEMPTS + 1):
+        field = _requested_username_controls(current_nodes)
+        current = _username_value_below_field(current_nodes, field)
+        if _username_field_matches_candidate(current_nodes, field, candidate):
+            return current_nodes
+
+        # On this proven Reddit layout, the username value is directly beneath
+        # the floating label. Tapping the right side positions the cursor at the
+        # end. A retry is allowed only after the old value is proven absent.
+        stack.tap_xy(650, field.center()[1] + 32)
+        if current:
+            stack.press_backspace(40)
+            _cancelable_wait(stack, 0.5)
+            cleared_stem = (
+                "890_username_cleared"
+                if typing_attempt == 0 and index == 0
+                else (
+                    f"890_username_variant_{index}_cleared"
+                    if typing_attempt == 0
+                    else f"{base_stem}_retype_{typing_attempt}_cleared"
+                )
+            )
+            _, cleared = dump_named(
+                stack,
+                phone,
+                cleared_stem,
+                log,
+                shot=True,
+            )
+            if not _requested_username_empty_after_clear(cleared):
+                raise UsernameAvailabilityUnclear(
+                    "Requested username field did not clear; no candidate was typed "
+                    "or saved."
+                )
+        elif not _requested_username_empty_after_clear(current_nodes):
+            raise UsernameAvailabilityUnclear(
+                "Requested username field state was unclear; no candidate was typed "
+                "or saved."
+            )
+
+        stack.type_text(candidate)
+        _cancelable_wait(stack, 1.2)
+        typed_stem = (
+            base_stem
+            if typing_attempt == 0
+            else f"{base_stem}_retype_{typing_attempt}"
+        )
+        _, fresh = dump_named(
             stack,
             phone,
-            (
-                "890_username_cleared"
-                if index == 0
-                else f"890_username_variant_{index}_cleared"
-            ),
+            typed_stem,
             log,
             shot=True,
         )
-        if not _requested_username_empty_after_clear(cleared):
-            raise UsernameAvailabilityUnclear(
-                "Requested username field did not clear; no candidate was typed "
-                "or saved."
+        for poll in range(USERNAME_TYPED_VALUE_POLLS + 1):
+            fresh_field = _requested_username_controls(fresh)
+            if _username_field_matches_candidate(fresh, fresh_field, candidate):
+                return fresh
+            if poll >= USERNAME_TYPED_VALUE_POLLS:
+                break
+            _cancelable_wait(stack, 0.8)
+            _, fresh = dump_named(
+                stack,
+                phone,
+                f"{typed_stem}_verify_{poll + 1}",
+                log,
+                shot=True,
+                preview=False,
             )
-    stack.type_text(candidate)
-    _cancelable_wait(stack, 1.2)
-    _, fresh = dump_named(
-        stack,
-        phone,
-        (
-            "890_username_requested"
-            if index == 0
-            else f"890_username_variant_{index}"
-        ),
-        log,
-        shot=True,
+
+        if typing_attempt < USERNAME_RETYPE_ATTEMPTS:
+            log(
+                "Requested username field verification stayed mismatched after "
+                "fresh reads; clearing and retyping the same durable candidate "
+                "once (value redacted)."
+            )
+            current_nodes = fresh
+
+    raise UsernameAvailabilityUnclear(
+        "Reddit did not show the exact local username candidate after bounded "
+        "fresh reads and one safe retype. Did not continue."
     )
-    fresh_field = _requested_username_controls(fresh)
-    if _username_value_below_field(fresh, fresh_field) != candidate:
-        raise UsernameAvailabilityUnclear(
-            "Reddit did not show the exact local username candidate in the field. "
-            "Did not continue."
-        )
-    return fresh
 
 
 def use_requested_username(

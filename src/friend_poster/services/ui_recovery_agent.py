@@ -87,6 +87,7 @@ _WORKFLOW_TOOL_SCOPES: dict[str, frozenset[str]] = {
     "fill_prepared_field": frozenset(
         {"creation_pipeline", "icloud_unlock", "account_form"}
     ),
+    "verified_retry_saved_email_field": frozenset({"account_form"}),
     "retry_icloud_unlock": frozenset({"creation_pipeline", "icloud_unlock"}),
     "verified_dismiss_icloud_sheet": frozenset(
         {"creation_pipeline", "icloud_unlock"}

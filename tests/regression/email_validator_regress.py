@@ -53,6 +53,33 @@ def main() -> int:
     ]
     check("invalid-warning-rejected", not validator.email_ready(warning, expected))
 
+    # Immutable a0279 OCR shape: the exact prepared address contains one
+    # underscore, while live OCR renders only that underscore as whitespace.
+    underscore_expected = "pebble_42fixture@icloud.com"
+    underscore_as_space = synthetic_email("pebble 42fixture@icloud.com")
+    underscore_report = validator._email_validation_report(
+        underscore_as_space, underscore_expected
+    )
+    check("underscore-read-as-space-is-accepted", underscore_report.valid)
+    check(
+        "underscore-space-equivalence-is-classified",
+        underscore_report.ocr_equivalence == "underscore-read-as-space",
+    )
+    check(
+        "unrelated-space-difference-remains-rejected",
+        not validator.email_ready(
+            synthetic_email("pebble x2fixture@icloud.com"),
+            underscore_expected,
+        ),
+    )
+    check(
+        "underscore-space-with-invalid-warning-is-rejected",
+        not validator.email_ready(
+            underscore_as_space + [ocr("Please enter a valid email", 90, 600, 420)],
+            underscore_expected,
+        ),
+    )
+
     form_context = synthetic_email(expected)[:-1]
     split = form_context + [
         ocr("fixture_name9h@", 70, 530, 270),

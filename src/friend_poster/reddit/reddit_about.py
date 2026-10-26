@@ -46,11 +46,13 @@ BIRTHDAY_TRANSITION_MAX_DUMPS = 8
 BIRTHDAY_OCR_RETRY_DUMPS = 3
 BIRTH_YEAR_MIN = 2002
 BIRTH_YEAR_MAX = 2006
-BIRTHDAY_AXIS_MAX_MOVES = {"year": 40, "month": 8, "day": 14}
+BIRTHDAY_AXIS_MAX_MOVES = {"year": 40, "month": 8, "day": 62}
 BIRTHDAY_AXIS_UNCHANGED_LIMIT = 2
 BIRTHDAY_MAX_ROWS_PER_GESTURE = 3
 BIRTHDAY_MIN_DRAG_FACTOR = 1.35
 BIRTHDAY_TITLE_LABELS = ("Birthday", "Birthdav")
+BIRTHDAY_SUBMIT_LABELS = ("Continue",)
+BIRTHDAY_SUBMIT_MIN_Y = 1050
 
 
 def _normalized_month_text(text: str) -> str:
@@ -277,7 +279,21 @@ def _axis_distance(axis: str, current: int, target: int, target_date: date) -> i
     """Return signed rows; positive values move toward increasing wheel values."""
     if axis == "year":
         return target - current
-    size = 12 if axis == "month" else monthrange(target_date.year, target_date.month)[1]
+    if axis == "day":
+        # The day column still renders rows through 31 in short months, but the
+        # live Reddit picker can clamp at the last valid day instead of wrapping
+        # through those faded rows.  Therefore a month-length modulo can choose
+        # an impossible direction (for example, end-of-February -> an early
+        # February day).  Move linearly through valid days.  A temporarily
+        # centered 29/30/31 is accepted so month correction can subsequently
+        # bring it back to the exact, validated target date.
+        last_valid_day = monthrange(target_date.year, target_date.month)[1]
+        if not 1 <= current <= 31 or not 1 <= target <= last_valid_day:
+            raise PhoneError(
+                f"Birthday {axis} wheel contains an invalid centered value. Did not move it."
+            )
+        return target - current
+    size = 12
     if not 1 <= current <= size or not 1 <= target <= size:
         raise PhoneError(
             f"Birthday {axis} wheel contains an invalid centered value. Did not move it."
@@ -301,7 +317,10 @@ def _day_target_just_outside_visible_window(
     signed_distance: int,
 ) -> bool:
     """Prove that the target is exactly one row beyond the visible day edge."""
-    size = monthrange(target_date.year, target_date.month)[1]
+    # Reddit's day wheel visibly keeps all 31 rows even for shorter months.
+    # A temporarily visible 31 is not a valid final date, but it remains part
+    # of the contiguous picker geometry and must not break the safe row scan.
+    size = 31
     selected_nodes = selected_birthday_nodes(nodes)
     rows = _axis_nodes(nodes, "day")
     if selected_nodes is None or not rows:
@@ -342,6 +361,146 @@ def _day_target_just_outside_visible_window(
         successor = (visible[-1] % size) + 1
         return target == successor
     return False
+
+
+def _day_visible_progress_node(
+    nodes,
+    target: int,
+    target_date: date,
+    signed_distance: int,
+):
+    """Return one proven visible day row that strictly approaches ``target``.
+
+    A native picker can ignore a short one-row flick when it starts close to
+    the selection band.  After that no-op is verified, prefer an exact visible
+    row in the same direction.  Only the contiguous day run around the centered
+    selection is eligible; unrelated OCR numbers cannot become tap targets.
+    """
+    if signed_distance == 0:
+        return None
+    selected_nodes = selected_birthday_nodes(nodes)
+    rows = _axis_nodes(nodes, "day")
+    if selected_nodes is None or not rows:
+        return None
+
+    size = 31
+    centered_node = selected_nodes[0]
+    centered_index = min(
+        range(len(rows)),
+        key=lambda index: abs(
+            rows[index][1].center()[1] - centered_node.center()[1]
+        ),
+    )
+    first = centered_index
+    while first > 0:
+        previous_value, previous_node = rows[first - 1]
+        current_value, current_node = rows[first]
+        gap = current_node.center()[1] - previous_node.center()[1]
+        if not 25 <= gap <= 80 or current_value != (previous_value % size) + 1:
+            break
+        first -= 1
+    last = centered_index
+    while last + 1 < len(rows):
+        current_value, current_node = rows[last]
+        next_value, next_node = rows[last + 1]
+        gap = next_node.center()[1] - current_node.center()[1]
+        if not 25 <= gap <= 80 or next_value != (current_value % size) + 1:
+            break
+        last += 1
+
+    candidates = []
+    last_valid_day = monthrange(target_date.year, target_date.month)[1]
+    for value, node in rows[first : last + 1]:
+        if not 1 <= value <= last_valid_day:
+            # Short months still render faded rows through 31.  They prove the
+            # wheel geometry, but are never safe recovery tap targets.
+            continue
+        try:
+            candidate_distance = _axis_distance("day", value, target, target_date)
+        except PhoneError:
+            continue
+        if candidate_distance == 0:
+            continue
+        if signed_distance > 0 and candidate_distance < 0:
+            continue
+        if signed_distance < 0 and candidate_distance > 0:
+            continue
+        if abs(candidate_distance) >= abs(signed_distance):
+            continue
+        candidates.append((abs(candidate_distance), node))
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda item: (
+            item[0],
+            abs(item[1].center()[1] - BIRTHDAY_WHEEL_CENTER_Y),
+        ),
+    )[1]
+
+
+def _summary_backed_adjacent_day_node(
+    nodes,
+    target: int,
+    target_date: date,
+    signed_distance: int,
+):
+    """Return one adjacent day row when the centered day alone is OCR-hidden.
+
+    Reddit renders the selected wheel row in a heavier font and OCR can omit a
+    single-digit day even though the bounded date summary still states the
+    current selection.  This recovery is deliberately narrower than a generic
+    coordinate tap: the summary must cross-check against the centered month and
+    year, and unique predecessor/successor rows must bracket the canonical
+    wheel center.  Only the adjacent row in the target direction is eligible.
+    """
+    if signed_distance == 0 or selected_birthday_nodes(nodes) is not None:
+        return None
+    current = _birthday_from_summary_with_wheel_cross_check(nodes)
+    if current is None:
+        return None
+    current_day, current_month, current_year = current
+    if (current_month, current_year) != (target_date.month, target_date.year):
+        return None
+    if _axis_distance("day", current_day, target, target_date) != signed_distance:
+        return None
+
+    rows = _axis_nodes(nodes, "day")
+    predecessor = 31 if current_day == 1 else current_day - 1
+    successor = 1 if current_day == 31 else current_day + 1
+    above = [
+        node
+        for value, node in rows
+        if value == predecessor
+        and 25 <= BIRTHDAY_WHEEL_CENTER_Y - node.center()[1] <= 80
+    ]
+    below = [
+        node
+        for value, node in rows
+        if value == successor
+        and 25 <= node.center()[1] - BIRTHDAY_WHEEL_CENTER_Y <= 80
+    ]
+    if len(above) != 1 or len(below) != 1:
+        return None
+    if abs(above[0].center()[0] - below[0].center()[0]) > 25:
+        return None
+
+    candidate_value, candidate = (
+        (successor, below[0]) if signed_distance > 0 else (predecessor, above[0])
+    )
+    last_valid_day = monthrange(target_date.year, target_date.month)[1]
+    if not 1 <= candidate_value <= last_valid_day:
+        return None
+    candidate_distance = _axis_distance(
+        "day", candidate_value, target, target_date
+    )
+    if candidate_distance == 0:
+        return candidate
+    if signed_distance * candidate_distance <= 0:
+        return None
+    if abs(candidate_distance) != abs(signed_distance) - 1:
+        return None
+    return candidate
 
 
 def _move_birthday_axis(
@@ -438,6 +597,68 @@ def _set_birthday_axis(
             log(f"Birthday {axis}: selecting an exact visible row.")
             stack.tap_xy(*visible_target.center())
         else:
+            adjacent_day = None
+            if axis == "day":
+                adjacent_day = _summary_backed_adjacent_day_node(
+                    current_nodes,
+                    target,
+                    target_date,
+                    old_signed_distance,
+                )
+            if adjacent_day is not None:
+                movement_kind = "summary-adjacent"
+                log(
+                    "Birthday day: centered OCR is hidden; selecting one "
+                    "proven adjacent row from bounded summary geometry."
+                )
+                stack.tap_xy(*adjacent_day.center())
+                fresh = stable_birthday_dump(
+                    stack,
+                    phone,
+                    f"910_birthday_{axis}_{move_count + 1}",
+                    shot=False,
+                )
+                fresh_selected = selected_birthday(fresh)
+                if fresh_selected is None:
+                    raise PhoneError(
+                        f"Birthday {axis} picker became unclear after a movement."
+                    )
+                fresh_values = {
+                    "day": fresh_selected[0],
+                    "month": fresh_selected[1],
+                    "year": fresh_selected[2],
+                }
+                for locked_axis, locked_value in (locked_axes or {}).items():
+                    if fresh_values.get(locked_axis) != locked_value:
+                        raise PhoneError(
+                            f"Birthday {locked_axis} changed while setting {axis}. "
+                            "Did not continue."
+                        )
+                fresh_value = fresh_selected[axis_index]
+                if fresh_value == current:
+                    unchanged += 1
+                    if unchanged >= BIRTHDAY_AXIS_UNCHANGED_LIMIT:
+                        raise PhoneError(
+                            "Birthday day adjacent-row recovery did not move after "
+                            "two verified attempts."
+                        )
+                    log(
+                        "Birthday day adjacent row was unchanged; one bounded retry is allowed."
+                    )
+                    current_nodes = fresh
+                    continue
+                new_signed_distance = _axis_distance(
+                    axis, fresh_value, target, target_date
+                )
+                if abs(new_signed_distance) != old_distance - 1:
+                    raise PhoneError(
+                        "Birthday day adjacent-row recovery did not advance exactly one row."
+                    )
+                unchanged = 0
+                log("Birthday day adjacent-row movement verified.")
+                current_nodes = fresh
+                continue
+
             if old_signed_distance == 0:
                 raise PhoneError(
                     f"Birthday {axis} target comparison was inconsistent. Did not move it."
@@ -456,22 +677,70 @@ def _set_birthday_axis(
                 day_reversal_pending = False
                 day_reversal_used = True
                 log("Birthday day: one bounded overshoot reversal.")
+                _move_birthday_axis(
+                    stack,
+                    current_nodes,
+                    axis,
+                    1 if old_signed_distance > 0 else -1,
+                    gesture_rows,
+                    retry=gesture_retry,
+                )
+            elif axis == "day" and unchanged:
+                # A verified no-op must never replay the same gesture.  Prefer
+                # one exact, visible, valid day row that strictly reduces the
+                # now-linear distance, even when the target is still far away.
+                progress_node = _day_visible_progress_node(
+                    current_nodes,
+                    target,
+                    target_date,
+                    old_signed_distance,
+                )
+                if progress_node is not None:
+                    movement_kind = "verified-row-recovery"
+                    log(
+                        "Birthday day: prior gesture was unchanged; "
+                        "selecting one proven closer visible row."
+                    )
+                    stack.tap_xy(*progress_node.center())
+                else:
+                    movement_kind = "approach" if old_distance <= 3 else "normal"
+                    if old_distance <= 3:
+                        gesture_rows = 1
+                    # No proven row is available. The one allowed retry gets a
+                    # longer but still bounded drag through ``retry``.
+                    gesture_retry = unchanged
+                    log("Birthday day: one bounded longer retry after a verified no-op.")
+                    _move_birthday_axis(
+                        stack,
+                        current_nodes,
+                        axis,
+                        1 if old_signed_distance > 0 else -1,
+                        gesture_rows,
+                        retry=gesture_retry,
+                    )
             elif axis == "day" and old_distance <= 3:
                 movement_kind = "approach"
                 gesture_rows = 1
-                gesture_retry = 0
                 log("Birthday day: one-row final approach.")
+                _move_birthday_axis(
+                    stack,
+                    current_nodes,
+                    axis,
+                    1 if old_signed_distance > 0 else -1,
+                    gesture_rows,
+                    retry=gesture_retry,
+                )
             else:
                 movement_kind = "normal"
                 log(f"Birthday {axis}: bounded adjustment {move_count + 1}.")
-            _move_birthday_axis(
-                stack,
-                current_nodes,
-                axis,
-                1 if old_signed_distance > 0 else -1,
-                gesture_rows,
-                retry=gesture_retry,
-            )
+                _move_birthday_axis(
+                    stack,
+                    current_nodes,
+                    axis,
+                    1 if old_signed_distance > 0 else -1,
+                    gesture_rows,
+                    retry=gesture_retry,
+                )
 
         fresh = stable_birthday_dump(
             stack,
@@ -535,7 +804,21 @@ def _set_birthday_axis(
         crossed_target = old_signed_distance * new_signed_distance < 0
         fresh_visible_target = _visible_target_node(fresh, axis, target)
 
-        if movement_kind == "reversal" and fresh_value != target:
+        if (
+            axis == "day"
+            and movement_kind != "reversal"
+            and fresh_value != target
+            and fresh_visible_target is not None
+        ):
+            # Momentum can cross the target or wrap the native wheel even when
+            # the requested direction is linear.  A freshly proven exact row
+            # is safer than rejecting the screen or issuing another gesture;
+            # the next loop will exact-tap that row.
+            log(
+                "Birthday day target became exactly visible after movement; "
+                "retaining the verified screen."
+            )
+        elif movement_kind == "reversal" and fresh_value != target:
             if crossed_target:
                 raise PhoneError(
                     "Birthday day-wheel recovery crossed the configured value again. "
@@ -643,6 +926,40 @@ def birthday_picker(nodes) -> bool:
         find_label_exact(nodes, ("About you",)) is not None
         and find_label_exact(nodes, BIRTHDAY_TITLE_LABELS) is not None
     )
+
+
+def _proven_birthday_submit_control(nodes, expected_birth_date: date):
+    """Return one exact bottom submit control only for the configured date.
+
+    The live a0269 build labels the orange control ``Continue``.  This is
+    deliberately not a generic orange-button or ``Create`` guess.  The caller
+    separately applies the explicit last-resort adult-date policy only after
+    both bounded exact-date correction attempts have been exhausted.
+    """
+    if selected_birthday(nodes) != (
+        expected_birth_date.day,
+        expected_birth_date.month,
+        expected_birth_date.year,
+    ):
+        return None
+    return _proven_adult_birthday_submit_control(nodes)
+
+
+def _proven_adult_birthday_submit_control(nodes):
+    """Return one exact Continue for any locally proven adult wheel date."""
+    if not birthday_screen(nodes) or not adult_birthday(nodes):
+        return None
+    labels = {collapsed_text(label) for label in BIRTHDAY_SUBMIT_LABELS}
+    matches = [
+        node
+        for node in nodes
+        if node.visible
+        and node.enabled
+        and node.on_screen()
+        and node.center()[1] >= BIRTHDAY_SUBMIT_MIN_Y
+        and collapsed_text(node.labels()) in labels
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def stable_birthday_dump(
@@ -882,9 +1199,8 @@ def _finish_birthday_confirmation(
                     "Birthday confirmation remained after one exact Yes, Confirm tap. "
                     "Did not tap it again or choose Go Back."
                 )
-            raise PhoneError(
-                "Yes, Confirm did not reach the gender screen after 8 fresh dumps. "
-                "Did not guess another action."
+            raise BirthdayRecoveryExhausted(
+                "Yes, Confirm reached an unknown visual state after bounded local checks."
             )
 
         if attempt == BIRTHDAY_TRANSITION_MAX_DUMPS:
@@ -905,9 +1221,8 @@ def _finish_birthday_confirmation(
             "Birthday screen remained after one exact Continue tap. "
             "Did not tap Continue again."
         )
-    raise PhoneError(
-        "Birthday confirmation did not reach the gender screen after 8 fresh dumps. "
-        "Did not guess another action."
+    raise BirthdayRecoveryExhausted(
+        "Birthday submission reached an unknown visual state after bounded local checks."
     )
 
 
@@ -1050,41 +1365,77 @@ def tap_woman(
                         "retrying once from a fresh verified picker dump."
                     )
         if last_birthday_error is not None:
-            raise BirthdayRecoveryExhausted(
-                "Birthday local recovery was exhausted on a verified picker."
-            ) from last_birthday_error
-        time.sleep(0.8)
-        nodes = stable_birthday_dump(
-            stack,
-            phone,
-            "910_birthday_ready",
-        )
-        if selected_birthday(nodes) != (
-            expected_birth_date.day,
-            expected_birth_date.month,
-            expected_birth_date.year,
-        ):
-            raise PhoneError(
-                "Birthday changed away from the private configured date before submission. "
-                "Did not tap Continue."
+            submitted_birth_date = expected_birth_date
+            submit = _proven_birthday_submit_control(nodes, expected_birth_date)
+            if submit is None:
+                submit = _proven_adult_birthday_submit_control(nodes)
+                selected = selected_birthday(nodes)
+                if submit is None or selected is None:
+                    raise BirthdayRecoveryExhausted(
+                        "Birthday local recovery was exhausted without one proven adult "
+                        "selection and unique bottom Continue."
+                    ) from last_birthday_error
+                try:
+                    submitted_birth_date = date(selected[2], selected[1], selected[0])
+                except ValueError as exc:
+                    raise BirthdayRecoveryExhausted(
+                        "Birthday local recovery ended on an invalid selected date."
+                    ) from exc
+                log(
+                    "Birthday local corrections exhausted; a fresh dump still proves "
+                    "one adult date and one unique bottom Continue, tapping once before AI."
+                )
+            else:
+                log(
+                    "Birthday local movements exhausted, but a fresh dump now proves "
+                    "the exact configured date and one bottom Continue; tapping once."
+                )
+            stack.tap_xy(*submit.center())
+            CREATION_PROGRESS.note()
+            nodes = _finish_birthday_confirmation(
+                stack,
+                phone,
+                nodes,
+                submitted_birth_date,
             )
-        if not birthday_screen(nodes) or not adult_birthday(nodes):
-            raise PhoneError("Configured birthday was not proven adult. Did not tap Continue.")
-        cont = find_label_exact(nodes, ("Continue",))
-        if cont is None:
-            raise PhoneError(
-                "Birthday picker has a selected adult date but no exact Continue button. "
-                "Did not guess a tap."
+        else:
+            time.sleep(0.8)
+            nodes = stable_birthday_dump(
+                stack,
+                phone,
+                "910_birthday_ready",
             )
-        log(f"Private birthday confirmed -> Continue [{cont.x},{cont.y} {cont.w}x{cont.h}]")
-        stack.tap_xy(*cont.center())
-        CREATION_PROGRESS.note()
-        nodes = _finish_birthday_confirmation(
-            stack,
-            phone,
-            nodes,
-            expected_birth_date,
-        )
+            if selected_birthday(nodes) != (
+                expected_birth_date.day,
+                expected_birth_date.month,
+                expected_birth_date.year,
+            ):
+                raise PhoneError(
+                    "Birthday changed away from the private configured date before submission. "
+                    "Did not tap Continue."
+                )
+            if not birthday_screen(nodes) or not adult_birthday(nodes):
+                raise PhoneError(
+                    "Configured birthday was not proven adult. Did not tap Continue."
+                )
+            submit = _proven_birthday_submit_control(nodes, expected_birth_date)
+            if submit is None:
+                raise PhoneError(
+                    "Birthday picker has a selected adult date but no unique exact bottom "
+                    "Continue control. Did not guess a tap."
+                )
+            log(
+                f"Private birthday confirmed -> bottom submit "
+                f"[{submit.x},{submit.y} {submit.w}x{submit.h}]"
+            )
+            stack.tap_xy(*submit.center())
+            CREATION_PROGRESS.note()
+            nodes = _finish_birthday_confirmation(
+                stack,
+                phone,
+                nodes,
+                expected_birth_date,
+            )
 
     _finish_gender(stack, phone, nodes)
 

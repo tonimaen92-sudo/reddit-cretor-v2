@@ -341,14 +341,82 @@ def main() -> int:
         continue_on_unclear=True,
     )
     check(
-        "unclear-final-after-completion-requires-exact-bundle-cleanup",
-        not unclear_final[-1]
-        and unclear_final[3] is not None
-        and unclear_final[3].completed == 5
-        and unclear_final[3].final_proof is None
+        "unclear-final-after-completion-enters-strict-ai-fallback",
+        "shared sanitized ui-recovery budget" in unclear_final[-1].casefold()
+        and unclear_final[3] is None
         and len(unclear_final[0].flicks) == 5
-        and any("exact-bundle Reddit cleanup is required" in line for line in unclear_final[1]),
+        and len(unclear_final[2]) == 5,
         unclear_final[-1],
+    )
+
+    proven_then_sparse_final = run_engine(
+        target=10,
+        frames=(
+            [feed_nodes("Trusted checkpoint")]
+            + [[node("Unknown screen", 100, 500, w=300)]] * 5
+        ),
+        continue_on_unclear=True,
+    )
+    check(
+        "proven-checkpoint-allows-safe-sparse-terminal-cleanup",
+        not proven_then_sparse_final[-1]
+        and proven_then_sparse_final[3] is not None
+        and proven_then_sparse_final[3].final_proof is not None
+        and len(proven_then_sparse_final[0].flicks) == 10
+        and any(
+            "without an Anthropic call" in line
+            for line in proven_then_sparse_final[1]
+        ),
+        proven_then_sparse_final[-1],
+    )
+
+    proven_then_protected_final = run_engine(
+        target=10,
+        frames=(
+            [feed_nodes("Trusted checkpoint")]
+            + [[node("About you", 100, 500, w=300)]] * 5
+        ),
+        continue_on_unclear=True,
+    )
+    check(
+        "proven-checkpoint-does-not-bypass-protected-final-state",
+        "shared sanitized ui-recovery budget"
+        in proven_then_protected_final[-1].casefold()
+        and proven_then_protected_final[3] is None
+        and len(proven_then_protected_final[0].flicks) == 10,
+        proven_then_protected_final[-1],
+    )
+
+    protected_then_feed = run_engine(
+        target=10,
+        frames=(
+            [[node("About you", 100, 500, w=300)]] * 3
+            + [feed_nodes("Recovered after protected-looking copy")]
+        ),
+        strict=False,
+        continue_on_unclear=True,
+    )
+    check(
+        "protected-looking-feed-text-defers-until-later-checkpoint",
+        not protected_then_feed[-1]
+        and len(protected_then_feed[0].flicks) == 10
+        and any(
+            "continuing the configured swipe sequence" in line
+            for line in protected_then_feed[1]
+        ),
+        protected_then_feed[-1],
+    )
+
+    persistent_protected = run_engine(
+        target=5,
+        frames=[[node("About you", 100, 500, w=300)]] * 6,
+        continue_on_unclear=True,
+    )
+    check(
+        "persistent-protected-ui-calls-strict-ai-only-after-all-swipes",
+        "shared sanitized ui-recovery budget" in persistent_protected[-1].casefold()
+        and len(persistent_protected[0].flicks) == 5,
+        persistent_protected[-1],
     )
 
     strict_unclear_final = run_engine(

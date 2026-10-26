@@ -27,6 +27,7 @@ from friend_poster.device.ui_tree import (  # noqa: E402
     dump_named,
     find_label_exact,
 )
+from friend_poster.services.ui_recovery_agent import UnknownVisualStateError  # noqa: E402
 
 os.environ["SKIP_SHOT"] = "1"
 
@@ -59,17 +60,37 @@ SORRY_STOP_MESSAGE = (
 )
 
 
+class RedditEmailRetryLater(PhoneError):
+    """Reddit kept the email form in its temporary retry-later state."""
+
+    failure_code = "reddit_email_retry_later"
+
+
 class EmailFieldInvalid(PhoneError):
     """Reddit's email field never accepted the exact saved @icloud.com address.
 
-    Raised only for the terminal 873 condition: after the one authorized type
-    and at most one proven single-missing-character retype, the field still
-    does not hold the saved address, so no further type, retype, or Continue
-    tap is allowed.  ``failure_code`` is the machine-readable identity consumed
-    by the Creator batch pipeline; it is never derived from message text.
+    Raised only for the terminal 873 condition: after the initial type and one
+    bounded force-clear/retype, the field still does not hold the saved address,
+    so no further local type, retype, or Continue tap is allowed.  The bounded
+    local handler is always exhausted before this narrowly typed visual failure
+    becomes eligible for the shared Anthropic recovery budget.
     """
 
     failure_code = "reddit_email_field_invalid"
+    ai_recoverable = True
+
+
+class ExistingAccountContainerError(PhoneError):
+    """The selected incomplete-attempt container contains a Reddit account.
+
+    This is deliberately narrower than a generic visual failure: callers may
+    use it to replace an incomplete bulk container only after the strong
+    profile markers in :func:`existing_account_profile` were observed.  Manual
+    runs and slots with a created-account checkpoint remain protected by the
+    controller.
+    """
+
+    failure_code = "existing_account_container"
 
 
 def log(msg: str) -> None:
@@ -210,6 +231,41 @@ def welcome(nodes) -> bool:
         find_label_exact(nodes, ("Hi new friend,", "welcome to Reddit")) is not None
         or find_label_exact(nodes, ("Enter your email to get started",)) is not None
     )
+
+
+def icloud_password_prompt_cancel_node(nodes):
+    """Return only the bounded Cancel action for an iCloud password overlay.
+
+    Hide My Email can leave its Apple-ID password prompt above Reddit after the
+    replacement alias is activated.  The Reddit welcome title remains visible
+    behind the modal, while OCR partially obscures ``Email`` (for example as
+    ``Ema``).  Prove the system prompt from its title/body and select only the
+    lower modal Cancel action, never Reddit's top navigation Cancel.
+    """
+    text = blob_of(nodes).casefold()
+    if (
+        "sign in to icloud" not in text
+        or "enter the password for your apple id" not in text
+        or "password" not in text
+    ):
+        return None
+    hits = []
+    for node in nodes:
+        label = collapsed_text(node.labels()).casefold()
+        words = label.split()
+        if (
+            node.on_screen()
+            and node.visible
+            and node.enabled
+            and words
+            and all(word == "cancel" for word in words)
+            and 120 <= node.x <= 330
+            and 500 <= node.y <= 650
+            and node.w <= 220
+            and node.h <= 80
+        ):
+            hits.append(node)
+    return hits[0] if len(hits) == 1 else None
 
 
 def provider_sheet(nodes) -> bool:
@@ -461,7 +517,7 @@ def dump_after_you(stack: TapStack, phone: Phone):
         log("Bottom-nav You proved a login/signup landing/provider sheet.")
         return nodes
     if state == "profile":
-        raise PhoneError(
+        raise ExistingAccountContainerError(
             "Bottom-nav You opened an existing account/profile. Stopped without "
             "logging out or changing it. See 872_after_you."
         )
@@ -489,7 +545,7 @@ def wait_after_signup_doorway(stack: TapStack, phone: Phone, *, stop=None, log_f
             )
             last_nodes = nodes
             if existing_account_profile(nodes):
-                raise PhoneError(
+                raise ExistingAccountContainerError(
                     "Signup doorway opened an existing account/profile. Stopped without "
                     "logging out or changing it."
                 )
@@ -706,6 +762,12 @@ def _email_ocr_equivalence(observed: str, expected: str) -> str:
     if len(differences) != 1:
         return "none"
     seen, want = differences[0]
+    # iOS keeps the full prepared address in the focused field, but the live
+    # OCR backend can render a single underscore as whitespace.  Accept this
+    # only in the expected direction and only as the sole difference; form
+    # context and Reddit's invalid-email warning are checked separately.
+    if seen == " " and want == "_":
+        return "underscore-read-as-space"
     if set((seen, want)) == {"8", "s"}:
         return "eight-s"
     if (seen, want) == ("o", "0"):
@@ -737,7 +799,33 @@ def _email_validation_report(nodes, email: str) -> _EmailValidationReport:
     invalid_warning = "please enter a valid email" in raw
     regions = [region for region in _email_ocr_regions(nodes) if "@icloud" in region.text]
 
+    # _email_ocr_regions intentionally strips OCR whitespace.  Preserve the
+    # one proven a0279 distinction before that normalization: the raw field
+    # rendered the expected underscore as whitespace.  A truly missing typed
+    # underscore has no raw-space evidence and therefore remains rejected.
+    if expected.count("_") == 1:
+        space_variant = expected.replace("_", " ")
+        for node in nodes:
+            raw_text = " ".join(
+                unicodedata.normalize("NFKC", _node_ocr_text(node)).casefold().split()
+            )
+            if (
+                node.ntype == "ocr"
+                and node.on_screen()
+                and 400 <= node.y <= 750
+                and _tok(re.escape(space_variant), raw_text)
+            ):
+                regions.append(
+                    _EmailOcrRegion(
+                        space_variant,
+                        int(node.x), int(node.y), int(node.w), int(node.h),
+                        _ocr_confidence(node),
+                    )
+                )
+
     def observed_address(region: _EmailOcrRegion) -> str:
+        if " " in region.text:
+            return region.text
         match = EMAIL_PILL_RE.search(region.text)
         if match is not None:
             return match.group(1).casefold()
@@ -881,14 +969,22 @@ def email_transition_pending(nodes, email: str) -> bool:
     )
 
 
-def type_slot_email(stack: TapStack, nodes, email: str, name: str, *, stop=None) -> None:
+def type_slot_email(
+    stack: TapStack,
+    nodes,
+    email: str,
+    name: str,
+    *,
+    stop=None,
+    force_clear: bool = False,
+) -> None:
     _check_stop(stop)
     field = find_label_exact(nodes, ("Email",))
     if field is None:
         raise PhoneError("Welcome screen has no Email field.")
     y = field.center()[1]
     junk = emails_on(nodes) or "please enter a valid email" in blob_of(nodes).lower()
-    if junk or "@" in _b_norm(nodes):
+    if force_clear or junk or "@" in _b_norm(nodes):
         # Retype path: tap the RIGHT end of the pill so the cursor lands at the
         # end (middle-tap left the cursor mid-text and backspaces left old prefix
         # like binder+bindery.hire_8g@icloud.com). Then 60 backspaces, one Lua.
@@ -903,8 +999,59 @@ def type_slot_email(stack: TapStack, nodes, email: str, name: str, *, stop=None)
         log(f"Email pill tap (375,{y}) type {name} {email}")
         stack.tap_xy(375, y)
         _wait(stop, 0.45)
-    stack.type_text(email)
+    # One Lua owns the complete key sequence and writes a completion marker.
+    # Launching one XXTouch script per character lets the next /recycle race
+    # the previous key event; the live a0277 run repeatedly kept only a small
+    # fraction of the saved address even though every launch returned code 0.
+    # type_human remains character-by-character and clipboard-free, but its
+    # single verified script cannot cancel its own preceding characters.
+    human_type = getattr(stack, "type_human", None)
+    if callable(human_type):
+        human_type(email, ms=160)
+    else:  # Lightweight test doubles and non-XXTouch compatibility.
+        stack.type_text(email)
     _wait(stop, 1.2)
+
+
+def retry_saved_email_field(
+    stack: TapStack,
+    phone: Phone,
+    email: str,
+    name: str,
+    *,
+    stop=None,
+    log_fn=None,
+):
+    """Force-clear/retype the locally saved email and prove it from fresh OCR.
+
+    This is the only prepared-value operation exposed to account-form AI
+    recovery.  The model never receives the address and never chooses the
+    value; it can only request this controller-bound deterministic operation.
+    Continue is deliberately not tapped here.
+    """
+    emit = log_fn or log
+    _check_stop(stop)
+    _, nodes = dump_named(stack, phone, "873_email_ai_before", emit, shot=False)
+    if not welcome(nodes):
+        raise PhoneError(
+            "Saved-email retry requires Reddit's locally verified welcome form."
+        )
+    type_slot_email(
+        stack,
+        nodes,
+        email,
+        name,
+        stop=stop,
+        force_clear=True,
+    )
+    _, fresh = dump_named(stack, phone, "873_email_ai_after", emit, shot=False)
+    if not welcome(fresh) or not email_ready(fresh, email):
+        raise EmailFieldInvalid(
+            "Prepared saved-email retry did not reach an exact locally verified "
+            "Reddit email field. Did not tap Continue."
+        )
+    emit("Prepared saved-email retry reached an exact locally verified field.")
+    return fresh
 
 
 def step(
@@ -922,6 +1069,7 @@ def step(
     *,
     email_done_taps: list[int] | None = None,
     signup_doorway_taps: list[int] | None = None,
+    icloud_prompt_cancel_taps: list[int] | None = None,
     stop=None,
 ):
     _check_stop(stop)
@@ -931,6 +1079,8 @@ def step(
         email_done_taps = [0]
     if signup_doorway_taps is None:
         signup_doorway_taps = [0]
+    if icloud_prompt_cancel_taps is None:
+        icloud_prompt_cancel_taps = [0]
     warn_siwa(nodes, log)
     b = blob_of(nodes)
     shown = emails_on(nodes)
@@ -944,6 +1094,23 @@ def step(
 
     if at_sorry(nodes):
         return "SORRY"
+
+    icloud_cancel = icloud_password_prompt_cancel_node(nodes)
+    if icloud_cancel is not None:
+        if icloud_prompt_cancel_taps[0] >= 1:
+            raise PhoneError(
+                "The proven iCloud password prompt remained after one bounded "
+                "Cancel tap. Did not repeat the tap or enter a password."
+            )
+        log(
+            "iCloud password prompt overlays Reddit welcome -> bounded modal "
+            f"Cancel [{icloud_cancel.x},{icloud_cancel.y} "
+            f"{icloud_cancel.w}x{icloud_cancel.h}]"
+        )
+        stack.tap_xy(*icloud_cancel.center())
+        icloud_prompt_cancel_taps[0] += 1
+        _wait(stop, 1.4)
+        return "ICLOUD_PASSWORD_CANCEL"
 
     if find_label_exact(nodes, ("Select Container",)) is not None:
         open_container(stack, phone, log, name, email)
@@ -1081,6 +1248,16 @@ def step(
                 return "WAIT"
             if btn is None and keyboard_done is not None:
                 if email_done_taps[0] >= 1:
+                    # Live a0362: Done really dismissed the keyboard for one
+                    # fresh frame, but Reddit's disabled "Sorry, please try
+                    # again later" CTA was too low-contrast for live OCR.  The
+                    # app then re-focused the field and the keyboard returned.
+                    # That proven hide -> reappear sequence is a server-side
+                    # retry-later state, not permission to tap Done or submit
+                    # again.  Keep the same slot/alias and surface a dedicated
+                    # failure code for a later Retry / Resume.
+                    if email_transition_waits[0] >= 1:
+                        raise RedditEmailRetryLater(SORRY_STOP_MESSAGE)
                     raise PhoneError(
                         "The exact keyboard Done key was already tapped once, but the "
                         "email keyboard is still present. Did not tap it again."
@@ -1124,15 +1301,53 @@ def step(
                     f"at index {index} (class={'digit' if char.isdigit() else 'letter'}); "
                     "clearing and retyping once before any submit."
                 )
-                type_slot_email(stack, nodes, email, name, stop=stop)
-                typed_once[0] += 1
-                return "RETYPED"
+            else:
+                report = _email_validation_report(nodes, email)
+                log(
+                    "Email did not match the saved address after the first type "
+                    f"(observed_local_len={report.local_length}, "
+                    f"suffix_match={str(report.suffix_match).lower()}); "
+                    "force-clearing and retyping once before any submit."
+                )
+            type_slot_email(
+                stack,
+                nodes,
+                email,
+                name,
+                stop=stop,
+                force_clear=True,
+            )
+            typed_once[0] += 1
+            return "RETYPED"
         if typed_once[0] >= 1:
             _log_email_validation_failure(nodes, email)
+            # The decision OCR can lag the keyboard's final character even
+            # after the bounded settle.  In live a0299, this branch saw an
+            # invalid field while the immediately following diagnostic frame
+            # already held the exact saved address.  Take one OCR-only terminal
+            # recheck and allow it to recover only a fully proven local
+            # postcondition; never type or submit from this guard.
+            _, terminal_nodes = dump_named(
+                stack,
+                phone,
+                "873_email_terminal_recheck",
+                log,
+                shot=False,
+            )
+            if at_verify(terminal_nodes):
+                return "VERIFY"
+            if at_sorry(terminal_nodes):
+                return "SORRY"
+            if welcome(terminal_nodes) and email_ready(terminal_nodes, email):
+                log(
+                    "Email terminal recheck proved the exact saved address; "
+                    "continuing without another type or submit tap."
+                )
+                return "WAIT"
             dump_named(stack, phone, "873_email_still_invalid", log, shot=True)
             raise EmailFieldInvalid(
-                "Email field still invalid after one type and at most one bounded "
-                "single-missing-character retype (need the exact saved @icloud.com "
+                "Email field still invalid after one type and one bounded "
+                "force-clear/retype (need the exact saved @icloud.com "
                 "address in Reddit's email form and no 'Please enter a valid email'). "
                 "Did not tap Continue. See 873_email_still_invalid."
             )
@@ -1152,6 +1367,11 @@ def wait_ui(stack: TapStack, phone: Phone, stem: str, nodes, *, stop=None, log_f
     for i in range(8):
         _check_stop(stop)
         CREATION_PROGRESS.note()
+        if existing_account_profile(nodes):
+            raise ExistingAccountContainerError(
+                "Reddit opened an existing account/profile while waiting for "
+                "the signup UI. Stopped without logging out or changing it."
+            )
         if proven_springboard(nodes):
             raise PhoneError(
                 "Reddit left the foreground and iPhone Home is visible. "
@@ -1225,6 +1445,7 @@ def run_to_verify(
     email_done_taps = [0]
     home_you_taps = [0]
     signup_doorway_taps = [0]
+    icloud_prompt_cancel_taps = [0]
     b = blob_of(nodes)
     if (
         not opened[0]
@@ -1270,6 +1491,7 @@ def run_to_verify(
             home_you_taps,
             email_done_taps=email_done_taps,
             signup_doorway_taps=signup_doorway_taps,
+            icloud_prompt_cancel_taps=icloud_prompt_cancel_taps,
             stop=stop,
         )
         log(f"STEP {i} {result}")
@@ -1293,7 +1515,7 @@ def run_to_verify(
             # rejection.  Do not touch the phone again merely to duplicate it:
             # a second dump delayed the terminal error and could be interrupted
             # before Creator logged the failure.
-            raise PhoneError(SORRY_STOP_MESSAGE)
+            raise RedditEmailRetryLater(SORRY_STOP_MESSAGE)
         if result == "UNKNOWN":
             nodes = wait_ui(
                 stack,
@@ -1317,6 +1539,7 @@ def run_to_verify(
                 home_you_taps,
                 email_done_taps=email_done_taps,
                 signup_doorway_taps=signup_doorway_taps,
+                icloud_prompt_cancel_taps=icloud_prompt_cancel_taps,
                 stop=stop,
             )
             log(f"STEP {i} retry {result}")
@@ -1333,13 +1556,16 @@ def run_to_verify(
                 continue
             if result == "UNKNOWN":
                 dump_named(stack, phone, f"877_unknown_{i}", log, shot=True)
-                raise PhoneError("Screen not in locked path. See dump. Did not guess.")
+                raise UnknownVisualStateError(
+                    "Screen not in locked path after bounded signup handling. "
+                    "See dump. Did not guess."
+                )
             if result == "VERIFY":
                 dump_named(stack, phone, "879_verify", log, shot=True)
                 log(f"ON Verify your email for {email}. Did not tap Skip.")
                 return
             if result == "SORRY":
-                raise PhoneError(SORRY_STOP_MESSAGE)
+                raise RedditEmailRetryLater(SORRY_STOP_MESSAGE)
         blob, nodes = dump_named(stack, phone, f"873_{i}", log, shot=True)
         nodes = wait_ui(
             stack,
@@ -1350,7 +1576,9 @@ def run_to_verify(
             log_fn=emit,
         )
 
-    raise PhoneError("Too many steps without Verify.")
+    raise UnknownVisualStateError(
+        "Signup exhausted its bounded UI transitions without reaching Verify."
+    )
 
 
 def main() -> int:

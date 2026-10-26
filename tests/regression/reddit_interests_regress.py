@@ -16,6 +16,7 @@ from friend_poster.core.paths import DUMP_DIR
 
 PASS: list[str] = []
 FAIL: list[str] = []
+FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures"
 
 
 def check(name: str, condition: bool) -> None:
@@ -103,18 +104,59 @@ def main() -> int:
         and interests.customize_search_node(current_nodes) is not None
         and len(interests.customize_topics(current_nodes)) >= 4,
     )
-    checked_a0059_path = (
-        DUMP_DIR / "925_customize_verified_2.json"
+    # Stable evidence from a0267: after tapping Prut, Reddit kept the selected
+    # pill and checkmark but omitted its complete OCR node.  The previous check
+    # read the mutable 925 dump while hard-coding an older account's labels, so
+    # every later live run could invalidate the regression itself.
+    a0267_before = parse_nodes(
+        (FIXTURE_DIR / "a0267_customize_before_pending.json").read_text(
+            encoding="utf-8"
+        )
     )
-    checked_a0059_nodes = parse_nodes(checked_a0059_path.read_text(encoding="utf-8"))
+    a0267_after = parse_nodes(
+        (FIXTURE_DIR / "a0267_customize_after_pending_ocr_missing.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    a0267_prut = next(
+        node
+        for node in interests.customize_topics(a0267_before)
+        if interests.customize_topic_label(node) == "prut"
+    )
+    with tempfile.TemporaryDirectory() as temporary:
+        stable_stem = "a0267_pending_ocr_missing"
+        Path(temporary, stable_stem + ".json").write_bytes(
+            (FIXTURE_DIR / "a0267_customize_after_pending_ocr_missing.json").read_bytes()
+        )
+        Path(temporary, stable_stem + ".png").write_bytes(
+            (FIXTURE_DIR / "a0267_customize_after_pending_ocr_missing.png").read_bytes()
+        )
+        original_dir = interests.DUMP_DIR
+        try:
+            interests.DUMP_DIR = temporary
+            a0267_selected = interests._selected_customize_topics(
+                a0267_after,
+                stable_stem,
+                expected_labels={"netflix", "prut"},
+                pending={
+                    "label": "prut",
+                    "bounds": [
+                        a0267_prut.x,
+                        a0267_prut.y,
+                        a0267_prut.w,
+                        a0267_prut.h,
+                    ],
+                },
+            )
+        finally:
+            interests.DUMP_DIR = original_dir
     check(
-        "a0059-clipped-slash-checkmark-maps-only-to-pending-tv-dramas",
-        interests._selected_customize_topics(
-            checked_a0059_nodes,
-            "925_customize_verified_2",
-            expected_labels={"hair care", "tv dramas"},
-            pending={"label": "tv dramas", "bounds": [37, 1148, 156, 18]},
-        ) == {"hair care", "tv dramas"},
+        "a0267-selected-pill-without-ocr-recovers-from-saved-bounds",
+        "prut" not in {
+            interests.customize_topic_label(node)
+            for node in interests.customize_topics(a0267_after)
+        }
+        and a0267_selected == {"netflix", "prut"},
     )
     check(
         "search-anchor-requires-both-actions",

@@ -94,6 +94,36 @@ class ICloudPasswordEntryError(PhoneError):
         self.selection_overlay = bool(selection_overlay)
 
 
+class HideMyEmailVisualRecoveryExhausted(PhoneError):
+    """The bounded local HME navigator exhausted a still-visual UI state.
+
+    This opt-in is deliberately limited to navigation states that a sanitized
+    visual recovery agent can inspect.  Credential rejection, missing tap
+    transport, cancellation, persistence failures and malformed data continue
+    to raise ordinary ``PhoneError`` and therefore remain local-only.
+    """
+
+    failure_code = "icloud_hme_visual_recovery_exhausted"
+    ai_recoverable = True
+
+
+def hide_my_email_recovery_ready(nodes) -> bool:
+    """Return whether a fresh frame is safe for deterministic HME retry.
+
+    The iCloud overview row is explicitly not enough: that is the stuck state
+    that triggered recovery.  A visible Create control, an HME address, or an
+    HME page without the overview row proves navigation progressed into the
+    owned Hide My Email workflow.
+    """
+
+    if _icloud_main_hme_row(nodes) is not None:
+        return False
+    if _find_create(nodes) is not None or bool(_icloud_emails(nodes)):
+        return True
+    labels = " ".join(node.labels().casefold() for node in nodes)
+    return "hide my email" in labels and "manage storage" not in labels
+
+
 @dataclass(frozen=True)
 class _ICloudPasswordSheet:
     """A verified iCloud "Sign in to iCloud" password sheet.
@@ -139,6 +169,13 @@ _KEYBOARD_WORDS = {"space", "return"}
 _KEYBOARD_MIN_Y = 700
 _SHEET_SUBMIT_WAIT_SECONDS = 15.0
 _SHEET_POLL_SECONDS = 1.5
+# The iCloud overview can remain visually present for several fresh OCR frames
+# after a successful password submission while its Hide My Email row is still
+# disabled (the disclosure chevron is absent). Each live dump itself takes a
+# few seconds, so four bounded polls give Settings roughly 30 seconds to finish
+# the transition without repeating a tap or involving paid recovery.
+_HME_POST_UNLOCK_POLLS = 4
+_HME_POST_UNLOCK_POLL_SECONDS = 1.5
 # One verified tap is enough. The old long-press/Select-All/backspace oracle
 # could select the Apple-ID row and could send a control character as text.
 # Entry now starts only from the explicit empty ``Password`` placeholder and
@@ -797,6 +834,97 @@ def _icloud_main_hme_row(nodes):
     return find_label_exact(nodes, ("Hide My Email",))
 
 
+def _icloud_main_hme_row_actionable(nodes, row=None) -> bool:
+    """Return whether the verified overview row has a disclosure chevron.
+
+    Immediately after iCloud authentication the row label can still be OCR
+    visible while Settings has temporarily removed its chevron and ignores
+    taps. Only a same-band OCR node containing the disclosure marker proves
+    that the overview row is ready to receive the one bounded re-entry tap.
+    """
+    row = row or _icloud_main_hme_row(nodes)
+    if row is None:
+        return False
+    row_y = row.center()[1]
+    band = max(35, row.h * 2)
+    for node in nodes:
+        if not node.on_screen() or abs(node.center()[1] - row_y) > band:
+            continue
+        text = node.labels()
+        if "›" in text or ">" in text:
+            return True
+    return False
+
+
+def _settle_hme_after_icloud_unlock(stack, phone, log, nodes, stop) -> list:
+    """Wait for the authenticated HME route before one verified re-entry tap.
+
+    This handles the observed delayed Settings transition locally. It never
+    types the password again, never taps a row whose disclosure chevron is
+    absent, and permits at most one exact-row tap across all fresh frames.
+    """
+    current = nodes
+    row_tapped = False
+    for poll_index in range(_HME_POST_UNLOCK_POLLS + 1):
+        if stop and stop.is_set():
+            raise PhoneError("Stopped.")
+        if hide_my_email_recovery_ready(current):
+            if poll_index:
+                log(
+                    "Hide My Email post-unlock transition locally verified "
+                    f"after {poll_index} fresh frame(s)."
+                )
+            return current
+        if _full_apple_id_signin(current):
+            raise PhoneError(
+                "Apple ID returned to the full sign-in screen after iCloud "
+                "authentication; did not type credentials again."
+            )
+        if not _sheet_gone(current):
+            raise ICloudPasswordEntryError(
+                "iCloud requested another password sheet during the bounded "
+                "post-unlock transition; did not submit the password again."
+            )
+
+        row = _icloud_main_hme_row(current)
+        if (
+            row is not None
+            and not row_tapped
+            and _icloud_main_hme_row_actionable(current, row)
+        ):
+            if not stack.can_tap():
+                raise PhoneError(
+                    "Hide My Email overview row became actionable after unlock, "
+                    "but no tap backend is available."
+                )
+            log(
+                "iCloud overview finished loading; tapping the freshly verified "
+                "Hide My Email row once."
+            )
+            stack.tap_xy(*row.center())
+            row_tapped = True
+        elif row is not None and not row_tapped:
+            log(
+                "Hide My Email overview row is still settling without a "
+                "disclosure chevron; waiting without tapping."
+            )
+
+        if poll_index >= _HME_POST_UNLOCK_POLLS:
+            break
+        time.sleep(_HME_POST_UNLOCK_POLL_SECONDS)
+        _blob, current = dump_named(
+            stack,
+            phone,
+            f"03_hme_after_unlock_settle_{poll_index + 1}",
+            log,
+        )
+
+    raise HideMyEmailVisualRecoveryExhausted(
+        "Hide My Email route did not leave the iCloud overview after bounded "
+        "post-unlock settling; no unverified or repeated tap was made."
+    )
+
+
 def _label_field(nodes):
     fields = [
         n
@@ -928,6 +1056,14 @@ def create_one_hide_my_email(
             stack.tap_xy(*hme.center())
             time.sleep(1.5)
             blob, nodes = dump_named(stack, phone, "03_hme_before_create_retry", log)
+            # Preserve where authentication was observed.  The password sheet
+            # can appear after this first row tap; submitting it returns to the
+            # overview, and a following row tap may be ignored while Settings
+            # is still enabling the route.  The post-unlock settle below must
+            # therefore know about either row-tap boundary, not only the second.
+            had_password_sheet = (
+                "sign in to icloud" in " ".join(n.labels().casefold() for n in nodes)
+            )
             nodes = _unlock_icloud_with_fresh_sheet_retry(stack, phone, log, nodes, stop)
             if _full_apple_id_signin(nodes):
                 raise PhoneError(
@@ -946,23 +1082,30 @@ def create_one_hide_my_email(
                 stack.tap_xy(*hme_again.center())
                 time.sleep(1.5)
                 blob, nodes = dump_named(stack, phone, "03_hme_after_second_row_tap", log)
-                had_password_sheet = (
+                second_tap_password_sheet = (
                     "sign in to icloud" in " ".join(n.labels().casefold() for n in nodes)
                 )
+                had_password_sheet = had_password_sheet or second_tap_password_sheet
                 nodes = _unlock_icloud_with_fresh_sheet_retry(stack, phone, log, nodes, stop)
                 # Authentication dismisses back to the overview instead of
-                # completing the row navigation.  One verified post-unlock
-                # re-entry is safe; it is not a blind repeat.
+                # completing the row navigation. Settings can keep the row
+                # visibly disabled for several fresh frames, so wait for the
+                # HME route or a locally verified disclosure chevron before
+                # allowing one post-unlock re-entry tap.
                 after_unlock = _icloud_main_hme_row(nodes)
                 if had_password_sheet and after_unlock is not None:
-                    log("iCloud unlock returned to the overview; re-entering the verified Hide My Email row once.")
-                    stack.tap_xy(*after_unlock.center())
-                    time.sleep(1.5)
-                    blob, nodes = dump_named(stack, phone, "03_hme_after_unlock_row_tap", log)
-                    if "sign in to icloud" in " ".join(n.labels().casefold() for n in nodes):
-                        raise PhoneError("iCloud requested its password again after the bounded post-unlock Hide My Email tap.")
+                    log(
+                        "iCloud unlock returned to the overview; waiting for "
+                        "the verified Hide My Email route to finish loading."
+                    )
+                    nodes = _settle_hme_after_icloud_unlock(
+                        stack, phone, log, nodes, stop
+                    )
                 if _icloud_main_hme_row(nodes) is not None:
-                    raise PhoneError("Hide My Email row remained on the iCloud overview after bounded verified navigation; did not guess further taps.")
+                    raise HideMyEmailVisualRecoveryExhausted(
+                        "Hide My Email row remained on the iCloud overview after "
+                        "bounded verified navigation; did not guess further taps."
+                    )
             nodes = _leave_hme_detail_if_needed(
                 stack, phone, log, nodes, "03_hme_after_address_detail_back"
             )
@@ -987,12 +1130,13 @@ def create_one_hide_my_email(
                     nodes = _unlock_icloud_with_fresh_sheet_retry(stack, phone, log, nodes, stop)
                     overview_row = _icloud_main_hme_row(nodes)
                     if had_password_sheet and overview_row is not None:
-                        log("Delayed iCloud unlock returned to the overview; re-entering the verified Hide My Email row once.")
-                        stack.tap_xy(*overview_row.center())
-                        time.sleep(1.5)
-                        blob, nodes = dump_named(stack, phone, "03_hme_after_delayed_unlock_row_tap", log)
-                        if _icloud_main_hme_row(nodes) is not None:
-                            raise PhoneError("Hide My Email row remained on the overview after delayed unlock re-entry; did not keep scrolling Settings.")
+                        log(
+                            "Delayed iCloud unlock returned to the overview; "
+                            "waiting for the verified Hide My Email route."
+                        )
+                        nodes = _settle_hme_after_icloud_unlock(
+                            stack, phone, log, nodes, stop
+                        )
                     before = set(_icloud_emails(nodes))
                     if before:
                         log("Existing Hide My Email addresses on screen: " + ", ".join(before))
@@ -1001,7 +1145,7 @@ def create_one_hide_my_email(
                         log(f"Found Create after scroll {attempt+1}: {create.labels()!r} at {create.center()}")
                         break
         if create is None:
-            raise PhoneError(
+            raise HideMyEmailVisualRecoveryExhausted(
                 "Hide My Email list is open (or Settings is) but no Create New Address node is in the live dump. "
                 f"Read {os.path.join(DUMP_DIR, '03_hme_before_create.json')} and retune CREATE_LABELS. "
                 "Did not guess a tap. Unlock iCloud+ Hide My Email on this Apple ID if the row is missing."

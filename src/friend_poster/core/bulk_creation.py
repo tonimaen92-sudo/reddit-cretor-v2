@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import errno
 import ipaddress
@@ -37,6 +38,16 @@ _LOCK = threading.RLock()
 USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{1,28}$")
 REDDIT_PASSWORD_MIN_LENGTH = 8
 REDDIT_PASSWORD_MAX_LENGTH = 128
+RADIO_RECOVERY_VERSION = 1
+RADIO_RECOVERY_STATES = frozenset({
+    "none",
+    "pending",
+    "on_confirmed",
+    "restore_pending",
+    "off_confirmed",
+    "verify_pending",
+    "completed",
+})
 
 
 class BulkError(RuntimeError):
@@ -57,9 +68,21 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def empty_radio_recovery() -> dict:
+    """Return the credential-free, crash-safe Android radio journal."""
+    return {
+        "version": RADIO_RECOVERY_VERSION,
+        "state": "none",
+        "attempt": 0,
+        "head_fingerprint": None,
+        "operation_id": None,
+        "updated_at_utc": None,
+    }
+
+
 def empty_state() -> dict:
     return {
-        "version": 6, "revision": 0, "run_id": None, "writer_id": None,
+        "version": 7, "revision": 0, "run_id": None, "writer_id": None,
         "recovery": None,
         "queue": [], "requested": 0, "remaining": 0,
         "stage": "idle", "slot_id": None, "baseline_ip": None,
@@ -68,12 +91,31 @@ def empty_state() -> dict:
         "failure_phase": None, "failure_reason": None, "failure_code": None,
         "failures": [],
         "ip_attempt": None,
+        # Number of durable reset-action phases already started for the
+        # current queue head.  New runs allow fast ADB, MacroDroid fallback,
+        # then one final ADB fallback.  Legacy migration still maps a spent
+        # remote phase to one so Resume can finish without replaying it.
+        "ip_reset_attempt_count": 0,
+        "radio_recovery": empty_radio_recovery(),
         # Durable per-batch policy: newly started batches request automatic
         # deletion of each completed account's local container.  Any batch
         # saved before this flag existed keeps its previous (no-delete)
         # behavior and is never used to delete historical containers.
         "delete_containers": False,
     }
+
+
+def radio_recovery_head_fingerprint(state: dict) -> str:
+    """Return an opaque exact binding for the current slot/queue head.
+
+    Slot ids are the durable, non-secret identities allocated to queue heads.
+    Hashing the slot id keeps even that identifier out of the radio journal;
+    usernames, passwords, birth dates and IP addresses are never inputs.
+    """
+    sid = state.get("slot_id") if isinstance(state, dict) else None
+    if not isinstance(sid, str) or re.fullmatch(r"[a-z]\d{4,}", sid) is None:
+        raise BulkError("Radio recovery requires an exact current slot.")
+    return hashlib.sha256(f"bulk-radio-head-v1\0{sid}".encode("ascii")).hexdigest()
 
 
 def empty_draft() -> dict:
@@ -193,12 +235,57 @@ def parse_queue(
 
 def _validate(state: object) -> dict:
     blank = empty_state()
-    if not isinstance(state, dict) or set(state) != set(blank) or state.get("version") != 6:
+    if not isinstance(state, dict) or set(state) != set(blank) or state.get("version") != 7:
         raise BulkError("Saved bulk configuration is malformed.")
     if type(state["delete_containers"]) is not bool:
         raise BulkError("Saved bulk configuration is malformed.")
     if type(state["revision"]) is not int or state["revision"] < 0:
         raise BulkError("Saved bulk configuration is malformed.")
+    reset_count = state["ip_reset_attempt_count"]
+    if type(reset_count) is not int or not 0 <= reset_count <= 3:
+        raise BulkError("Saved bulk radio recovery metadata is malformed.")
+    radio = state["radio_recovery"]
+    if not isinstance(radio, dict) or set(radio) != {
+        "version", "state", "attempt", "head_fingerprint", "operation_id",
+        "updated_at_utc",
+    }:
+        raise BulkError("Saved bulk radio recovery metadata is malformed.")
+    if (
+        type(radio["version"]) is not int
+        or radio["version"] != RADIO_RECOVERY_VERSION
+        or not isinstance(radio["state"], str)
+        or radio["state"] not in RADIO_RECOVERY_STATES
+    ):
+        raise BulkError("Saved bulk radio recovery metadata is malformed.")
+    if type(radio["attempt"]) is not int or radio["attempt"] < 0:
+        raise BulkError("Saved bulk radio recovery metadata is malformed.")
+    if radio["state"] == "none":
+        if any(radio[field] is not None for field in (
+            "head_fingerprint", "operation_id", "updated_at_utc",
+        )) or radio["attempt"] != 0:
+            raise BulkError("Saved bulk radio recovery metadata is malformed.")
+    else:
+        if radio["attempt"] < 1 or radio["attempt"] != reset_count:
+            raise BulkError("Saved bulk radio recovery metadata is malformed.")
+        if (
+            not isinstance(radio["head_fingerprint"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", radio["head_fingerprint"]) is None
+            or not isinstance(radio["operation_id"], str)
+        ):
+            raise BulkError("Saved bulk radio recovery metadata is malformed.")
+        try:
+            uuid.UUID(radio["operation_id"])
+        except (ValueError, TypeError, AttributeError):
+            raise BulkError("Saved bulk radio recovery metadata is malformed.") from None
+        try:
+            stamp = datetime.fromisoformat(str(radio["updated_at_utc"]).replace("Z", "+00:00"))
+            if (
+                not str(radio["updated_at_utc"]).endswith("Z")
+                or stamp.utcoffset() != timezone.utc.utcoffset(stamp)
+            ):
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError):
+            raise BulkError("Saved bulk radio recovery metadata is malformed.") from None
     for field in ("run_id", "writer_id"):
         value = state[field]
         if value is not None:
@@ -267,6 +354,15 @@ def _validate(state: object) -> dict:
     sid = state["slot_id"]
     if sid is not None and (not isinstance(sid, str) or re.fullmatch(r"[a-z]\d{4,}", sid) is None):
         raise BulkError("Saved bulk configuration is malformed.")
+    if radio["state"] != "none":
+        if state["remaining"] < 1 or not state["queue"]:
+            raise BulkError("Saved bulk radio recovery metadata is malformed.")
+        if radio["head_fingerprint"] != radio_recovery_head_fingerprint(state):
+            raise BulkError("Saved bulk radio recovery metadata is malformed.")
+    if state["remaining"] == 0 and (
+        reset_count != 0 or radio != empty_radio_recovery()
+    ):
+        raise BulkError("Saved bulk radio recovery metadata is malformed.")
     for field in ("baseline_ip", "verified_ip"):
         value = state[field]
         if value is not None:
@@ -347,7 +443,10 @@ def load_state(path: Path = STATE_PATH) -> dict:
         with _LOCK:
             with path.open(encoding="utf-8") as handle:
                 state = json.load(handle)
-            v5_fields = set(empty_state()) - {
+            v6_fields = set(empty_state()) - {
+                "ip_reset_attempt_count", "radio_recovery",
+            }
+            v5_fields = v6_fields - {
                 "delete_containers",
             }
             v4_fields = v5_fields - {
@@ -356,52 +455,94 @@ def load_state(path: Path = STATE_PATH) -> dict:
             v3_fields = v4_fields - {"failure_code", "failures"}
             v2_fields = v3_fields - {"failure_reason"}
             legacy_fields = v2_fields - {"ip_attempt"}
+            if isinstance(state, dict) and state.get("version") == 6 and set(state) == v6_fields:
+                # Version 6 had no durable distinction between a spent remote
+                # MacroDroid phase and an available local ADB phase.  Preserve
+                # a known spent phase as one (not two) so Resume cannot resend
+                # the webhook, while still allowing one local recovery phase.
+                reset_count = 1 if (
+                    state.get("remaining", 0) > 0
+                    and (
+                        state.get("failure_code") in {
+                            "ip_auto_retry_pending",
+                            "ip_auto_retry_scheduled",
+                            "ip_retry_exhausted",
+                        }
+                        or state.get("stage") in {"may_have_triggered", "retry_ip"}
+                        or (
+                            state.get("failure_phase") == "ip"
+                            and state.get("baseline_ip")
+                            and state.get("ip_attempt")
+                        )
+                    )
+                ) else 0
+                migrated = {
+                    **state,
+                    "version": 7,
+                    "ip_reset_attempt_count": reset_count,
+                    "radio_recovery": empty_radio_recovery(),
+                }
+                _validate(migrated)
+                save_state(migrated, path)
+                return migrated
             if isinstance(state, dict) and state.get("version") == 5 and set(state) == v5_fields:
                 # A pre-policy batch keeps its previous behavior: no automatic
                 # container deletion, and no retroactive deletion of anything.
-                migrated = {**state, "version": 6, "delete_containers": False}
+                migrated = {
+                    **state, "version": 7, "delete_containers": False,
+                    "ip_reset_attempt_count": 0,
+                    "radio_recovery": empty_radio_recovery(),
+                }
                 _validate(migrated)
                 save_state(migrated, path)
                 return migrated
             if isinstance(state, dict) and state.get("version") == 4 and set(state) == v4_fields:
                 migrated = {
-                    **state, "version": 6, "revision": 0, "run_id": None,
+                    **state, "version": 7, "revision": 0, "run_id": None,
                     "writer_id": None, "recovery": None,
                     "delete_containers": False,
+                    "ip_reset_attempt_count": 0,
+                    "radio_recovery": empty_radio_recovery(),
                 }
                 _validate(migrated)
                 save_state(migrated, path)
                 return migrated
             if isinstance(state, dict) and state.get("version") == 1 and set(state) == legacy_fields:
                 migrated = {
-                    **state, "version": 6, "ip_attempt": None,
+                    **state, "version": 7, "ip_attempt": None,
                     "failure_reason": None, "failure_code": None, "failures": [],
                     "revision": 0, "run_id": None, "writer_id": None,
                     "recovery": None,
                     "delete_containers": False,
+                    "ip_reset_attempt_count": 0,
+                    "radio_recovery": empty_radio_recovery(),
                 }
                 _validate(migrated)
                 save_state(migrated, path)
                 return migrated
             if isinstance(state, dict) and state.get("version") == 2 and set(state) == v2_fields:
                 migrated = {
-                    **state, "version": 6, "failure_reason": None,
+                    **state, "version": 7, "failure_reason": None,
                     "failure_code": None, "failures": [],
                     "revision": 0, "run_id": None, "writer_id": None,
                     "recovery": None,
                     "delete_containers": False,
+                    "ip_reset_attempt_count": 0,
+                    "radio_recovery": empty_radio_recovery(),
                 }
                 _validate(migrated)
                 save_state(migrated, path)
                 return migrated
             if isinstance(state, dict) and state.get("version") == 3 and set(state) == v3_fields:
                 migrated = {
-                    **state, "version": 6,
+                    **state, "version": 7,
                     "failure_code": _failure_code_from_reason(state.get("failure_reason")),
                     "failures": [],
                     "revision": 0, "run_id": None, "writer_id": None,
                     "recovery": None,
                     "delete_containers": False,
+                    "ip_reset_attempt_count": 0,
+                    "radio_recovery": empty_radio_recovery(),
                 }
                 _validate(migrated)
                 save_state(migrated, path)
@@ -850,6 +991,9 @@ def consume_completed(state: dict, slot_id: str, *, ready_at_utc: str) -> dict:
     next_state["failure_reason"] = None
     next_state["failure_code"] = None
     next_state["ip_attempt"] = None
+    next_state["ip_reset_attempt_count"] = 0
+    next_state["radio_recovery"] = empty_radio_recovery()
+    _validate(next_state)
     return next_state
 
 
@@ -899,6 +1043,8 @@ def consume_failed(
     next_state["failure_reason"] = None
     next_state["failure_code"] = None
     next_state["ip_attempt"] = None
+    next_state["ip_reset_attempt_count"] = 0
+    next_state["radio_recovery"] = empty_radio_recovery()
     _validate(next_state)
     return next_state
 
@@ -956,5 +1102,7 @@ def consume_stalled(
     next_state["failure_reason"] = None
     next_state["failure_code"] = None
     next_state["ip_attempt"] = None
+    next_state["ip_reset_attempt_count"] = 0
+    next_state["radio_recovery"] = empty_radio_recovery()
     _validate(next_state)
     return next_state

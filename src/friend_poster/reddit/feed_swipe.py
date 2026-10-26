@@ -209,6 +209,34 @@ def _dump_checkpoint(
             )
             return nodes
         if error:
+            # Creation feed OCR can legitimately contain onboarding phrases in
+            # ordinary post/ad copy (for example, "I don't know about you").
+            # Once the caller has opted into the bounded continue-on-unclear
+            # policy, do not abandon the saved swipe sequence on that text
+            # alone.  Re-capture locally first, then defer a still-unproven
+            # Reddit visual state to the strict final check after every
+            # configured gesture has been checkpointed.  Home and Crane remain
+            # immediate hard stops because they prove that Reddit is no longer
+            # the active surface.
+            if (
+                continue_on_unclear
+                and error.startswith("protected Reddit screen")
+            ):
+                if capture < FEED_SWIPE_FRAME_RETRIES:
+                    logger(
+                        f"Feed checkpoint {completed}: possible protected-flow "
+                        "text remained unproven; retrying locally without "
+                        f"another gesture ({capture + 1}/{FEED_SWIPE_FRAME_RETRIES})."
+                    )
+                    stack.wait(FEED_SWIPE_RETRY_SECONDS)
+                    continue
+                logger(
+                    f"Feed checkpoint {completed}: protected-flow text remained "
+                    "unproven after local captures; preserving progress and "
+                    "continuing the configured swipe sequence before strict "
+                    "visual recovery."
+                )
+                return last_nodes
             raise PhoneError(
                 f"Feed swipe checkpoint after gesture {completed} stopped because {error}."
             )
@@ -245,12 +273,24 @@ def _strict_final_proof(
     *,
     stop=None,
     allow_unclear_completion: bool = False,
+    trusted_prior_proof: FeedCleanupProof | None = None,
+    trusted_checkpoint_seen: bool = False,
     allow_created_account_feed_proof: bool = False,
     dump_fn=dump_named,
 ) -> FeedCleanupProof | None:
     candidate_nodes = nodes
+    final_error = ""
     for capture in range(1, FEED_SWIPE_FRAME_RETRIES + 1):
         _check_stop(stop)
+        final_error = _checkpoint_error(
+            candidate_nodes,
+            allow_created_account_feed_proof=allow_created_account_feed_proof,
+        )
+        if final_error and not (
+            allow_unclear_completion
+            and final_error.startswith("protected Reddit screen")
+        ):
+            raise PhoneError(f"Final feed proof stopped because {final_error}.")
         proof = make_feed_cleanup_proof(candidate_nodes)
         if proof is None:
             proof = make_terminal_feed_cleanup_proof(candidate_nodes)
@@ -272,18 +312,30 @@ def _strict_final_proof(
             persist=False,
             preview=False,
         )
-        error = _checkpoint_error(
-            candidate_nodes,
-            allow_created_account_feed_proof=allow_created_account_feed_proof,
-        )
-        if error:
-            raise PhoneError(f"Final feed proof stopped because {error}.")
-    if allow_unclear_completion:
+    if (
+        allow_unclear_completion
+        and trusted_checkpoint_seen
+        and trusted_prior_proof is not None
+        and not final_error
+    ):
+        # Dynamic post/video frames can be too sparse for a fresh cleanup
+        # proof. Every requested swipe is already durably saved, this same
+        # uninterrupted sequence previously proved Reddit, and the final
+        # bounded captures rejected Home, Crane and protected signup. The old
+        # proof may authorize exact-bundle cleanup, but never another gesture.
         logger(
-            "Final Reddit feed cleanup proof remained unclear after all configured "
-            "swipes completed; exact-bundle Reddit cleanup is required."
+            "Final post-swipe OCR remained sparse, but this uninterrupted "
+            "sequence already proved the Reddit feed at a checkpoint and no "
+            "unsafe final screen was detected; continuing exact-bundle cleanup "
+            "without an Anthropic call."
         )
-        return None
+        return trusted_prior_proof
+    if allow_unclear_completion:
+        raise FeedVisualRecoveryExhausted(
+            "All configured feed swipes were saved, but strict local feed "
+            "verification remained unclear after the final bounded captures. "
+            "The shared sanitized UI-recovery budget may now be used."
+        )
     raise FeedVisualRecoveryExhausted(
         "Final Reddit feed cleanup proof remained unclear. Account creation and "
         "swipe progress were saved; Reddit was not closed from stale evidence."
@@ -336,6 +388,8 @@ def run_feed_swipes(
         f"Feed swipes: {pause_count} random pause(s) scheduled for this session."
     )
     latest_nodes = None
+    trusted_prior_proof = initial_proof
+    trusted_checkpoint_seen = False
     for gesture in range(completed + 1, target + 1):
         _check_stop(stop)
         logger(f"Starting feed swipe {gesture}/{target}")
@@ -369,6 +423,20 @@ def run_feed_swipes(
                 allow_created_account_feed_proof=allow_created_account_feed_proof,
                 dump_fn=dump_fn,
             )
+            checkpoint_proof = make_feed_cleanup_proof(latest_nodes)
+            if checkpoint_proof is None:
+                checkpoint_proof = make_terminal_feed_cleanup_proof(latest_nodes)
+            if checkpoint_proof is None and allow_created_account_feed_proof:
+                checkpoint_proof = make_created_account_feed_resume_proof(
+                    latest_nodes
+                )
+            if checkpoint_proof is not None:
+                trusted_prior_proof = checkpoint_proof
+            if proven_reddit_feed_structure(latest_nodes) or (
+                allow_created_account_feed_proof
+                and make_created_account_feed_resume_proof(latest_nodes) is not None
+            ):
+                trusted_checkpoint_seen = True
         if gesture in pause_positions:
             pause_seconds = random_source.uniform(
                 FEED_SWIPE_PAUSE_MIN_SECONDS,
@@ -408,6 +476,8 @@ def run_feed_swipes(
             latest_nodes,
             stop=stop,
             allow_unclear_completion=(continue_on_unclear and completed == target),
+            trusted_prior_proof=trusted_prior_proof,
+            trusted_checkpoint_seen=trusted_checkpoint_seen,
             allow_created_account_feed_proof=allow_created_account_feed_proof,
             dump_fn=dump_fn,
         )
